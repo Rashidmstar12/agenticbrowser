@@ -54,6 +54,7 @@ COMMANDS: dict[str, str] = {
     "fill":               "fill <selector> <value>",
     "press":              "press <key>",
     "hover":              "hover <selector>",
+    "select_option":      "select_option <selector> <value>",
     "scroll":             "scroll [y=500] [x=0]",
     "scroll_to":          "scroll_to <selector>",
     "close_popups":       "close_popups",
@@ -145,6 +146,11 @@ def _dispatch(
         elif cmd == "hover":
             selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
             return agent.hover(selector)
+
+        elif cmd == "select_option":
+            selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            value    = parts[2] if len(parts) > 2 else input("  Value: ").strip()
+            return agent.select_option(selector, value)
 
         elif cmd == "scroll":
             y = int(parts[1]) if len(parts) > 1 else 500

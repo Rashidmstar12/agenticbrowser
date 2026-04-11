@@ -657,22 +657,6 @@ def task_run(req: TaskRunRequest) -> dict[str, Any]:
     # Execute — results list may contain exception strings internally.
     exec_results = planner.execute(steps, agent, stop_on_error=req.stop_on_error)
 
-    # Optionally save execution log (only when log_path is set).
-    if req.log_path:
-        import json as _log_json, logging as _log
-        from datetime import datetime as _dt, timezone as _tz
-        _tools = get_tools()
-        log_entry = {
-            "intent": req.intent,
-            "success": all(r.get("status") == "ok" for r in exec_results),
-            "timestamp": _dt.now(_tz.utc).isoformat(),
-            "step_count": len(steps),
-        }
-        try:
-            _tools.write_file(req.log_path, _log_json.dumps(log_entry, indent=2))
-        except Exception as _exc:
-            logging.getLogger(__name__).warning("Could not save log: %s", _sanitize_error(str(_exc)))
-
     # Build response by cross-referencing the *untainted* steps list for action
     # names and using only sanitized error messages from the execution results.
     safe_step_results = []
@@ -688,12 +672,36 @@ def task_run(req: TaskRunRequest) -> dict[str, Any]:
             "error":  _sanitize_error(str(r.get("error", ""))) if is_error else None,
         })
 
-    return {
+    # Optionally save execution log (only when log_path is set).
+    # The log is a file write, so we can include the full results without
+    # exposing them in the HTTP response.
+    if req.log_path:
+        import json as _log_json
+        from datetime import datetime as _dt, timezone as _tz
+        _tools = get_tools()
+        log_entry = {
+            "intent":       req.intent,
+            "success":      failed_count == 0,
+            "timestamp":    _dt.now(_tz.utc).isoformat(),
+            "step_count":   len(steps),
+            "failed_count": failed_count,
+            "steps":        [{"action": s["action"]} for s in steps],
+            "results":      safe_step_results,
+        }
+        try:
+            _tools.write_file(req.log_path, _log_json.dumps(log_entry, indent=2))
+        except Exception as _exc:
+            logging.getLogger(__name__).warning("Could not save log: %s", _sanitize_error(str(_exc)))
+
+    safe_response: dict[str, Any] = {
         "success":      failed_count == 0,
         "intent":       req.intent,    # from request, not from execution results
         "failed_count": failed_count,
         "results":      safe_step_results,
     }
+    if failed_count > 0:
+        raise HTTPException(status_code=422, detail=safe_response)
+    return safe_response
 
 
 @app.post("/task/plan", summary="Convert a natural-language intent to a step list (dry run)")

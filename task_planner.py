@@ -80,6 +80,11 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
         "optional": {"x": 0, "y": 500},
         "description": "Scroll the page by x/y pixels.",
     },
+    "scroll_to_element": {
+        "required": ["selector"],
+        "optional": {},
+        "description": "Scroll an element into the visible viewport.",
+    },
     "screenshot": {
         "required": [],
         "optional": {"path": None, "full_page": False},
@@ -884,6 +889,9 @@ class TaskPlanner:
 
         if action == "scroll":
             return agent.scroll(x=step.get("x", 0), y=step.get("y", 500))
+
+        if action == "scroll_to_element":
+            return agent.scroll_to_element(step["selector"])
 
         if action == "screenshot":
             return agent.screenshot(
