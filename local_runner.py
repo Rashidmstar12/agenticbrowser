@@ -26,6 +26,7 @@ import sys
 from typing import Any
 
 from browser_agent import BrowserAgent
+from task_planner import TaskPlanner, StepValidationError
 
 # ---------------------------------------------------------------------------
 # Logging

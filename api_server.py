@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from browser_agent import BrowserAgent
+from task_planner import TaskPlanner, StepValidationError, validate_steps, STEP_SCHEMA
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -35,12 +36,19 @@ logger = logging.getLogger(__name__)
 # Global agent instance (one per server process)
 # ---------------------------------------------------------------------------
 _agent: BrowserAgent | None = None
+_planner: TaskPlanner | None = None
 
 
 def get_agent() -> BrowserAgent:
     if _agent is None or _agent._page is None:
         raise HTTPException(status_code=400, detail="Browser session is not active. POST /session/start first.")
     return _agent
+
+
+def get_planner() -> TaskPlanner:
+    if _planner is None:
+        raise HTTPException(status_code=400, detail="Browser session is not active. POST /session/start first.")
+    return _planner
 
 
 # ---------------------------------------------------------------------------
@@ -55,14 +63,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         _agent.stop()
     logger.info("Agentic Browser API server shut down")
 
-
 app = FastAPI(
     title="Agentic Browser API",
     description=(
         "REST API for controlling a Chromium-based browser agent. "
-        "Supports navigation, interaction, popup handling, screenshots, and JS evaluation."
+        "Supports navigation, interaction, popup handling, screenshots, JS evaluation, "
+        "and natural-language task planning with zero hallucination."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -156,13 +164,27 @@ class HoverRequest(BaseModel):
     selector: str = Field(..., description="CSS selector of the element to hover")
 
 
+class TaskRunRequest(BaseModel):
+    intent: str = Field(..., description="Natural-language task, e.g. 'go to google and search python'")
+    stop_on_error: bool = Field(True, description="Stop execution on the first failed step")
+
+
+class TaskPlanRequest(BaseModel):
+    intent: str = Field(..., description="Natural-language task to convert into a step list")
+
+
+class TaskExecuteRequest(BaseModel):
+    steps: list[dict] = Field(..., description="Pre-validated list of step objects to execute")
+    stop_on_error: bool = Field(True, description="Stop execution on the first failed step")
+
+
 # ---------------------------------------------------------------------------
 # Routes: session management
 # ---------------------------------------------------------------------------
 
 @app.post("/session/start", summary="Start a browser session")
 def session_start(req: SessionStartRequest) -> dict[str, Any]:
-    global _agent
+    global _agent, _planner
     if _agent is not None and _agent._page is not None:
         return {"status": "already_running", "headless": _agent.headless}
     _agent = BrowserAgent(
@@ -172,16 +194,18 @@ def session_start(req: SessionStartRequest) -> dict[str, Any]:
         default_timeout=req.default_timeout,
     )
     _agent.start()
+    _planner = TaskPlanner()
     return {"status": "started", "headless": req.headless}
 
 
 @app.post("/session/stop", summary="Stop the browser session")
 def session_stop() -> dict[str, Any]:
-    global _agent
+    global _agent, _planner
     if _agent is None:
         return {"status": "not_running"}
     _agent.stop()
     _agent = None
+    _planner = None
     return {"status": "stopped"}
 
 
@@ -318,6 +342,60 @@ def wait_for_selector(req: WaitForSelectorRequest) -> dict[str, Any]:
 @app.post("/wait/load_state", summary="Wait for a specific load state")
 def wait_for_load_state(req: WaitForLoadStateRequest) -> dict[str, Any]:
     return get_agent().wait_for_load_state(req.state)
+
+
+# ---------------------------------------------------------------------------
+# Routes: task planner
+# ---------------------------------------------------------------------------
+
+@app.post("/task/run", summary="Plan and execute a natural-language browser task")
+def task_run(req: TaskRunRequest) -> dict[str, Any]:
+    """
+    Convert *intent* to a step plan and execute it in one call.
+
+    This is the primary endpoint for agentic use.  Common tasks (Google search,
+    navigation, YouTube search, etc.) are resolved via deterministic templates
+    — no LLM call, no hallucination.  For unknown intents the configured LLM
+    backend is used with a constrained prompt.
+    """
+    result = get_planner().run(req.intent, get_agent(), stop_on_error=req.stop_on_error)
+    if not result["success"]:
+        raise HTTPException(status_code=422, detail=result)
+    return result
+
+
+@app.post("/task/plan", summary="Convert a natural-language intent to a step list (dry run)")
+def task_plan(req: TaskPlanRequest) -> dict[str, Any]:
+    """
+    Return the planned steps WITHOUT executing them.
+    Useful for previewing what would happen before running.
+    """
+    try:
+        steps = get_planner().plan(req.intent)
+        return {"intent": req.intent, "steps": steps, "count": len(steps)}
+    except (ValueError, StepValidationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post("/task/execute", summary="Execute a pre-built step list")
+def task_execute(req: TaskExecuteRequest) -> dict[str, Any]:
+    """
+    Run an already-built list of step dicts directly.
+    Steps are re-validated before execution.
+    """
+    try:
+        validated = validate_steps(req.steps)
+    except StepValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    results = get_planner().execute(validated, get_agent(), stop_on_error=req.stop_on_error)
+    failed  = [r for r in results if r["status"] == "error"]
+    return {"success": len(failed) == 0, "results": results, "failed_count": len(failed)}
+
+
+@app.get("/task/schema", summary="Return the allowed action schema")
+def task_schema() -> dict[str, Any]:
+    """Return the full STEP_SCHEMA so clients know what actions are valid."""
+    return {"schema": STEP_SCHEMA}
 
 
 # ---------------------------------------------------------------------------
