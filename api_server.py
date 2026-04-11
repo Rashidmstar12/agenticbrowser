@@ -11,6 +11,7 @@ Or use the helper:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
@@ -21,6 +22,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from browser_agent import BrowserAgent
+from system_tools import SystemTools
 from task_planner import TaskPlanner, StepValidationError, validate_steps, STEP_SCHEMA
 
 # ---------------------------------------------------------------------------
@@ -44,10 +46,15 @@ def _sanitize_error(msg: str) -> str:
     return first[:500]
 
 # ---------------------------------------------------------------------------
-# Global agent instance (one per server process)
+# Global singletons (one per server process)
 # ---------------------------------------------------------------------------
-_agent: BrowserAgent | None = None
-_planner: TaskPlanner | None = None
+_agent:   BrowserAgent | None = None
+_planner: TaskPlanner  | None = None
+_tools:   SystemTools  | None = None
+
+
+def _workspace() -> str:
+    return os.environ.get("BROWSER_WORKSPACE", "workspace")
 
 
 def get_agent() -> BrowserAgent:
@@ -60,6 +67,13 @@ def get_planner() -> TaskPlanner:
     if _planner is None:
         raise HTTPException(status_code=400, detail="Browser session is not active. POST /session/start first.")
     return _planner
+
+
+def get_tools() -> SystemTools:
+    global _tools
+    if _tools is None:
+        _tools = SystemTools(workspace=_workspace())
+    return _tools
 
 
 # ---------------------------------------------------------------------------
@@ -79,14 +93,14 @@ app = FastAPI(
     description=(
         "REST API for controlling a Chromium-based browser agent. "
         "Supports navigation, interaction, popup handling, screenshots, JS evaluation, "
-        "and natural-language task planning with zero hallucination."
+        "system tools (file I/O, code execution), and natural-language task planning."
     ),
-    version="1.1.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
-# Request / Response models
+# Request / Response models — session
 # ---------------------------------------------------------------------------
 
 class SessionStartRequest(BaseModel):
@@ -95,6 +109,10 @@ class SessionStartRequest(BaseModel):
     auto_close_popups: bool = Field(True, description="Auto-dismiss common popups on page load")
     default_timeout: int = Field(30_000, description="Default timeout in milliseconds")
 
+
+# ---------------------------------------------------------------------------
+# Request models — browser
+# ---------------------------------------------------------------------------
 
 class NavigateRequest(BaseModel):
     url: str = Field(..., description="Target URL to navigate to")
@@ -175,9 +193,113 @@ class HoverRequest(BaseModel):
     selector: str = Field(..., description="CSS selector of the element to hover")
 
 
+# ---------------------------------------------------------------------------
+# Request models — smart extraction / assertion / wait_text
+# ---------------------------------------------------------------------------
+
+class ExtractLinksRequest(BaseModel):
+    selector: str = Field("a", description="CSS selector for link elements")
+    limit: int = Field(100, description="Maximum number of links to return")
+
+
+class ExtractTableRequest(BaseModel):
+    selector: str = Field("table", description="CSS selector for the table element")
+    table_index: int = Field(0, description="Zero-based index when selector matches multiple tables")
+
+
+class AssertTextRequest(BaseModel):
+    text: str = Field(..., description="Text that must be present on the page")
+    selector: str = Field("body", description="CSS selector of the element to search in")
+    case_sensitive: bool = Field(False, description="Case-sensitive match")
+
+
+class AssertUrlRequest(BaseModel):
+    pattern: str = Field(..., description="Regex pattern that must match the current URL")
+
+
+class WaitTextRequest(BaseModel):
+    text: str = Field(..., description="Text to wait for")
+    selector: str = Field("body", description="CSS selector of the container element")
+    timeout: int | None = Field(None, description="Override timeout in ms")
+
+
+# ---------------------------------------------------------------------------
+# Request models — cookie persistence
+# ---------------------------------------------------------------------------
+
+class SaveCookiesRequest(BaseModel):
+    path: str = Field(..., description="Workspace-relative file path to save cookies (JSON)")
+
+
+class LoadCookiesRequest(BaseModel):
+    path: str = Field(..., description="Workspace-relative file path to load cookies from")
+
+
+# ---------------------------------------------------------------------------
+# Request models — multi-tab
+# ---------------------------------------------------------------------------
+
+class NewTabRequest(BaseModel):
+    url: str | None = Field(None, description="Optional URL to navigate to in the new tab")
+
+
+class SwitchTabRequest(BaseModel):
+    index: int = Field(..., description="Zero-based index of the tab to activate")
+
+
+class CloseTabRequest(BaseModel):
+    index: int | None = Field(None, description="Tab index to close (default: active tab)")
+
+
+# ---------------------------------------------------------------------------
+# Request models — system tools
+# ---------------------------------------------------------------------------
+
+class WriteFileRequest(BaseModel):
+    path: str = Field(..., description="Workspace-relative file path")
+    content: str = Field(..., description="Text content to write")
+    mode: str = Field("w", description="Write mode: 'w' to overwrite, 'a' to append")
+
+
+class AppendFileRequest(BaseModel):
+    path: str = Field(..., description="Workspace-relative file path")
+    content: str = Field(..., description="Text content to append")
+
+
+class ReadFileRequest(BaseModel):
+    path: str = Field(..., description="Workspace-relative file path")
+
+
+class ListDirRequest(BaseModel):
+    path: str = Field(".", description="Workspace-relative directory path")
+
+
+class MakeDirRequest(BaseModel):
+    path: str = Field(..., description="Workspace-relative directory path to create")
+
+
+class DeleteFileRequest(BaseModel):
+    path: str = Field(..., description="Workspace-relative path of the file or directory to delete")
+
+
+class RunPythonRequest(BaseModel):
+    code: str = Field(..., description="Python code snippet to execute")
+    timeout: int = Field(30, description="Maximum execution time in seconds")
+
+
+class RunShellRequest(BaseModel):
+    command: str = Field(..., description="Shell command to run in the workspace directory")
+    timeout: int = Field(30, description="Maximum execution time in seconds")
+
+
+# ---------------------------------------------------------------------------
+# Request models — task planner
+# ---------------------------------------------------------------------------
+
 class TaskRunRequest(BaseModel):
     intent: str = Field(..., description="Natural-language task, e.g. 'go to google and search python'")
     stop_on_error: bool = Field(True, description="Stop execution on the first failed step")
+    log_path: str | None = Field(None, description="Workspace-relative path to save the execution log")
 
 
 class TaskPlanRequest(BaseModel):
@@ -195,9 +317,10 @@ class TaskExecuteRequest(BaseModel):
 
 @app.post("/session/start", summary="Start a browser session")
 def session_start(req: SessionStartRequest) -> dict[str, Any]:
-    global _agent, _planner
+    global _agent, _planner, _tools
     if _agent is not None and _agent._page is not None:
         return {"status": "already_running", "headless": _agent.headless}
+    _tools = SystemTools(workspace=_workspace())
     _agent = BrowserAgent(
         headless=req.headless,
         slow_mo=req.slow_mo,
@@ -206,7 +329,8 @@ def session_start(req: SessionStartRequest) -> dict[str, Any]:
     )
     _agent.start()
     _planner = TaskPlanner()
-    return {"status": "started", "headless": req.headless}
+    _planner._system_tools = _tools  # share workspace
+    return {"status": "started", "headless": req.headless, "workspace": str(_tools.workspace)}
 
 
 @app.post("/session/stop", summary="Stop the browser session")
@@ -356,6 +480,147 @@ def wait_for_load_state(req: WaitForLoadStateRequest) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Routes: smart extraction
+# ---------------------------------------------------------------------------
+
+@app.post("/page/extract_links", summary="Extract all hyperlinks from the page")
+def extract_links(req: ExtractLinksRequest) -> dict[str, Any]:
+    return get_agent().extract_links(selector=req.selector, limit=req.limit)
+
+
+@app.post("/page/extract_table", summary="Extract an HTML table as JSON rows")
+def extract_table(req: ExtractTableRequest) -> dict[str, Any]:
+    return get_agent().extract_table(selector=req.selector, table_index=req.table_index)
+
+
+# ---------------------------------------------------------------------------
+# Routes: assertions
+# ---------------------------------------------------------------------------
+
+@app.post("/assert/text", summary="Assert text is present on the page (fails with 422 if not)")
+def assert_text(req: AssertTextRequest) -> dict[str, Any]:
+    try:
+        return get_agent().assert_text(req.text, selector=req.selector, case_sensitive=req.case_sensitive)
+    except AssertionError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+
+@app.post("/assert/url", summary="Assert the current URL matches a regex pattern")
+def assert_url(req: AssertUrlRequest) -> dict[str, Any]:
+    try:
+        return get_agent().assert_url(req.pattern)
+    except AssertionError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+
+# ---------------------------------------------------------------------------
+# Routes: wait for dynamic content
+# ---------------------------------------------------------------------------
+
+@app.post("/wait/text", summary="Wait until text appears on the page")
+def wait_text(req: WaitTextRequest) -> dict[str, Any]:
+    return get_agent().wait_text(req.text, selector=req.selector, timeout=req.timeout)
+
+
+# ---------------------------------------------------------------------------
+# Routes: cookie persistence
+# ---------------------------------------------------------------------------
+
+@app.post("/cookies/save", summary="Save browser cookies to a workspace file")
+def save_cookies(req: SaveCookiesRequest) -> dict[str, Any]:
+    import json as _json
+    cookies = get_agent().get_cookies()
+    get_tools().write_file(req.path, _json.dumps(cookies, indent=2))
+    return {"cookies_saved": len(cookies), "path": req.path}
+
+
+@app.post("/cookies/load", summary="Load cookies from a workspace file into the browser")
+def load_cookies(req: LoadCookiesRequest) -> dict[str, Any]:
+    import json as _json
+    result = get_tools().read_file(req.path)
+    cookies = _json.loads(result["content"])
+    get_agent().add_cookies(cookies)
+    return {"cookies_loaded": len(cookies), "path": req.path}
+
+
+# ---------------------------------------------------------------------------
+# Routes: multi-tab
+# ---------------------------------------------------------------------------
+
+@app.post("/tabs/new", summary="Open a new browser tab")
+def new_tab(req: NewTabRequest) -> dict[str, Any]:
+    return get_agent().new_tab(url=req.url)
+
+
+@app.post("/tabs/switch", summary="Switch to a tab by index")
+def switch_tab(req: SwitchTabRequest) -> dict[str, Any]:
+    return get_agent().switch_tab(req.index)
+
+
+@app.post("/tabs/close", summary="Close a browser tab")
+def close_tab(req: CloseTabRequest) -> dict[str, Any]:
+    return get_agent().close_tab(index=req.index)
+
+
+@app.get("/tabs/list", summary="List all open browser tabs")
+def list_tabs() -> dict[str, Any]:
+    return get_agent().list_tabs()
+
+
+# ---------------------------------------------------------------------------
+# Routes: system tools — file I/O
+# ---------------------------------------------------------------------------
+
+@app.post("/system/write_file", summary="Write a file in the workspace")
+def write_file(req: WriteFileRequest) -> dict[str, Any]:
+    return get_tools().write_file(req.path, req.content, mode=req.mode)
+
+
+@app.post("/system/append_file", summary="Append content to a workspace file")
+def append_file(req: AppendFileRequest) -> dict[str, Any]:
+    return get_tools().append_file(req.path, req.content)
+
+
+@app.post("/system/read_file", summary="Read a workspace file")
+def read_file(req: ReadFileRequest) -> dict[str, Any]:
+    return get_tools().read_file(req.path)
+
+
+@app.post("/system/list_dir", summary="List a workspace directory")
+def list_dir(req: ListDirRequest) -> dict[str, Any]:
+    return get_tools().list_dir(req.path)
+
+
+@app.post("/system/make_dir", summary="Create a directory in the workspace")
+def make_dir(req: MakeDirRequest) -> dict[str, Any]:
+    return get_tools().make_dir(req.path)
+
+
+@app.post("/system/delete_file", summary="Delete a file or directory from the workspace")
+def delete_file(req: DeleteFileRequest) -> dict[str, Any]:
+    return get_tools().delete_file(req.path)
+
+
+@app.get("/system/info", summary="Get workspace info and file counts")
+def system_info() -> dict[str, Any]:
+    return get_tools().info()
+
+
+# ---------------------------------------------------------------------------
+# Routes: system tools — code execution
+# ---------------------------------------------------------------------------
+
+@app.post("/system/run_python", summary="Execute a Python snippet in the workspace")
+def run_python(req: RunPythonRequest) -> dict[str, Any]:
+    return get_tools().run_python(req.code, timeout=req.timeout)
+
+
+@app.post("/system/run_shell", summary="Execute a shell command in the workspace")
+def run_shell(req: RunShellRequest) -> dict[str, Any]:
+    return get_tools().run_shell(req.command, timeout=req.timeout)
+
+
+# ---------------------------------------------------------------------------
 # Routes: task planner
 # ---------------------------------------------------------------------------
 
@@ -364,14 +629,17 @@ def task_run(req: TaskRunRequest) -> dict[str, Any]:
     """
     Convert *intent* to a step plan and execute it in one call.
 
-    This is the primary endpoint for agentic use.  Common tasks (Google search,
-    navigation, YouTube search, etc.) are resolved via deterministic templates
-    — no LLM call, no hallucination.  For unknown intents the configured LLM
-    backend is used with a constrained prompt.
+    Common tasks (Google search, navigation, YouTube search, etc.) are resolved
+    via deterministic templates — no LLM call, no hallucination.  For unknown
+    intents the configured LLM backend is used with a constrained prompt.
     """
-    result = get_planner().run(req.intent, get_agent(), stop_on_error=req.stop_on_error)
+    result = get_planner().run(
+        req.intent,
+        get_agent(),
+        stop_on_error=req.stop_on_error,
+        log_path=req.log_path,
+    )
     if not result["success"]:
-        # Sanitize error strings before exposing them in the HTTP response.
         safe_result = dict(result)
         if "error" in safe_result:
             safe_result["error"] = _sanitize_error(safe_result["error"])
@@ -385,29 +653,19 @@ def task_run(req: TaskRunRequest) -> dict[str, Any]:
 
 @app.post("/task/plan", summary="Convert a natural-language intent to a step list (dry run)")
 def task_plan(req: TaskPlanRequest) -> dict[str, Any]:
-    """
-    Return the planned steps WITHOUT executing them.
-    Useful for previewing what would happen before running.
-    """
+    """Return the planned steps WITHOUT executing them."""
     try:
         steps = get_planner().plan(req.intent)
         return {"intent": req.intent, "steps": steps, "count": len(steps)}
     except (ValueError, StepValidationError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-
-
-@app.post("/task/execute", summary="Execute a pre-built step list")
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
 def task_execute(req: TaskExecuteRequest) -> dict[str, Any]:
-    """
-    Run an already-built list of step dicts directly.
-    Steps are re-validated before execution.
-    """
+    """Run an already-built list of step dicts directly (re-validated before execution)."""
     try:
         validated = validate_steps(req.steps)
     except StepValidationError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
     results = get_planner().execute(validated, get_agent(), stop_on_error=req.stop_on_error)
-    # Sanitize any exception messages before returning to the client.
     safe_results = [
         {**r, "error": _sanitize_error(r["error"])} if r.get("status") == "error" else r
         for r in results
@@ -443,3 +701,4 @@ if __name__ == "__main__":
         reload=args.reload,
         log_level=args.log_level,
     )
+

@@ -685,7 +685,7 @@ agenticbrowser/
 │                      #   Template matching (zero-LLM common tasks)
 │                      #   Constrained LLM planning (OpenAI / Ollama)
 │                      #   Step schema validation
-│                      #   Variable substitution ({{last}}, {{step_N}})
+│                      #   Variable substitution ({{last}})
 │                      #   Execution engine (browser + system steps)
 │
 ├── api_server.py      # FastAPI REST server
@@ -694,8 +694,176 @@ agenticbrowser/
 │
 ├── local_runner.py    # Interactive terminal + JSON task file runner
 │                      #   REPL with all commands
-│                      #   --intent / --task / --cmd CLI flags
+│                      #   --intent / --task / --cmd / --workspace CLI flags
 │
 ├── requirements.txt   # Python dependencies
 └── README.md          # This file
+```
+
+---
+
+## 15. Futuristic features
+
+These features extend the core with smart extraction, assertions, wait helpers, multi-tab support, cookie persistence, step-level retry, and execution logging.
+
+### Smart extraction actions
+
+| Action | Required | Optional | Description |
+|--------|----------|----------|-------------|
+| `extract_links` | — | `selector` ("a"), `limit` (100) | Return all `<a>` hrefs as `[{text, href}]`. Stored as `{{last}}` (JSON string). |
+| `extract_table` | — | `selector` ("table"), `table_index` (0) | Return HTML table rows as `[{header: value}]`. |
+
+**Example — scrape all links from a page:**
+```json
+[
+  { "action": "navigate",       "url": "https://news.ycombinator.com" },
+  { "action": "extract_links",  "selector": "a.storylink", "limit": 30 },
+  { "action": "write_file",     "path": "hn_links.json", "content": "{{last}}" }
+]
+```
+
+**API:** `POST /page/extract_links`, `POST /page/extract_table`
+
+---
+
+### Assertion actions
+
+Assertions **fail the task** (raise an error) when the condition is not met. Use them to verify page state before proceeding to the next step.
+
+| Action | Required | Optional | Description |
+|--------|----------|----------|-------------|
+| `assert_text` | `text` | `selector` ("body"), `case_sensitive` (false) | Fail if text is not found in element. |
+| `assert_url` | `pattern` | — | Fail if current URL does not match regex pattern. |
+
+**Example — confirm login succeeded:**
+```json
+[
+  { "action": "navigate",    "url": "https://app.example.com/login" },
+  { "action": "fill",        "selector": "input[name='email']",    "value": "user@example.com" },
+  { "action": "fill",        "selector": "input[name='password']", "value": "secret" },
+  { "action": "click",       "selector": "button[type='submit']" },
+  { "action": "assert_url",  "pattern": "/dashboard" },
+  { "action": "assert_text", "text": "Welcome back" }
+]
+```
+
+**API:** `POST /assert/text`, `POST /assert/url`
+
+---
+
+### Wait for dynamic content
+
+| Action | Required | Optional | Description |
+|--------|----------|----------|-------------|
+| `wait_text` | `text` | `selector` ("body"), `timeout` (ms) | Poll until the text appears in the element (good for async/SPA content). |
+
+**API:** `POST /wait/text`
+
+---
+
+### Cookie persistence
+
+Save and restore browser sessions across runs.
+
+| Action | Required | Description |
+|--------|----------|-------------|
+| `save_cookies` | `path` | Serialize all cookies to a JSON file in the workspace. |
+| `load_cookies` | `path` | Restore cookies from a workspace JSON file into the browser context. |
+
+**Example — reuse a logged-in session:**
+```json
+[
+  { "action": "load_cookies", "path": "session.json" },
+  { "action": "navigate",     "url": "https://app.example.com/dashboard" },
+  { "action": "assert_url",   "pattern": "/dashboard" }
+]
+```
+
+**API:** `POST /cookies/save`, `POST /cookies/load`
+
+---
+
+### Multi-tab management
+
+| Action | Required | Optional | Description |
+|--------|----------|----------|-------------|
+| `new_tab` | — | `url` | Open a new tab (optionally navigate). Makes it the active tab. |
+| `switch_tab` | `index` | — | Switch the active tab by zero-based index. |
+| `close_tab` | — | `index` (active tab) | Close a tab. |
+| `list_tabs` | — | — | Return info about all open tabs. |
+
+**Example — open two tabs in parallel:**
+```json
+[
+  { "action": "navigate",    "url": "https://example.com" },
+  { "action": "new_tab",     "url": "https://news.ycombinator.com" },
+  { "action": "get_text",    "selector": ".itemlist" },
+  { "action": "switch_tab",  "index": 0 },
+  { "action": "get_text",    "selector": "body" }
+]
+```
+
+**REPL:** `new_tab [url]`, `switch_tab <index>`, `close_tab [index]`, `list_tabs`
+
+**API:** `POST /tabs/new`, `POST /tabs/switch`, `POST /tabs/close`, `GET /tabs/list`
+
+---
+
+### Per-step retry
+
+Any step can declare `retry` (number of extra attempts) and `retry_delay` (seconds between attempts). The step is only marked as failed after all attempts are exhausted.
+
+```json
+[
+  { "action": "click", "selector": "#dynamic-button", "retry": 3, "retry_delay": 2.0 }
+]
+```
+
+This is useful for elements that appear asynchronously, flaky network conditions, or timing-sensitive interactions.
+
+---
+
+### Execution logging
+
+Pass `log_path` to `/task/run` or `TaskPlanner.run()` to save the full execution log (steps, results, timestamp) as a JSON file in the workspace.
+
+**API:**
+```bash
+curl -X POST http://localhost:8000/task/run \
+  -H "Content-Type: application/json" \
+  -d '{"intent": "search python on google", "log_path": "logs/run.json"}'
+```
+
+**Python:**
+```python
+planner.run("search python on google", agent, log_path="logs/run.json")
+```
+
+---
+
+### `last_result` in Python scripts
+
+When a `run_python` step follows a step that produced text output (e.g. `get_text`, `read_file`, `extract_links`), the previous output is automatically injected as a Python variable named `last_result`:
+
+```json
+[
+  { "action": "get_text",    "selector": "#results" },
+  { "action": "run_python",  "code": "words = last_result.split(); print(len(words), 'words')" }
+]
+```
+
+---
+
+### `--intent` and `--workspace` CLI flags
+
+```bash
+# Run a task directly from the command line and exit
+python local_runner.py --intent "go to google and search python tutorials"
+
+# Use a custom workspace directory for all file operations
+python local_runner.py --workspace /tmp/myworkspace --intent "collect text from https://example.com and save to page.txt"
+
+# BROWSER_WORKSPACE environment variable is also honoured
+export BROWSER_WORKSPACE=/data/workspace
+python local_runner.py --intent "..."
 ```

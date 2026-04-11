@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 # Default timeout (seconds) for subprocess code/command execution.
 _DEFAULT_EXEC_TIMEOUT = 30
 
+# Maximum characters captured from stdout/stderr of a subprocess.
+# Prevents runaway scripts from filling memory with gigabytes of output.
+_MAX_OUTPUT_CHARS = 1_000_000  # ≈ 1 MB of ASCII text
+
 
 # ---------------------------------------------------------------------------
 # Path safety
@@ -265,8 +269,8 @@ class SystemTools:
                 cwd=str(self.workspace),
             )
             return {
-                "stdout":    result.stdout,
-                "stderr":    result.stderr,
+                "stdout":    result.stdout[:_MAX_OUTPUT_CHARS],
+                "stderr":    result.stderr[:_MAX_OUTPUT_CHARS],
                 "exit_code": result.returncode,
                 "success":   result.returncode == 0,
             }
@@ -289,6 +293,11 @@ class SystemTools:
 
         The command runs inside the workspace directory.
 
+        .. warning::
+            ``run_shell`` executes arbitrary shell commands.  Only pass
+            commands from trusted sources.  Never construct the command from
+            unsanitised user input.
+
         Parameters
         ----------
         command:
@@ -304,6 +313,8 @@ class SystemTools:
         dict
             ``{"stdout": ..., "stderr": ..., "exit_code": N, "success": bool}``
         """
+        if not isinstance(command, str) or not command.strip():
+            raise ValueError("command must be a non-empty string.")
         timeout = timeout or self.exec_timeout
         logger.info("run_shell: %r (timeout=%ds)", command, timeout)
 
@@ -313,12 +324,12 @@ class SystemTools:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                shell=shell,
+                shell=shell,  # noqa: S602  # shell=True is intentional — run_shell is for trusted commands
                 cwd=str(self.workspace),
             )
             return {
-                "stdout":    result.stdout,
-                "stderr":    result.stderr,
+                "stdout":    result.stdout[:_MAX_OUTPUT_CHARS],
+                "stderr":    result.stderr[:_MAX_OUTPUT_CHARS],
                 "exit_code": result.returncode,
                 "success":   result.returncode == 0,
             }

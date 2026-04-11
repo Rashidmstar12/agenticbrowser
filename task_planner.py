@@ -136,6 +136,66 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
         "optional": {"timeout": 30},
         "description": "Execute a shell command in the workspace directory.",
     },
+    # ---- Smart extraction actions ----
+    "extract_links": {
+        "required": [],
+        "optional": {"selector": "a", "limit": 100},
+        "description": "Extract all hyperlinks from the page. Returns list of {text, href}. Stored as {{last}} (JSON).",
+    },
+    "extract_table": {
+        "required": [],
+        "optional": {"selector": "table", "table_index": 0},
+        "description": "Extract an HTML table as a list of row dicts keyed by header text.",
+    },
+    # ---- Assertion actions ----
+    "assert_text": {
+        "required": ["text"],
+        "optional": {"selector": "body", "case_sensitive": False},
+        "description": "Fail the task if the given text is NOT found in the element. Use to verify page state.",
+    },
+    "assert_url": {
+        "required": ["pattern"],
+        "optional": {},
+        "description": "Fail the task if the current URL does not match the regex pattern.",
+    },
+    # ---- Wait for dynamic content ----
+    "wait_text": {
+        "required": ["text"],
+        "optional": {"selector": "body", "timeout": None},
+        "description": "Wait until the given text appears in the element (polls until timeout).",
+    },
+    # ---- Cookie persistence ----
+    "save_cookies": {
+        "required": ["path"],
+        "optional": {},
+        "description": "Save all browser cookies to a JSON file in the workspace.",
+    },
+    "load_cookies": {
+        "required": ["path"],
+        "optional": {},
+        "description": "Load cookies from a workspace JSON file into the browser context.",
+    },
+    # ---- Multi-tab actions ----
+    "new_tab": {
+        "required": [],
+        "optional": {"url": None},
+        "description": "Open a new browser tab (optionally navigate to url). Makes the new tab active.",
+    },
+    "switch_tab": {
+        "required": ["index"],
+        "optional": {},
+        "description": "Switch the active browser tab to the one at the given index.",
+    },
+    "close_tab": {
+        "required": [],
+        "optional": {"index": None},
+        "description": "Close a browser tab by index (default: current active tab).",
+    },
+    "list_tabs": {
+        "required": [],
+        "optional": {},
+        "description": "Return info about all open tabs (index, url, title, active).",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -421,6 +481,14 @@ class StepValidationError(ValueError):
     pass
 
 
+# Universal optional keys that apply to every step.
+# They are preserved by validate_steps and consumed by execute().
+_UNIVERSAL_STEP_KEYS: dict[str, Any] = {
+    "retry":       0,    # number of extra attempts after a failure
+    "retry_delay": 1.0,  # seconds to wait between retry attempts
+}
+
+
 def validate_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     Validate and normalise a list of step dicts against STEP_SCHEMA.
@@ -457,6 +525,9 @@ def validate_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for key in schema["required"]:
             normalised[key] = step[key]
         for key, default in schema["optional"].items():
+            normalised[key] = step.get(key, default)
+        # Preserve universal keys (retry, retry_delay)
+        for key, default in _UNIVERSAL_STEP_KEYS.items():
             normalised[key] = step.get(key, default)
         validated.append(normalised)
 
@@ -656,8 +727,15 @@ class TaskPlanner:
         -----
         The special token ``{{last}}`` in any string field of a step is
         replaced with the text output of the most recent step that produces
-        one (``get_text``, ``read_file``, ``run_python``, ``run_shell``).
+        one (``get_text``, ``read_file``, ``run_python``, ``run_shell``,
+        ``extract_links``, ``extract_table``).
+
+        Each step may include the universal keys ``retry`` (int, default 0)
+        and ``retry_delay`` (float seconds, default 1.0) to automatically
+        re-attempt failed steps before marking them as errors.
         """
+        import time as _time
+
         results: list[dict[str, Any]] = []
         last: str = ""
         for i, step in enumerate(steps):
@@ -666,21 +744,43 @@ class TaskPlanner:
             # Substitute {{last}} in all string values of this step.
             if last:
                 step = _interpolate_last(step, last)
-            try:
-                result = self._execute_step(agent, step)
-                # Update {{last}} from steps that produce text output.
-                if action == "get_text":
-                    last = result if isinstance(result, str) else str(result)
-                elif action == "read_file" and isinstance(result, dict):
-                    last = result.get("content", "")
-                elif action in ("run_python", "run_shell") and isinstance(result, dict):
-                    last = result.get("stdout", "")
-                results.append({"step": i, "action": action, "status": "ok", "result": result})
-            except Exception as exc:
-                logger.error("Step %d (%s) failed: %s", i, action, exc)
-                results.append({"step": i, "action": action, "status": "error", "error": str(exc)})
+
+            retry_count = int(step.get("retry", 0))
+            retry_delay = float(step.get("retry_delay", 1.0))
+            last_exc: Exception | None = None
+
+            for attempt in range(retry_count + 1):
+                try:
+                    result = self._execute_step(agent, step, last=last)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < retry_count:
+                        logger.warning(
+                            "Step %d (%s) attempt %d/%d failed (%s); retrying in %.1fs",
+                            i, action, attempt + 1, retry_count + 1, exc, retry_delay,
+                        )
+                        _time.sleep(retry_delay)
+
+            if last_exc is not None:
+                logger.error("Step %d (%s) failed after %d attempt(s): %s", i, action, retry_count + 1, last_exc)
+                results.append({"step": i, "action": action, "status": "error", "error": str(last_exc)})
                 if stop_on_error:
                     break
+                continue
+
+            # Update {{last}} from steps that produce text output.
+            if action == "get_text":
+                last = result if isinstance(result, str) else str(result)
+            elif action == "read_file" and isinstance(result, dict):
+                last = result.get("content", "")
+            elif action in ("run_python", "run_shell") and isinstance(result, dict):
+                last = result.get("stdout", "")
+            elif action in ("extract_links", "extract_table") and isinstance(result, dict):
+                import json as _json
+                last = _json.dumps(result, ensure_ascii=False)
+            results.append({"step": i, "action": action, "status": "ok", "result": result})
         return results
 
     def run(
@@ -689,12 +789,21 @@ class TaskPlanner:
         agent: Any,
         *,
         stop_on_error: bool = True,
+        log_path: str | None = None,
     ) -> dict[str, Any]:
         """
         Plan *intent* and execute the resulting steps against *agent*.
 
         Returns a summary dict with ``steps``, ``results``, and ``success`` flag.
+
+        Parameters
+        ----------
+        log_path:
+            Optional workspace-relative path (e.g. ``"logs/run.json"``) where
+            the full execution log (steps + results + timestamp) is saved.
         """
+        from datetime import datetime as _dt
+
         try:
             steps = self.plan(intent)
         except (ValueError, StepValidationError) as exc:
@@ -702,13 +811,26 @@ class TaskPlanner:
 
         results = self.execute(steps, agent, stop_on_error=stop_on_error)
         failed  = [r for r in results if r["status"] == "error"]
-        return {
-            "success": len(failed) == 0,
-            "intent":  intent,
-            "steps":   steps,
-            "results": results,
+        summary = {
+            "success":      len(failed) == 0,
+            "intent":       intent,
+            "steps":        steps,
+            "results":      results,
             "failed_count": len(failed),
         }
+
+        if log_path:
+            import json as _json
+            from datetime import timezone as _tz
+            st = self._get_system_tools()
+            log_entry = {**summary, "timestamp": _dt.now(_tz.utc).isoformat()}
+            try:
+                st.write_file(log_path, _json.dumps(log_entry, indent=2, default=str))
+                logger.info("Execution log saved to %s", log_path)
+            except Exception as exc:
+                logger.warning("Could not save execution log to %r: %s", log_path, exc)
+
+        return summary
 
     # ------------------------------------------------------------------
     # Template matching
@@ -729,7 +851,7 @@ class TaskPlanner:
     # Step executor
     # ------------------------------------------------------------------
 
-    def _execute_step(self, agent: Any, step: dict[str, Any]) -> Any:
+    def _execute_step(self, agent: Any, step: dict[str, Any], *, last: str = "") -> Any:
         action = step["action"]
 
         if action == "navigate":
@@ -779,10 +901,59 @@ class TaskPlanner:
         if action == "evaluate":
             return agent.evaluate(step["script"])
 
-        # ---- System actions (file I/O + code execution) ----
-
         if action == "get_text":
             return agent.get_text(step.get("selector", "body"))
+
+        # ---- Smart extraction ----
+
+        if action == "extract_links":
+            return agent.extract_links(
+                selector=step.get("selector", "a"),
+                limit=step.get("limit", 100),
+            )
+
+        if action == "extract_table":
+            return agent.extract_table(
+                selector=step.get("selector", "table"),
+                table_index=step.get("table_index", 0),
+            )
+
+        # ---- Assertions ----
+
+        if action == "assert_text":
+            return agent.assert_text(
+                step["text"],
+                selector=step.get("selector", "body"),
+                case_sensitive=step.get("case_sensitive", False),
+            )
+
+        if action == "assert_url":
+            return agent.assert_url(step["pattern"])
+
+        # ---- Wait for dynamic content ----
+
+        if action == "wait_text":
+            return agent.wait_text(
+                step["text"],
+                selector=step.get("selector", "body"),
+                timeout=step.get("timeout"),
+            )
+
+        # ---- Multi-tab ----
+
+        if action == "new_tab":
+            return agent.new_tab(url=step.get("url"))
+
+        if action == "switch_tab":
+            return agent.switch_tab(step["index"])
+
+        if action == "close_tab":
+            return agent.close_tab(index=step.get("index"))
+
+        if action == "list_tabs":
+            return agent.list_tabs()
+
+        # ---- System actions (file I/O + code execution) ----
 
         st = self._get_system_tools()
 
@@ -799,10 +970,27 @@ class TaskPlanner:
             return st.list_dir(step.get("path", "."))
 
         if action == "run_python":
-            return st.run_python(step["code"], timeout=step.get("timeout"))
+            # Inject the previous step's text output as `last_result` variable.
+            extra: dict[str, Any] = {"last_result": last} if last else {}
+            return st.run_python(step["code"], timeout=step.get("timeout"), extra_vars=extra or None)
 
         if action == "run_shell":
             return st.run_shell(step["command"], timeout=step.get("timeout"))
+
+        # ---- Cookie persistence ----
+
+        if action == "save_cookies":
+            import json as _json
+            cookies = agent.get_cookies()
+            st.write_file(step["path"], _json.dumps(cookies, indent=2))
+            return {"cookies_saved": len(cookies), "path": step["path"]}
+
+        if action == "load_cookies":
+            import json as _json
+            result = st.read_file(step["path"])
+            cookies = _json.loads(result["content"])
+            agent.add_cookies(cookies)
+            return {"cookies_loaded": len(cookies), "path": step["path"]}
 
         raise ValueError(f"Unknown action: {action!r}")
 

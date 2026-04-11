@@ -129,6 +129,7 @@ class BrowserAgent:
         self._browser: Browser | None = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._pages: list[Page] = []  # all open tabs; self._page is the active one
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -155,6 +156,7 @@ class BrowserAgent:
         # Auto-handle native JS dialogs (alert / confirm / prompt).
         self._page = self._context.new_page()
         self._page.on("dialog", self._handle_dialog)
+        self._pages = [self._page]  # track all open tabs
 
         logger.info("BrowserAgent started (headless=%s)", self.headless)
         return self
@@ -169,6 +171,7 @@ class BrowserAgent:
         self._context = None
         self._browser = None
         self._playwright = None
+        self._pages = []
         logger.info("BrowserAgent stopped")
 
     # Context manager support
@@ -560,3 +563,296 @@ class BrowserAgent:
             "title": self.page.title(),
             "viewport": self.page.viewport_size,
         }
+
+    # ------------------------------------------------------------------
+    # Smart extraction
+    # ------------------------------------------------------------------
+
+    def extract_links(self, selector: str = "a", limit: int = 100) -> dict[str, Any]:
+        """
+        Return all hyperlinks on the page matching *selector*.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector used to find anchor (or other) elements (default ``"a"``).
+        limit:
+            Maximum number of links to return (default ``100``).
+
+        Returns
+        -------
+        dict
+            ``{"links": [{"text": ..., "href": ...}, ...], "count": N}``
+        """
+        links: list[dict[str, Any]] = self.page.evaluate(
+            """
+            ([sel, lim]) => {
+                const els = Array.from(document.querySelectorAll(sel)).slice(0, lim);
+                return els.map(el => ({
+                    text: (el.textContent || "").trim(),
+                    href: el.href || el.getAttribute("href") || "",
+                }));
+            }
+            """,
+            [selector, limit],
+        )
+        return {"links": links, "count": len(links), "selector": selector}
+
+    def extract_table(self, selector: str = "table", table_index: int = 0) -> dict[str, Any]:
+        """
+        Extract an HTML ``<table>`` as a list of row dicts keyed by header text.
+
+        The first row is treated as the header row.  If the table has no
+        ``<thead>`` the first ``<tr>`` is used instead.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector for the table element (default ``"table"``).
+        table_index:
+            Zero-based index when the selector matches multiple tables.
+
+        Returns
+        -------
+        dict
+            ``{"rows": [{col: value, ...}, ...], "count": N, "headers": [...]}``
+        """
+        data: dict[str, Any] | None = self.page.evaluate(
+            """
+            ([sel, idx]) => {
+                const tables = document.querySelectorAll(sel);
+                const table = tables[idx];
+                if (!table) return null;
+                const rows = Array.from(table.rows);
+                if (rows.length === 0) return {headers: [], rows: [], count: 0};
+                const headers = Array.from(rows[0].cells).map(c => c.textContent.trim());
+                const dataRows = rows.slice(1).map(row => {
+                    const cells = Array.from(row.cells).map(c => c.textContent.trim());
+                    const obj = {};
+                    headers.forEach((h, i) => { obj[h || String(i)] = cells[i] ?? ""; });
+                    return obj;
+                });
+                return {headers, rows: dataRows, count: dataRows.length};
+            }
+            """,
+            [selector, table_index],
+        )
+        if data is None:
+            raise ValueError(
+                f"No table found for selector {selector!r} at index {table_index}. "
+                "Check that the page has a <table> element."
+            )
+        return data
+
+    # ------------------------------------------------------------------
+    # Assertions
+    # ------------------------------------------------------------------
+
+    def assert_text(
+        self,
+        text: str,
+        selector: str = "body",
+        case_sensitive: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Assert that *text* is present in the text content of *selector*.
+
+        Raises ``AssertionError`` (which causes the step to fail) when the
+        text is not found.  This is useful for verification steps in a task
+        plan — e.g. confirm a login succeeded before proceeding.
+
+        Returns
+        -------
+        dict
+            ``{"found": True, "text": ..., "selector": ...}``
+        """
+        content = self.get_text(selector)
+        haystack = content if case_sensitive else content.lower()
+        needle   = text    if case_sensitive else text.lower()
+        if needle not in haystack:
+            raise AssertionError(
+                f"Expected text {text!r} not found in element {selector!r}."
+            )
+        return {"found": True, "text": text, "selector": selector}
+
+    def assert_url(self, pattern: str) -> dict[str, Any]:
+        """
+        Assert that the current URL matches *pattern* (treated as a regex).
+
+        Raises ``AssertionError`` when there is no match, ``ValueError`` when
+        *pattern* is not a valid regular expression.
+
+        Returns
+        -------
+        dict
+            ``{"url": ..., "pattern": ..., "matched": True}``
+        """
+        import re as _re
+        if len(pattern) > 500:
+            raise ValueError("URL pattern too long (max 500 characters).")
+        current = self.page.url
+        try:
+            compiled = _re.compile(pattern)
+        except _re.error as exc:
+            raise ValueError(f"Invalid regex pattern {pattern!r}: {exc}") from None
+        if not compiled.search(current):
+            raise AssertionError(
+                f"URL {current!r} does not match pattern {pattern!r}."
+            )
+        return {"url": current, "pattern": pattern, "matched": True}
+
+    # ------------------------------------------------------------------
+    # Wait for dynamic content
+    # ------------------------------------------------------------------
+
+    def wait_text(
+        self,
+        text: str,
+        selector: str = "body",
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """
+        Wait until *text* appears in the text content of *selector*.
+
+        Useful when content is loaded asynchronously (e.g. after an XHR
+        completes) and a CSS-selector-based wait would be too broad.
+
+        Parameters
+        ----------
+        text:
+            The string to wait for.
+        selector:
+            CSS selector of the container element (default ``"body"``).
+        timeout:
+            Override the default timeout (milliseconds).
+
+        Returns
+        -------
+        dict
+            ``{"found": True, "text": ..., "selector": ...}``
+        """
+        import json as _json
+        timeout_ms = timeout or self.default_timeout
+        self.page.wait_for_function(
+            "([sel, txt]) => {"
+            "  const el = document.querySelector(sel);"
+            "  return el && el.textContent.includes(txt);"
+            "}",
+            arg=[selector, text],
+            timeout=timeout_ms,
+        )
+        return {"found": True, "text": text, "selector": selector}
+
+    # ------------------------------------------------------------------
+    # Cookie persistence
+    # ------------------------------------------------------------------
+
+    def get_cookies(self) -> list[dict[str, Any]]:
+        """Return all cookies for the current browser context."""
+        return self._context.cookies()  # type: ignore[union-attr]
+
+    def add_cookies(self, cookies: list[dict[str, Any]]) -> None:
+        """Add *cookies* to the current browser context."""
+        self._context.add_cookies(cookies)  # type: ignore[union-attr]
+
+    # ------------------------------------------------------------------
+    # Multi-tab management
+    # ------------------------------------------------------------------
+
+    def new_tab(self, url: str | None = None) -> dict[str, Any]:
+        """
+        Open a new browser tab and make it the active page.
+
+        Parameters
+        ----------
+        url:
+            Optional URL to navigate to immediately after opening the tab.
+
+        Returns
+        -------
+        dict
+            ``{"tab_index": N, "url": ..., "title": ...}``
+        """
+        if self._context is None:
+            raise RuntimeError("Browser is not started. Call start() first.")
+        page = self._context.new_page()
+        page.on("dialog", self._handle_dialog)
+        self._pages.append(page)
+        self._page = page
+        index = len(self._pages) - 1
+        if url:
+            self.navigate(url)
+        return {"tab_index": index, "url": self._page.url, "title": self._page.title()}
+
+    def switch_tab(self, index: int) -> dict[str, Any]:
+        """
+        Switch the active page to the tab at *index*.
+
+        Returns
+        -------
+        dict
+            ``{"tab_index": N, "url": ..., "title": ...}``
+        """
+        if index < 0 or index >= len(self._pages):
+            raise ValueError(
+                f"Tab index {index} is out of range. "
+                f"Open tabs: 0–{len(self._pages) - 1}."
+            )
+        self._page = self._pages[index]
+        return {"tab_index": index, "url": self._page.url, "title": self._page.title()}
+
+    def close_tab(self, index: int | None = None) -> dict[str, Any]:
+        """
+        Close a browser tab.
+
+        Parameters
+        ----------
+        index:
+            Tab index to close.  When ``None`` the currently active tab is
+            closed.  Raises ``RuntimeError`` if there is only one tab open.
+
+        Returns
+        -------
+        dict
+            ``{"closed_index": N, "remaining_tabs": M}``
+        """
+        if len(self._pages) <= 1:
+            raise RuntimeError(
+                "Cannot close the last open tab. "
+                "Use stop() to shut down the browser session."
+            )
+        if index is None:
+            index = self._pages.index(self._page)
+        if index < 0 or index >= len(self._pages):
+            raise ValueError(
+                f"Tab index {index} is out of range. "
+                f"Open tabs: 0–{len(self._pages) - 1}."
+            )
+        target = self._pages.pop(index)
+        target.close()
+        if self._page is target:
+            # Switch to the last remaining tab.
+            self._page = self._pages[-1]
+        return {"closed_index": index, "remaining_tabs": len(self._pages)}
+
+    def list_tabs(self) -> dict[str, Any]:
+        """
+        Return information about all open tabs.
+
+        Returns
+        -------
+        dict
+            ``{"tabs": [{"index": N, "url": ..., "title": ..., "active": bool}], "count": N}``
+        """
+        tabs = []
+        for i, page in enumerate(self._pages):
+            try:
+                tabs.append({
+                    "index":  i,
+                    "url":    page.url,
+                    "title":  page.title(),
+                    "active": page is self._page,
+                })
+            except Exception:
+                tabs.append({"index": i, "url": "unknown", "title": "unknown", "active": page is self._page})
+        return {"tabs": tabs, "count": len(tabs)}
