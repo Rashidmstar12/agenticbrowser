@@ -100,6 +100,42 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
         "optional": {},
         "description": "Run arbitrary JavaScript in the page context.",
     },
+    # ---- System actions (file I/O + code execution) ----
+    "get_text": {
+        "required": [],
+        "optional": {"selector": "body"},
+        "description": "Get the inner text of a page element and store it as {{last}}.",
+    },
+    "write_file": {
+        "required": ["path", "content"],
+        "optional": {"mode": "w"},
+        "description": "Write content to a file in the workspace. Use {{last}} to reference the previous step's result.",
+    },
+    "append_file": {
+        "required": ["path", "content"],
+        "optional": {},
+        "description": "Append content to a file in the workspace.",
+    },
+    "read_file": {
+        "required": ["path"],
+        "optional": {},
+        "description": "Read a file from the workspace.",
+    },
+    "list_dir": {
+        "required": [],
+        "optional": {"path": "."},
+        "description": "List files in the workspace directory.",
+    },
+    "run_python": {
+        "required": ["code"],
+        "optional": {"timeout": 30},
+        "description": "Execute a Python code snippet. {{last}} is injected as 'last_result' variable.",
+    },
+    "run_shell": {
+        "required": ["command"],
+        "optional": {"timeout": 30},
+        "description": "Execute a shell command in the workspace directory.",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -283,6 +319,38 @@ _TEMPLATES: list[tuple[re.Pattern[str], Any]] = [
             re.IGNORECASE,
         ),
         lambda m: _navigate_steps(m.group(1)),
+    ),
+    # "collect/scrape/get/grab text from <url> and save to <file>"
+    (
+        re.compile(
+            r"(?:collect|scrape|get|grab|fetch|extract)\s+(?:the\s+)?(?:text|content|info|information|data)\s+"
+            r"(?:from\s+)?(https?://\S+|\S+\.\S+)\s+and\s+(?:save|write|store)\s+(?:it\s+)?(?:to|in)\s+(\S+)",
+            re.IGNORECASE,
+        ),
+        lambda m: [
+            {"action": "navigate",   "url": m.group(1) if re.match(r"https?://", m.group(1)) else "https://" + m.group(1),
+             "wait_until": "domcontentloaded"},
+            {"action": "close_popups"},
+            {"action": "wait_state", "state": "networkidle"},
+            {"action": "get_text",   "selector": "body"},
+            {"action": "write_file", "path": m.group(2), "content": "{{last}}"},
+        ],
+    ),
+    # "open <url>, collect page text, save to <file>"
+    (
+        re.compile(
+            r"(?:open|go\s+to|navigate\s+to|visit)\s+(https?://\S+|\S+\.\S+)"
+            r".*?(?:collect|save|store|write).*?(?:to|in)\s+(\S+\.(?:txt|csv|json|md|html))",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        lambda m: [
+            {"action": "navigate",   "url": m.group(1) if re.match(r"https?://", m.group(1)) else "https://" + m.group(1),
+             "wait_until": "domcontentloaded"},
+            {"action": "close_popups"},
+            {"action": "wait_state", "state": "networkidle"},
+            {"action": "get_text",   "selector": "body"},
+            {"action": "write_file", "path": m.group(2), "content": "{{last}}"},
+        ],
     ),
 ]
 
