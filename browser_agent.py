@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 # changed its search box from <input name='q'> to <textarea name='q'> in 2022).
 # ---------------------------------------------------------------------------
 _SELECTOR_FALLBACKS: list[tuple[str, list[str]]] = [
-    # Google search box – swapped from <input> to <textarea> in late 2022
+    # Google search box – swapped from <input> to <textarea> in late 2022.
+    # Primary is the current format; fallback covers old cached/proxied pages.
     (
         "textarea[name='q']",
         ["input[name='q']", "[aria-label='Search']", "[title='Search']"],
