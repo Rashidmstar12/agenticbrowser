@@ -27,6 +27,19 @@ logger = logging.getLogger(__name__)
 # This insulates the agent against CSS churn on well-known sites (e.g. Google
 # changed its search box from <input name='q'> to <textarea name='q'> in 2022).
 # ---------------------------------------------------------------------------
+# Selector prefixes that use Playwright's semantic engines instead of CSS.
+# resolve_selector() handles these via page.locator() rather than query_selector(),
+# so they survive full DOM rewrites as long as the visible text / ARIA role
+# / label / placeholder stays the same.
+_SEMANTIC_PREFIXES: tuple[str, ...] = (
+    "text=",        # visible text content  e.g. text=Sign in
+    "role=",        # ARIA role             e.g. role=button
+    "label=",       # <label> text          e.g. label=Email address
+    "placeholder=", # input placeholder     e.g. placeholder=Search
+    "title=",       # title attribute       e.g. title=Close
+    "alt=",         # img alt text          e.g. alt=Company logo
+)
+
 _SELECTOR_FALLBACKS: list[tuple[str, list[str]]] = [
     # Google search box – swapped from <input> to <textarea> in late 2022.
     # Primary is the current format; fallback covers old cached/proxied pages.
