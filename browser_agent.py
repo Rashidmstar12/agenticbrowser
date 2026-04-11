@@ -19,6 +19,37 @@ from playwright.sync_api import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Selector fallback chains for popular sites.
+# Each entry: (primary_selector, [fallback_1, fallback_2, ...])
+# resolve_selector() tries the primary selector first, then each fallback in
+# order, returning the first one that matches an element on the current page.
+# This insulates the agent against CSS churn on well-known sites (e.g. Google
+# changed its search box from <input name='q'> to <textarea name='q'> in 2022).
+# ---------------------------------------------------------------------------
+_SELECTOR_FALLBACKS: list[tuple[str, list[str]]] = [
+    # Google search box – swapped from <input> to <textarea> in late 2022
+    (
+        "textarea[name='q']",
+        ["input[name='q']", "[aria-label='Search']", "[title='Search']"],
+    ),
+    # Bing search box
+    (
+        "input#sb_form_q",
+        ["input[name='q']", "[aria-label='Enter your search term']", "input[type='search']"],
+    ),
+    # YouTube search box (id can change between desktop/mobile layouts)
+    (
+        "input#search",
+        ["input[name='search_query']", "[aria-label='Search']", "input[placeholder='Search']"],
+    ),
+    # Wikipedia search box
+    (
+        "input#searchInput",
+        ["input[name='search']", "[aria-label='Search Wikipedia']", "input[type='search']"],
+    ),
+]
+
 # CSS selectors that commonly represent popup / overlay elements to auto-dismiss.
 _POPUP_SELECTORS = [
     # Cookie consent buttons (accept / agree)
@@ -215,11 +246,59 @@ class BrowserAgent:
         return {"dismissed": dismissed, "count": len(dismissed)}
 
     # ------------------------------------------------------------------
+    # Selector resolution
+    # ------------------------------------------------------------------
+
+    def resolve_selector(self, selector: str) -> str:
+        """
+        Resolve *selector* to one that actually matches an element on the
+        current page.
+
+        Tries *selector* first.  If no element is found, tries each fallback
+        registered in ``_SELECTOR_FALLBACKS``.  Raises ``ValueError``
+        immediately (no 30-second Playwright timeout) when nothing matches,
+        with a message listing every selector that was attempted.
+
+        Parameters
+        ----------
+        selector:
+            The primary CSS selector to resolve.
+
+        Returns
+        -------
+        str
+            The first selector (primary or fallback) that matches an element.
+        """
+        candidates = [selector]
+        for primary, fallbacks in _SELECTOR_FALLBACKS:
+            if selector == primary:
+                candidates.extend(fallbacks)
+                break
+
+        for candidate in candidates:
+            try:
+                el = self.page.query_selector(candidate)
+            except Exception:
+                continue
+            if el is not None:
+                if candidate != selector:
+                    logger.info(
+                        "Selector %r not found; resolved to fallback %r",
+                        selector,
+                        candidate,
+                    )
+                return candidate
+
+        tried = ", ".join(repr(c) for c in candidates)
+        raise ValueError(f"No element found on page. Tried selectors: {tried}")
+
+    # ------------------------------------------------------------------
     # Element interaction
     # ------------------------------------------------------------------
 
     def click(self, selector: str, timeout: int | None = None) -> dict[str, Any]:
         """Click the first element matching *selector*."""
+        selector = self.resolve_selector(selector)
         logger.info("Clicking '%s'", selector)
         self.page.click(selector, timeout=timeout or self.default_timeout)
         return {"clicked": selector, "url": self.page.url}
@@ -240,6 +319,7 @@ class BrowserAgent:
             When ``True`` (default) the field is cleared before typing.
         """
         logger.info("Typing into '%s'", selector)
+        selector = self.resolve_selector(selector)
         self.page.click(selector, timeout=timeout or self.default_timeout)
         if clear_first:
             self.page.fill(selector, "", timeout=timeout or self.default_timeout)
@@ -248,6 +328,7 @@ class BrowserAgent:
 
     def fill(self, selector: str, value: str, timeout: int | None = None) -> dict[str, Any]:
         """Fill *selector* with *value* (faster than type_text for long text)."""
+        selector = self.resolve_selector(selector)
         self.page.fill(selector, value, timeout=timeout or self.default_timeout)
         return {"filled": value, "selector": selector}
 
@@ -258,6 +339,7 @@ class BrowserAgent:
 
     def hover(self, selector: str) -> dict[str, Any]:
         """Move the mouse over *selector*."""
+        selector = self.resolve_selector(selector)
         self.page.hover(selector)
         return {"hovered": selector}
 
@@ -277,7 +359,11 @@ class BrowserAgent:
 
     def scroll_to_element(self, selector: str) -> dict[str, Any]:
         """Scroll the element matching *selector* into view."""
-        self.page.query_selector(selector).scroll_into_view_if_needed()  # type: ignore[union-attr]
+        selector = self.resolve_selector(selector)
+        el = self.page.query_selector(selector)
+        if el is None:
+            raise ValueError(f"Element disappeared after selector resolution: {selector!r}")
+        el.scroll_into_view_if_needed()
         return {"scrolled_to": selector}
 
     # ------------------------------------------------------------------
