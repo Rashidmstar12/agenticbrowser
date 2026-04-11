@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 COMMANDS: dict[str, str] = {
+    # Browser commands
     "navigate":           "navigate <url> [wait_until=domcontentloaded]",
     "click":              "click <selector>",
     "type":               "type <selector> <text>",
@@ -61,6 +62,17 @@ COMMANDS: dict[str, str] = {
     "info":               "info",
     "wait":               "wait <selector>",
     "wait_state":         "wait_state [networkidle|load|domcontentloaded]",
+    # Task planner commands
+    "task":               "task <intent>  — plan + execute a natural-language task",
+    "task_plan":          "task_plan <intent>  — preview the plan without executing",
+    # System tool commands
+    "write_file":         "write_file <path> <content>",
+    "append_file":        "append_file <path> <content>",
+    "read_file":          "read_file <path>",
+    "list_dir":           "list_dir [path=.]",
+    "run_python":         "run_python <code>",
+    "run_shell":          "run_shell <command>",
+    # Meta
     "help":               "help",
     "quit":               "quit",
 }
