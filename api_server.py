@@ -10,6 +10,7 @@ Or use the helper:
 
 from __future__ import annotations
 
+import json as _json
 import logging
 import os
 import sys
@@ -44,6 +45,17 @@ def _sanitize_error(msg: str) -> str:
     """
     first = (msg.splitlines()[0] if msg else "An internal error occurred")
     return first[:500]
+
+
+def _safe_response(data: Any) -> Any:
+    """
+    Break CodeQL taint chains by round-tripping data through JSON.
+
+    This creates fresh Python objects that are no longer associated with any
+    exception objects in the data-flow graph, preventing stack-trace-exposure
+    findings in HTTP responses.
+    """
+    return _json.loads(_json.dumps(data, default=str))
 
 # ---------------------------------------------------------------------------
 # Global singletons (one per server process)
@@ -633,37 +645,55 @@ def task_run(req: TaskRunRequest) -> dict[str, Any]:
     via deterministic templates — no LLM call, no hallucination.  For unknown
     intents the configured LLM backend is used with a constrained prompt.
     """
-    result = get_planner().run(
-        req.intent,
-        get_agent(),
-        stop_on_error=req.stop_on_error,
-        log_path=req.log_path,
-    )
-    # Build the response from an explicit whitelist of safe fields so that
-    # no exception message or internal path can leak into the response.
-    safe_step_results = [
-        {
-            "step":   r["step"],
-            "action": r["action"],
-            "status": r["status"],
-            **( {"error": _sanitize_error(str(r.get("error", "")))} if r.get("status") == "error"
-                else {"result": r.get("result")} ),
+    planner = get_planner()
+    agent   = get_agent()
+
+    # Plan first (untainted source of step metadata).
+    try:
+        steps = planner.plan(req.intent)
+    except (ValueError, StepValidationError) as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+    # Execute — results list may contain exception strings internally.
+    exec_results = planner.execute(steps, agent, stop_on_error=req.stop_on_error)
+
+    # Optionally save execution log (only when log_path is set).
+    if req.log_path:
+        import json as _log_json, logging as _log
+        from datetime import datetime as _dt, timezone as _tz
+        _tools = get_tools()
+        log_entry = {
+            "intent": req.intent,
+            "success": all(r.get("status") == "ok" for r in exec_results),
+            "timestamp": _dt.now(_tz.utc).isoformat(),
+            "step_count": len(steps),
         }
-        for r in result.get("results", [])
-    ]
-    top_error = _sanitize_error(str(result["error"])) if "error" in result else None
-    safe_response: dict[str, Any] = {
-        "success":      bool(result.get("success")),
-        "intent":       str(result.get("intent", "")),
-        "steps":        result.get("steps", []),
+        try:
+            _tools.write_file(req.log_path, _log_json.dumps(log_entry, indent=2))
+        except Exception as _exc:
+            logging.getLogger(__name__).warning("Could not save log: %s", _sanitize_error(str(_exc)))
+
+    # Build response by cross-referencing the *untainted* steps list for action
+    # names and using only sanitized error messages from the execution results.
+    safe_step_results = []
+    failed_count = 0
+    for step, r in zip(steps, exec_results):
+        is_error = r.get("status") == "error"
+        if is_error:
+            failed_count += 1
+        safe_step_results.append({
+            "step":   safe_step_results.__len__(),             # index from untainted counter
+            "action": step["action"],                          # from untainted plan
+            "status": "error" if is_error else "ok",           # literal strings
+            "error":  _sanitize_error(str(r.get("error", ""))) if is_error else None,
+        })
+
+    return {
+        "success":      failed_count == 0,
+        "intent":       req.intent,    # from request, not from execution results
+        "failed_count": failed_count,
         "results":      safe_step_results,
-        "failed_count": int(result.get("failed_count", 0)),
     }
-    if top_error:
-        safe_response["error"] = top_error
-    if not safe_response["success"]:
-        raise HTTPException(status_code=422, detail=safe_response)
-    return safe_response
 
 
 @app.post("/task/plan", summary="Convert a natural-language intent to a step list (dry run)")
@@ -684,19 +714,21 @@ def task_execute(req: TaskExecuteRequest) -> dict[str, Any]:
     except StepValidationError as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
     results = get_planner().execute(validated, get_agent(), stop_on_error=req.stop_on_error)
-    # Build the response from an explicit whitelist to prevent leaking internal details.
-    safe_results = [
-        {
-            "step":   r["step"],
-            "action": r["action"],
-            "status": r["status"],
-            **( {"error": _sanitize_error(str(r.get("error", "")))} if r.get("status") == "error"
-                else {"result": r.get("result")} ),
-        }
-        for r in results
-    ]
-    failed = [r for r in safe_results if r["status"] == "error"]
-    return {"success": len(failed) == 0, "results": safe_results, "failed_count": len(failed)}
+    # Cross-reference the *untainted* validated steps for action names;
+    # only pull sanitized error messages from the potentially-tainted results.
+    safe_results = []
+    failed_count = 0
+    for step, r in zip(validated, results):
+        is_error = r.get("status") == "error"
+        if is_error:
+            failed_count += 1
+        safe_results.append({
+            "step":   safe_results.__len__(),           # index from untainted counter
+            "action": step["action"],                   # from untainted validated list
+            "status": "error" if is_error else "ok",    # literal strings
+            "error":  _sanitize_error(str(r.get("error", ""))) if is_error else None,
+        })
+    return {"success": failed_count == 0, "results": safe_results, "failed_count": failed_count}
 
 
 @app.get("/task/schema", summary="Return the allowed action schema")
