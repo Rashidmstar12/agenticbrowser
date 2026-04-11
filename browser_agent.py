@@ -677,27 +677,25 @@ class BrowserAgent:
 
     def assert_url(self, pattern: str) -> dict[str, Any]:
         """
-        Assert that the current URL matches *pattern* (treated as a regex).
+        Assert that the current URL contains *pattern* as a literal substring.
 
-        Raises ``AssertionError`` when there is no match, ``ValueError`` when
-        *pattern* is not a valid regular expression.
+        Raises ``AssertionError`` when the URL does not contain the pattern.
+
+        Parameters
+        ----------
+        pattern:
+            Literal substring that must be present in the current URL
+            (e.g. ``"/dashboard"``, ``"?tab=profile"``).
 
         Returns
         -------
         dict
             ``{"url": ..., "pattern": ..., "matched": True}``
         """
-        import re as _re
-        if len(pattern) > 500:
-            raise ValueError("URL pattern too long (max 500 characters).")
         current = self.page.url
-        try:
-            compiled = _re.compile(pattern)
-        except _re.error as exc:
-            raise ValueError(f"Invalid regex pattern {pattern!r}: {exc}") from None
-        if not compiled.search(current):
+        if pattern not in current:
             raise AssertionError(
-                f"URL {current!r} does not match pattern {pattern!r}."
+                f"URL {current!r} does not contain {pattern!r}."
             )
         return {"url": current, "pattern": pattern, "matched": True}
 

@@ -156,7 +156,7 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
     "assert_url": {
         "required": ["pattern"],
         "optional": {},
-        "description": "Fail the task if the current URL does not match the regex pattern.",
+        "description": "Fail the task if the current URL does not contain the literal pattern substring.",
     },
     # ---- Wait for dynamic content ----
     "wait_text": {

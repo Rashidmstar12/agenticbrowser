@@ -286,45 +286,54 @@ class SystemTools:
         self,
         command: str,
         timeout: int | None = None,
-        shell: bool = True,
     ) -> dict[str, Any]:
         """
         Execute a shell command and return its output.
 
-        The command runs inside the workspace directory.
+        The command is split with :func:`shlex.split` and executed directly
+        (``shell=False``) — no shell is invoked and shell metacharacters such
+        as pipes, redirects, or semicolons have no special meaning.  This is
+        the safe default.
 
-        .. warning::
-            ``run_shell`` executes arbitrary shell commands.  Only pass
-            commands from trusted sources.  Never construct the command from
-            unsanitised user input.
+        For commands that genuinely require a shell (pipes, redirects, etc.),
+        use :meth:`run_python` with ``subprocess`` instead::
+
+            import subprocess, shlex
+            r = subprocess.run("ls | grep foo", shell=True, capture_output=True, text=True)
+            print(r.stdout)
 
         Parameters
         ----------
         command:
-            Shell command string (e.g. ``"ls -la"`` or ``"cat output.txt"``).
+            Command string to execute (e.g. ``"ls -la"`` or ``"cat output.txt"``).
         timeout:
             Override the instance ``exec_timeout`` (seconds).
-        shell:
-            Pass through to ``subprocess.run``; ``True`` by default so that
-            pipes, redirects, and shell builtins work.
 
         Returns
         -------
         dict
             ``{"stdout": ..., "stderr": ..., "exit_code": N, "success": bool}``
         """
+        import shlex as _shlex
+
         if not isinstance(command, str) or not command.strip():
             raise ValueError("command must be a non-empty string.")
+
+        try:
+            cmd = _shlex.split(command)
+        except ValueError as exc:
+            raise ValueError(f"Invalid command syntax: {exc}") from None
+
         timeout = timeout or self.exec_timeout
         logger.info("run_shell: %r (timeout=%ds)", command, timeout)
 
         try:
             result = subprocess.run(
-                command,
+                cmd,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                shell=shell,  # noqa: S602  # shell=True is intentional — run_shell is for trusted commands
+                shell=False,
                 cwd=str(self.workspace),
             )
             return {

@@ -639,16 +639,31 @@ def task_run(req: TaskRunRequest) -> dict[str, Any]:
         stop_on_error=req.stop_on_error,
         log_path=req.log_path,
     )
-    if not result["success"]:
-        safe_result = dict(result)
-        if "error" in safe_result:
-            safe_result["error"] = _sanitize_error(safe_result["error"])
-        safe_result["results"] = [
-            {**r, "error": _sanitize_error(r["error"])} if r.get("status") == "error" else r
-            for r in safe_result.get("results", [])
-        ]
-        raise HTTPException(status_code=422, detail=safe_result)
-    return result
+    # Build the response from an explicit whitelist of safe fields so that
+    # no exception message or internal path can leak into the response.
+    safe_step_results = [
+        {
+            "step":   r["step"],
+            "action": r["action"],
+            "status": r["status"],
+            **( {"error": _sanitize_error(str(r.get("error", "")))} if r.get("status") == "error"
+                else {"result": r.get("result")} ),
+        }
+        for r in result.get("results", [])
+    ]
+    top_error = _sanitize_error(str(result["error"])) if "error" in result else None
+    safe_response: dict[str, Any] = {
+        "success":      bool(result.get("success")),
+        "intent":       str(result.get("intent", "")),
+        "steps":        result.get("steps", []),
+        "results":      safe_step_results,
+        "failed_count": int(result.get("failed_count", 0)),
+    }
+    if top_error:
+        safe_response["error"] = top_error
+    if not safe_response["success"]:
+        raise HTTPException(status_code=422, detail=safe_response)
+    return safe_response
 
 
 @app.post("/task/plan", summary="Convert a natural-language intent to a step list (dry run)")
@@ -659,6 +674,9 @@ def task_plan(req: TaskPlanRequest) -> dict[str, Any]:
         return {"intent": req.intent, "steps": steps, "count": len(steps)}
     except (ValueError, StepValidationError) as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+
+@app.post("/task/execute", summary="Execute a pre-built step list")
 def task_execute(req: TaskExecuteRequest) -> dict[str, Any]:
     """Run an already-built list of step dicts directly (re-validated before execution)."""
     try:
@@ -666,8 +684,15 @@ def task_execute(req: TaskExecuteRequest) -> dict[str, Any]:
     except StepValidationError as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
     results = get_planner().execute(validated, get_agent(), stop_on_error=req.stop_on_error)
+    # Build the response from an explicit whitelist to prevent leaking internal details.
     safe_results = [
-        {**r, "error": _sanitize_error(r["error"])} if r.get("status") == "error" else r
+        {
+            "step":   r["step"],
+            "action": r["action"],
+            "status": r["status"],
+            **( {"error": _sanitize_error(str(r.get("error", "")))} if r.get("status") == "error"
+                else {"result": r.get("result")} ),
+        }
         for r in results
     ]
     failed = [r for r in safe_results if r["status"] == "error"]
