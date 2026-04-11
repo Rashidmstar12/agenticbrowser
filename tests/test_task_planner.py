@@ -181,7 +181,7 @@ class TestTaskPlannerTemplates:
         # First navigate URL must point to google
         planner = self._planner()
         steps = planner.plan("go to google and search python")
-        assert "google.com" in steps[0]["url"]
+        assert steps[0]["url"] == "https://www.google.com"
 
     def test_google_search_variant(self) -> None:
         actions = self._actions("search for cats on google")
@@ -194,7 +194,7 @@ class TestTaskPlannerTemplates:
         assert "navigate" in actions
         planner = self._planner()
         steps = planner.plan("search python on bing")
-        assert "bing.com" in steps[0]["url"]
+        assert steps[0]["url"] == "https://www.bing.com"
 
     # DuckDuckGo
     def test_ddg_search(self) -> None:
@@ -206,13 +206,13 @@ class TestTaskPlannerTemplates:
     def test_youtube_search(self) -> None:
         planner = self._planner()
         steps = planner.plan("search cats on youtube")
-        assert "youtube.com" in steps[0]["url"]
+        assert steps[0]["url"] == "https://www.youtube.com"
 
     # Wikipedia
     def test_wikipedia_search(self) -> None:
         planner = self._planner()
         steps = planner.plan("search Python on wikipedia")
-        assert "wikipedia.org" in steps[0]["url"]
+        assert steps[0]["url"] == "https://en.wikipedia.org"
 
     # Navigate
     def test_navigate_https_url(self) -> None:
@@ -222,8 +222,7 @@ class TestTaskPlannerTemplates:
     def test_navigate_bare_domain(self) -> None:
         planner = self._planner()
         steps = planner.plan("open example.com")
-        assert steps[0]["url"].startswith("https://")
-        assert "example.com" in steps[0]["url"]
+        assert steps[0]["url"] == "https://example.com"
 
     # Scrape-and-save template
     def test_scrape_and_save(self) -> None:
