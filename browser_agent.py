@@ -729,7 +729,6 @@ class BrowserAgent:
         dict
             ``{"found": True, "text": ..., "selector": ...}``
         """
-        import json as _json
         timeout_ms = timeout or self.default_timeout
         self.page.wait_for_function(
             "([sel, txt]) => {"

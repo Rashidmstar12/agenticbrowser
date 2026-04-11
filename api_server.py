@@ -13,18 +13,16 @@ from __future__ import annotations
 import json as _json
 import logging
 import os
-import sys
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from browser_agent import BrowserAgent
 from system_tools import SystemTools
-from task_planner import TaskPlanner, StepValidationError, validate_steps, STEP_SCHEMA
+from task_planner import STEP_SCHEMA, StepValidationError, TaskPlanner, validate_steps
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -677,7 +675,8 @@ def task_run(req: TaskRunRequest) -> dict[str, Any]:
     # exposing them in the HTTP response.
     if req.log_path:
         import json as _log_json
-        from datetime import datetime as _dt, timezone as _tz
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
         _tools = get_tools()
         log_entry = {
             "intent":       req.intent,

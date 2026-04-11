@@ -25,12 +25,11 @@ import argparse
 import json
 import logging
 import os
-import sys
 from typing import Any
 
 from browser_agent import BrowserAgent
 from system_tools import SystemTools
-from task_planner import TaskPlanner, StepValidationError, validate_steps
+from task_planner import TaskPlanner, validate_steps
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -256,7 +255,7 @@ def _dispatch(
             path = parts[1] if len(parts) > 1 else input("  Path: ").strip()
             cookies = agent.get_cookies()
             if tools is None:
-                print(f"  Error: workspace not configured. Use --workspace.")
+                print("  Error: workspace not configured. Use --workspace.")
                 return None
             tools.write_file(path, json.dumps(cookies, indent=2))
             print(f"  Saved {len(cookies)} cookies to {path}")
@@ -265,7 +264,7 @@ def _dispatch(
         elif cmd == "load_cookies":
             path = parts[1] if len(parts) > 1 else input("  Path: ").strip()
             if tools is None:
-                print(f"  Error: workspace not configured. Use --workspace.")
+                print("  Error: workspace not configured. Use --workspace.")
                 return None
             r = tools.read_file(path)
             cookies = json.loads(r["content"])
