@@ -540,6 +540,28 @@ def _call_ollama(intent: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _interpolate_last(step: dict[str, Any], last: str) -> dict[str, Any]:
+    """
+    Return a copy of *step* with the token ``{{last}}`` replaced by *last*
+    in every string value.
+
+    This lets steps reference the text output of a previous step without
+    the LLM having to hard-code values.  For example::
+
+        {"action": "write_file", "path": "out.txt", "content": "{{last}}"}
+
+    writes the text extracted by the preceding ``get_text`` step.
+    """
+    return {
+        k: v.replace("{{last}}", last) if isinstance(v, str) else v
+        for k, v in step.items()
+    }
+
+
+# ---------------------------------------------------------------------------
 # TaskPlanner
 # ---------------------------------------------------------------------------
 
@@ -559,6 +581,7 @@ class TaskPlanner:
 
     def __init__(self, llm: str | None = None) -> None:
         self.llm = llm or self._detect_llm()
+        self._system_tools: Any = None  # lazy-created on first system action
 
     @staticmethod
     def _detect_llm() -> str | None:
@@ -567,6 +590,13 @@ class TaskPlanner:
         if os.environ.get("OLLAMA_HOST") or _ollama_running():
             return "ollama"
         return None
+
+    def _get_system_tools(self) -> Any:
+        """Return (and lazily create) the shared SystemTools instance."""
+        if self._system_tools is None:
+            from system_tools import SystemTools  # local import avoids hard dep
+            self._system_tools = SystemTools()
+        return self._system_tools
 
     # ------------------------------------------------------------------
     # Public API
@@ -621,13 +651,30 @@ class TaskPlanner:
         stop_on_error:
             If ``True`` (default), execution stops on the first failed step.
             If ``False``, failures are recorded but execution continues.
+
+        Notes
+        -----
+        The special token ``{{last}}`` in any string field of a step is
+        replaced with the text output of the most recent step that produces
+        one (``get_text``, ``read_file``, ``run_python``, ``run_shell``).
         """
         results: list[dict[str, Any]] = []
+        last: str = ""
         for i, step in enumerate(steps):
             action = step["action"]
             logger.info("Step %d/%d: %s", i + 1, len(steps), action)
+            # Substitute {{last}} in all string values of this step.
+            if last:
+                step = _interpolate_last(step, last)
             try:
                 result = self._execute_step(agent, step)
+                # Update {{last}} from steps that produce text output.
+                if action == "get_text":
+                    last = result if isinstance(result, str) else str(result)
+                elif action == "read_file" and isinstance(result, dict):
+                    last = result.get("content", "")
+                elif action in ("run_python", "run_shell") and isinstance(result, dict):
+                    last = result.get("stdout", "")
                 results.append({"step": i, "action": action, "status": "ok", "result": result})
             except Exception as exc:
                 logger.error("Step %d (%s) failed: %s", i, action, exc)
@@ -682,8 +729,7 @@ class TaskPlanner:
     # Step executor
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _execute_step(agent: Any, step: dict[str, Any]) -> Any:
+    def _execute_step(self, agent: Any, step: dict[str, Any]) -> Any:
         action = step["action"]
 
         if action == "navigate":
@@ -732,6 +778,31 @@ class TaskPlanner:
 
         if action == "evaluate":
             return agent.evaluate(step["script"])
+
+        # ---- System actions (file I/O + code execution) ----
+
+        if action == "get_text":
+            return agent.get_text(step.get("selector", "body"))
+
+        st = self._get_system_tools()
+
+        if action == "write_file":
+            return st.write_file(step["path"], step["content"], mode=step.get("mode", "w"))
+
+        if action == "append_file":
+            return st.append_file(step["path"], step["content"])
+
+        if action == "read_file":
+            return st.read_file(step["path"])
+
+        if action == "list_dir":
+            return st.list_dir(step.get("path", "."))
+
+        if action == "run_python":
+            return st.run_python(step["code"], timeout=step.get("timeout"))
+
+        if action == "run_shell":
+            return st.run_shell(step["command"], timeout=step.get("timeout"))
 
         raise ValueError(f"Unknown action: {action!r}")
 

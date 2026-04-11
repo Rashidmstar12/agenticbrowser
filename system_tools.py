@@ -133,10 +133,14 @@ class SystemTools:
         """
         target = safe_path(self.workspace, path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding=encoding) if mode == "w" else \
-            target.open("a", encoding=encoding).write(content)
+        if mode == "w":
+            target.write_text(content, encoding=encoding)
+        else:
+            with target.open("a", encoding=encoding) as fh:
+                fh.write(content)
         size = len(content.encode(encoding))
         logger.info("write_file: %s (%d bytes, mode=%s)", target, size, mode)
+        # bytes_written counts only the newly-written bytes, not the total file size.
         return {"path": str(target), "bytes_written": size, "mode": mode}
 
     def append_file(self, path: str, content: str, encoding: str = "utf-8") -> dict[str, Any]:

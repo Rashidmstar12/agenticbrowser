@@ -473,12 +473,7 @@ Use `{{last}}` in any string field of a step to reference the **text result of t
 ]
 ```
 
-You can also reference a specific earlier step by index:
-```
-{{step_0}}   →  result of step 0
-{{step_1}}   →  result of step 1
-{{last}}     →  result of the most recent step
-```
+Only `{{last}}` is supported; it always refers to the most recent step that produced text output.
 
 ---
 

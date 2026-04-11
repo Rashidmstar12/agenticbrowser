@@ -32,6 +32,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_error(msg: str) -> str:
+    """
+    Return only the first line of an error message, capped at 500 characters.
+
+    This prevents leaking internal file paths, module names, or stack trace
+    details into HTTP responses while still surfacing a useful error string.
+    """
+    first = (msg.splitlines()[0] if msg else "An internal error occurred")
+    return first[:500]
+
 # ---------------------------------------------------------------------------
 # Global agent instance (one per server process)
 # ---------------------------------------------------------------------------
@@ -360,7 +371,15 @@ def task_run(req: TaskRunRequest) -> dict[str, Any]:
     """
     result = get_planner().run(req.intent, get_agent(), stop_on_error=req.stop_on_error)
     if not result["success"]:
-        raise HTTPException(status_code=422, detail=result)
+        # Sanitize error strings before exposing them in the HTTP response.
+        safe_result = dict(result)
+        if "error" in safe_result:
+            safe_result["error"] = _sanitize_error(safe_result["error"])
+        safe_result["results"] = [
+            {**r, "error": _sanitize_error(r["error"])} if r.get("status") == "error" else r
+            for r in safe_result.get("results", [])
+        ]
+        raise HTTPException(status_code=422, detail=safe_result)
     return result
 
 
@@ -388,8 +407,13 @@ def task_execute(req: TaskExecuteRequest) -> dict[str, Any]:
     except StepValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     results = get_planner().execute(validated, get_agent(), stop_on_error=req.stop_on_error)
-    failed  = [r for r in results if r["status"] == "error"]
-    return {"success": len(failed) == 0, "results": results, "failed_count": len(failed)}
+    # Sanitize any exception messages before returning to the client.
+    safe_results = [
+        {**r, "error": _sanitize_error(r["error"])} if r.get("status") == "error" else r
+        for r in results
+    ]
+    failed = [r for r in safe_results if r["status"] == "error"]
+    return {"success": len(failed) == 0, "results": safe_results, "failed_count": len(failed)}
 
 
 @app.get("/task/schema", summary="Return the allowed action schema")

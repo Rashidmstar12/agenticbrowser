@@ -197,6 +197,41 @@ class BrowserAgent:
     # Navigation
     # ------------------------------------------------------------------
 
+    def _try_networkidle(self, timeout: int = 5_000) -> bool:
+        """
+        Attempt to wait for the ``networkidle`` load state.
+
+        Unlike :meth:`wait_for_load_state`, this method catches
+        ``TimeoutError`` and falls back to ``"load"`` so that SPAs with
+        persistent background network activity (WebSockets, analytics, etc.)
+        never cause the agent to hang indefinitely.
+
+        Parameters
+        ----------
+        timeout:
+            Milliseconds to wait for networkidle before giving up (default
+            5 000 ms — enough for normal pages, short enough to fail fast on
+            SPAs).
+
+        Returns
+        -------
+        bool
+            ``True`` if networkidle was reached, ``False`` if the fallback was
+            used.
+        """
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=timeout)
+            return True
+        except Exception:
+            logger.debug(
+                "networkidle not reached within %d ms; falling back to 'load'", timeout
+            )
+            try:
+                self.page.wait_for_load_state("load", timeout=timeout)
+            except Exception:
+                pass
+            return False
+
     def navigate(self, url: str, wait_until: str = "domcontentloaded") -> dict[str, Any]:
         """
         Navigate to *url*.
@@ -207,7 +242,10 @@ class BrowserAgent:
             Target URL (e.g. ``"https://example.com"``).
         wait_until:
             Playwright load-state strategy: ``"load"``, ``"domcontentloaded"``,
-            or ``"networkidle"``.
+            or ``"networkidle"``.  When ``"networkidle"`` is requested the page
+            is loaded with ``"domcontentloaded"`` first and then a best-effort
+            networkidle wait is attempted (see :meth:`_try_networkidle`).  This
+            prevents SPAs with background requests from hanging forever.
 
         Returns
         -------
@@ -215,7 +253,12 @@ class BrowserAgent:
             ``{"url": ..., "title": ...}``
         """
         logger.info("Navigating to %s", url)
-        self.page.goto(url, wait_until=wait_until)
+        # Navigate with a reliable load event; networkidle is attempted separately
+        # to avoid infinite hangs on SPAs that never stop making network requests.
+        actual_wait = "domcontentloaded" if wait_until == "networkidle" else wait_until
+        self.page.goto(url, wait_until=actual_wait)
+        if wait_until == "networkidle":
+            self._try_networkidle()
         if self.auto_close_popups:
             self.close_popups()
         return {"url": self.page.url, "title": self.page.title()}
@@ -268,21 +311,33 @@ class BrowserAgent:
         Resolve *selector* to one that actually matches an element on the
         current page.
 
-        Tries *selector* first.  If no element is found, tries each fallback
-        registered in ``_SELECTOR_FALLBACKS``.  Raises ``ValueError``
-        immediately (no 30-second Playwright timeout) when nothing matches,
-        with a message listing every selector that was attempted.
+        Semantic selectors (``text=``, ``role=``, ``label=``, ``placeholder=``,
+        ``title=``, ``alt=``) are handled via Playwright's locator engine which
+        understands ARIA semantics and survives DOM rewrites.  CSS selectors are
+        tried first, then each fallback registered in ``_SELECTOR_FALLBACKS``.
+
+        Raises ``ValueError`` immediately (no 30-second Playwright timeout)
+        when nothing matches, with a message listing every selector tried.
 
         Parameters
         ----------
         selector:
-            The primary CSS selector to resolve.
+            The primary CSS / semantic selector to resolve.
 
         Returns
         -------
         str
             The first selector (primary or fallback) that matches an element.
         """
+        # Semantic selectors use page.locator(), not query_selector().
+        if selector.startswith(_SEMANTIC_PREFIXES):
+            try:
+                if self.page.locator(selector).count() > 0:
+                    return selector
+            except Exception:
+                pass
+            raise ValueError(f"No element found for semantic selector: {selector!r}")
+
         candidates = [selector]
         for primary, fallbacks in _SELECTOR_FALLBACKS:
             if selector == primary:
@@ -359,6 +414,7 @@ class BrowserAgent:
 
     def select_option(self, selector: str, value: str) -> dict[str, Any]:
         """Select an ``<option>`` in a ``<select>`` element by value or label."""
+        selector = self.resolve_selector(selector)
         self.page.select_option(selector, value)
         return {"selected": value, "selector": selector}
 
@@ -481,7 +537,15 @@ class BrowserAgent:
         return {"url": self.page.url}
 
     def wait_for_load_state(self, state: str = "networkidle") -> dict[str, Any]:
-        """Wait for a specific load state (``"load"``, ``"domcontentloaded"``, ``"networkidle"``)."""
+        """Wait for a specific load state (``"load"``, ``"domcontentloaded"``, ``"networkidle"``).
+
+        When *state* is ``"networkidle"`` a best-effort wait with a short
+        timeout is used so that SPAs with persistent background requests do not
+        hang the agent.
+        """
+        if state == "networkidle":
+            reached = self._try_networkidle()
+            return {"state": "networkidle", "reached": reached}
         self.page.wait_for_load_state(state)
         return {"state": state}
 
