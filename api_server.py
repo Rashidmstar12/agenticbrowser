@@ -267,6 +267,53 @@ class CloseTabRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Request models — high-priority advanced interactions
+# ---------------------------------------------------------------------------
+
+class UploadFileRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector of the <input type='file'> element")
+    path: str = Field(..., description="Workspace-relative path of the file to upload. Separate multiple files with '|'.")
+
+
+class DownloadFileRequest(BaseModel):
+    url: str = Field(..., description="Direct download URL")
+    path: str = Field(..., description="Workspace-relative path where the file will be saved")
+
+
+class DragDropRequest(BaseModel):
+    source: str = Field(..., description="CSS selector of the element to drag")
+    target: str = Field(..., description="CSS selector of the drop target")
+
+
+class RightClickRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector of the element to right-click")
+
+
+class DoubleClickRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector of the element to double-click")
+
+
+class GetElementRectRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector of the element")
+
+
+class SetNetworkInterceptRequest(BaseModel):
+    url_pattern: str = Field(..., description="Glob pattern (e.g. '**/*.png') to match request URLs")
+    action: str = Field("abort", description="'abort' to block the request, 'continue' to pass it through")
+
+
+class SetViewportRequest(BaseModel):
+    width: int = Field(..., description="Viewport width in pixels")
+    height: int = Field(..., description="Viewport height in pixels")
+
+
+class SetGeolocationRequest(BaseModel):
+    latitude: float = Field(..., description="Latitude in decimal degrees (-90 to 90)")
+    longitude: float = Field(..., description="Longitude in decimal degrees (-180 to 180)")
+    accuracy: float = Field(10.0, description="Accuracy radius in metres")
+
+
+# ---------------------------------------------------------------------------
 # Request models — system tools
 # ---------------------------------------------------------------------------
 
@@ -580,6 +627,62 @@ def close_tab(req: CloseTabRequest) -> dict[str, Any]:
 @app.get("/tabs/list", summary="List all open browser tabs")
 def list_tabs() -> dict[str, Any]:
     return get_agent().list_tabs()
+
+
+# ---------------------------------------------------------------------------
+# Routes: high-priority advanced interactions
+# ---------------------------------------------------------------------------
+
+@app.post("/upload_file", summary="Set file(s) on a file input element")
+def upload_file(req: UploadFileRequest) -> dict[str, Any]:
+    file_path = str(get_tools().workspace / req.path)
+    return get_agent().upload_file(req.selector, file_path)
+
+
+@app.post("/download_file", summary="Navigate to a URL and save the triggered download")
+def download_file(req: DownloadFileRequest) -> dict[str, Any]:
+    save_path = str(get_tools().workspace / req.path)
+    return get_agent().download_file(req.url, save_path)
+
+
+@app.post("/drag_drop", summary="Drag an element and drop it on another element")
+def drag_drop(req: DragDropRequest) -> dict[str, Any]:
+    return get_agent().drag_and_drop(req.source, req.target)
+
+
+@app.post("/right_click", summary="Right-click (context-menu) an element")
+def right_click(req: RightClickRequest) -> dict[str, Any]:
+    return get_agent().right_click(req.selector)
+
+
+@app.post("/double_click", summary="Double-click an element")
+def double_click(req: DoubleClickRequest) -> dict[str, Any]:
+    return get_agent().double_click(req.selector)
+
+
+@app.post("/page/rect", summary="Get the bounding box of an element")
+def get_element_rect(req: GetElementRectRequest) -> dict[str, Any]:
+    return get_agent().get_element_rect(req.selector)
+
+
+@app.post("/network/intercept", summary="Intercept (block or pass through) requests matching a URL pattern")
+def set_network_intercept(req: SetNetworkInterceptRequest) -> dict[str, Any]:
+    return get_agent().set_network_intercept(req.url_pattern, action=req.action)
+
+
+@app.post("/network/clear_intercepts", summary="Remove all network intercept routes")
+def clear_network_intercepts() -> dict[str, Any]:
+    return get_agent().clear_network_intercepts()
+
+
+@app.post("/session/viewport", summary="Resize the browser viewport")
+def set_viewport(req: SetViewportRequest) -> dict[str, Any]:
+    return get_agent().set_viewport(req.width, req.height)
+
+
+@app.post("/session/geolocation", summary="Override the browser geolocation")
+def set_geolocation(req: SetGeolocationRequest) -> dict[str, Any]:
+    return get_agent().set_geolocation(req.latitude, req.longitude, accuracy=req.accuracy)
 
 
 # ---------------------------------------------------------------------------

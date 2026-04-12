@@ -15,12 +15,12 @@ Basic usage::
 from agenticbrowser.browser import Browser
 from agenticbrowser.models import (
     ActionResult,
+    BrowserOptions,
+    Element,
+    ElementsResult,
     NavigateResult,
     ScreenshotResult,
     TextResult,
-    ElementsResult,
-    Element,
-    BrowserOptions,
 )
 
 __all__ = [

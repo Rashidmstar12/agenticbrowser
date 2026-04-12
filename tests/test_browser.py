@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from agenticbrowser import Browser, BrowserOptions
-from agenticbrowser.models import ActionResult, NavigateResult
 
 
 class TestBrowserLifecycle:
