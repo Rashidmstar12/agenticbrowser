@@ -721,3 +721,57 @@ class TestSetViewportValidation:
             c = TestClient(app)
             r = c.post("/session/viewport", json={"width": 1280, "height": 720})
         assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# /screenshot path traversal protection (Bug fix regression)
+# ---------------------------------------------------------------------------
+
+class TestScreenshotPathTraversal:
+    def test_screenshot_traversal_path_rejected(self):
+        """A path escaping the workspace must return 422."""
+        agent = _make_agent()
+        tools = SystemTools()  # default workspace = ./workspace
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post("/screenshot", json={"path": "../../../etc/evil.png"})
+        assert r.status_code == 422
+
+    def test_screenshot_absolute_path_outside_workspace_rejected(self):
+        """An absolute path outside the workspace must return 422."""
+        agent = _make_agent()
+        tools = SystemTools()
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post("/screenshot", json={"path": "/tmp/evil.png"})
+        assert r.status_code == 422
+
+    def test_screenshot_safe_path_accepted(self):
+        """A normal workspace-relative path must pass through to the agent."""
+        agent = _make_agent()
+        agent.screenshot.return_value = {"path": "shot.png", "base64": None}
+        tools = SystemTools()
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post("/screenshot", json={"path": "shot.png"})
+        assert r.status_code == 200
+        # The path passed to the agent must be absolute (resolved by safe_path)
+        _args, kwargs = agent.screenshot.call_args
+        called_path = kwargs.get("path")
+        assert called_path is not None
+        # Confirm it ends with the requested filename
+        assert str(called_path).endswith("shot.png")
+
+    def test_screenshot_no_path_no_validation(self):
+        """Omitting path entirely (base64 mode) should still succeed."""
+        agent = _make_agent()
+        agent.screenshot.return_value = {"path": None, "base64": "abc=="}
+        tools = SystemTools()
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post("/screenshot", json={})
+        assert r.status_code == 200

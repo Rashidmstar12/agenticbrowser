@@ -922,3 +922,60 @@ class TestSetNetworkIntercept:
         result = agent.clear_network_intercepts()
         assert result["cleared"] == 1
         assert len(agent._intercept_patterns) == 0
+
+
+# ---------------------------------------------------------------------------
+# download_file URL scheme validation (Bug fix regression)
+# ---------------------------------------------------------------------------
+
+class TestDownloadFileURLValidation:
+    def test_download_http_allowed(self):
+        """http:// URLs should be accepted and page.goto called."""
+        agent, page, _ = _make_agent()
+        dl = MagicMock()
+        dl.suggested_filename = "file.zip"
+        page.expect_download.return_value.__enter__ = MagicMock(return_value=MagicMock(value=dl))
+        page.expect_download.return_value.__exit__ = MagicMock(return_value=False)
+        # Just asserting no ValueError is raised
+        try:
+            agent.download_file("http://example.com/file.zip", "/tmp/file.zip")
+        except Exception as exc:
+            # Any exception other than ValueError for scheme is acceptable
+            # (the mock may raise on save_as, etc.)
+            assert "Unsafe URL scheme" not in str(exc)
+
+    def test_download_https_allowed(self):
+        """https:// URLs should be accepted."""
+        agent, page, _ = _make_agent()
+        try:
+            agent.download_file("https://example.com/file.zip", "/tmp/file.zip")
+        except Exception as exc:
+            assert "Unsafe URL scheme" not in str(exc)
+
+    def test_download_javascript_blocked(self):
+        """javascript: URLs must be rejected before page.goto is called."""
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.download_file("javascript:alert(1)", "/tmp/evil.js")
+        page.goto.assert_not_called()
+
+    def test_download_file_blocked(self):
+        """file:// URLs must be rejected."""
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.download_file("file:///etc/passwd", "/tmp/passwd")
+        page.goto.assert_not_called()
+
+    def test_download_data_blocked(self):
+        """data: URIs must be rejected."""
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.download_file("data:text/html,<h1>xss</h1>", "/tmp/xss.html")
+        page.goto.assert_not_called()
+
+    def test_download_no_scheme_blocked(self):
+        """A plain hostname with no scheme must be rejected."""
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.download_file("example.com/file.zip", "/tmp/file.zip")
+        page.goto.assert_not_called()

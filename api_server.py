@@ -524,7 +524,14 @@ def evaluate(req: EvaluateRequest) -> dict[str, Any]:
 
 @app.post("/screenshot", summary="Take a screenshot")
 def screenshot(req: ScreenshotRequest) -> dict[str, Any]:
-    return get_agent().screenshot(path=req.path, full_page=req.full_page, as_base64=req.as_base64)
+    safe_screenshot_path: str | None = None
+    if req.path is not None:
+        tools = get_tools()
+        try:
+            safe_screenshot_path = str(safe_path(tools.workspace, req.path))
+        except PathTraversalError as exc:
+            raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+    return get_agent().screenshot(path=safe_screenshot_path, full_page=req.full_page, as_base64=req.as_base64)
 
 
 # ---------------------------------------------------------------------------

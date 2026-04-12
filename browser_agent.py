@@ -937,6 +937,11 @@ class BrowserAgent:
         dict
             ``{"saved_to": ..., "filename": ..., "ok": True}``
         """
+        if not url.startswith(_ALLOWED_URL_SCHEMES):
+            raise ValueError(
+                f"Unsafe URL scheme in {url!r}. "
+                f"Only {_ALLOWED_URL_SCHEMES} are allowed."
+            )
         with self.page.expect_download() as download_info:
             self.page.goto(url, wait_until="domcontentloaded")
         download = download_info.value
