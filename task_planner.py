@@ -742,6 +742,8 @@ class TaskPlanner:
         agent: Any,  # BrowserAgent (avoid circular import)
         *,
         stop_on_error: bool = True,
+        step_callback: Any = None,
+        step_start_callback: Any = None,
     ) -> list[dict[str, Any]]:
         """
         Execute *steps* against *agent*, returning a result record for each step.
@@ -751,6 +753,14 @@ class TaskPlanner:
         stop_on_error:
             If ``True`` (default), execution stops on the first failed step.
             If ``False``, failures are recorded but execution continues.
+        step_start_callback:
+            Optional callable ``(step_index: int, action: str) -> None`` invoked
+            immediately *before* each step begins.  Useful for real-time progress
+            reporting (e.g. WebSocket streaming).
+        step_callback:
+            Optional callable ``(result: dict) -> None`` invoked immediately
+            *after* each step finishes (both ok and error).  The dict has the
+            same shape as the elements of the returned list.
 
         Notes
         -----
@@ -770,6 +780,9 @@ class TaskPlanner:
         for i, step in enumerate(steps):
             action = step["action"]
             logger.info("Step %d/%d: %s", i + 1, len(steps), action)
+            # Notify caller that this step is about to start.
+            if step_start_callback is not None:
+                step_start_callback(i, action)
             # Substitute {{last}} in all string values of this step.
             if last:
                 step = _interpolate_last(step, last)
@@ -794,7 +807,10 @@ class TaskPlanner:
 
             if last_exc is not None:
                 logger.error("Step %d (%s) failed after %d attempt(s): %s", i, action, retry_count + 1, last_exc)
-                results.append({"step": i, "action": action, "status": "error", "error": str(last_exc)})
+                err_record: dict[str, Any] = {"step": i, "action": action, "status": "error", "error": str(last_exc)}
+                results.append(err_record)
+                if step_callback is not None:
+                    step_callback(err_record)
                 if stop_on_error:
                     break
                 continue
@@ -809,7 +825,10 @@ class TaskPlanner:
             elif action in ("extract_links", "extract_table") and isinstance(result, dict):
                 import json as _json
                 last = _json.dumps(result, ensure_ascii=False)
-            results.append({"step": i, "action": action, "status": "ok", "result": result})
+            ok_record: dict[str, Any] = {"step": i, "action": action, "status": "ok", "result": result}
+            results.append(ok_record)
+            if step_callback is not None:
+                step_callback(ok_record)
         return results
 
     def run(

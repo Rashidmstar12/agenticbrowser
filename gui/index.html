@@ -16,6 +16,10 @@
       border: 2px solid #6366f1; border-top-color: transparent;
       border-radius: 50%; animation: spin .7s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
+    /* Pulse ring shown on the active-running step pill */
+    .pill-active { outline: 2px solid #6366f1; outline-offset: 2px;
+      animation: pillPulse 1s ease-in-out infinite; }
+    @keyframes pillPulse { 0%,100% { outline-color: #6366f1; } 50% { outline-color: #a5b4fc; } }
     ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
   </style>
 </head>
@@ -394,18 +398,29 @@ function runTask() {
     const msg = JSON.parse(ev.data);
 
     if (msg.type === 'planned') {
+      // Render all step pills; all start with a dimmed spinner (not yet active)
       planEl.innerHTML = msg.actions.map((a, i) =>
-        `<span class="inline-flex items-center gap-1 px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full text-xs">
+        `<span id="step-pill-${i}" class="inline-flex items-center gap-1 px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full text-xs opacity-50">
           <span class="text-indigo-400">${i + 1}.</span>${a}
           <span id="step-icon-${i}" class="ml-1"><span class="spinner"></span></span>
         </span>`
       ).join('');
 
+    } else if (msg.type === 'step_start') {
+      // Highlight the active pill with a pulse ring and full opacity
+      const pill = document.getElementById(`step-pill-${msg.step}`);
+      if (pill) {
+        pill.classList.remove('opacity-50');
+        pill.classList.add('pill-active');
+      }
+
     } else if (msg.type === 'step_done') {
       const icon = msg.status === 'ok' ? '✅' : '❌';
-      // Update pill icon
-      const pill = document.getElementById(`step-icon-${msg.step}`);
-      if (pill) pill.innerHTML = icon;
+      // Remove active pulse from pill; show result icon
+      const pill = document.getElementById(`step-pill-${msg.step}`);
+      if (pill) pill.classList.remove('pill-active');
+      const iconEl = document.getElementById(`step-icon-${msg.step}`);
+      if (iconEl) iconEl.innerHTML = icon;
       // Add to log
       const row = document.createElement('div');
       row.className = 'step-row flex items-start gap-2 py-1.5 border-b border-gray-100 last:border-0';

@@ -875,10 +875,15 @@ async def ws_task(websocket: WebSocket) -> None:
     --------
     Client  → ``{"intent": "<natural language task>"}``
 
-    Server  → ``{"type": "planned",   "step_count": N, "actions": [...]}``
-            → ``{"type": "step_done", "step": i, "action": "...", "status": "ok"|"error", "error": "..."}``
-            → ``{"type": "done",      "success": bool, "failed_count": N}``
-            → ``{"type": "error",     "message": "..."}``  (on unrecoverable errors)
+    Server  → ``{"type": "planned",    "step_count": N, "actions": [...]}``
+            → ``{"type": "step_start", "step": i, "action": "..."}``
+            → ``{"type": "step_done",  "step": i, "action": "...", "status": "ok"|"error", "error": "..."}``
+            → ``{"type": "done",       "success": bool, "failed_count": N}``
+            → ``{"type": "error",      "message": "..."}``  (on unrecoverable errors)
+
+    Steps are emitted in real-time: ``step_start`` fires the moment a step
+    begins executing, and ``step_done`` fires as soon as it completes — not
+    after all steps finish.
     """
     await websocket.accept()
     loop = asyncio.get_running_loop()
@@ -909,25 +914,61 @@ async def ws_task(websocket: WebSocket) -> None:
             "actions":    [s["action"] for s in steps],
         })
 
-        # Execute all steps (synchronous call → run in thread pool)
-        results = await loop.run_in_executor(
+        # ------------------------------------------------------------------
+        # Real-time streaming: use a queue to bridge the synchronous thread
+        # pool (where execute() runs) and this async coroutine.
+        # The callbacks below are called from the worker thread and push
+        # events onto the queue; the consumer loop below drains it and sends
+        # each event to the WebSocket immediately.
+        # ------------------------------------------------------------------
+        queue: asyncio.Queue = asyncio.Queue()
+        _SENTINEL = object()  # signals that execution has finished
+
+        def _start_cb(step_idx: int, action: str) -> None:
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {"type": "step_start", "step": step_idx, "action": action},
+            )
+
+        def _done_cb(result: dict) -> None:
+            is_err = result.get("status") == "error"
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {
+                    "type":   "step_done",
+                    "step":   result["step"],
+                    "action": result["action"],
+                    "status": "error" if is_err else "ok",
+                    "error":  _sanitize_error(str(result.get("error", ""))) if is_err else None,
+                },
+            )
+
+        exec_future = loop.run_in_executor(
             None,
-            lambda: planner.execute(steps, agent, stop_on_error=True),
+            lambda: planner.execute(
+                steps,
+                agent,
+                stop_on_error=True,
+                step_start_callback=_start_cb,
+                step_callback=_done_cb,
+            ),
         )
 
-        failed = 0
-        for r in results:
-            is_err = r.get("status") == "error"
-            if is_err:
-                failed += 1
-            await websocket.send_json({
-                "type":   "step_done",
-                "step":   r["step"],
-                "action": r["action"],
-                "status": "error" if is_err else "ok",
-                "error":  _sanitize_error(str(r.get("error", ""))) if is_err else None,
-            })
+        # Drain the queue until the executor is done AND the queue is empty.
+        while True:
+            try:
+                msg = await asyncio.wait_for(queue.get(), timeout=0.05)
+                await websocket.send_json(msg)
+            except asyncio.TimeoutError:
+                if exec_future.done():
+                    # Flush any remaining messages before breaking.
+                    while not queue.empty():
+                        msg = queue.get_nowait()
+                        await websocket.send_json(msg)
+                    break
 
+        results = await exec_future
+        failed = sum(1 for r in results if r.get("status") == "error")
         await websocket.send_json({
             "type":         "done",
             "success":      failed == 0,
