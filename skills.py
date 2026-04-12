@@ -186,21 +186,55 @@ def _semver_satisfies(version: str, constraint: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Safe HTTP helper (guards against SSRF for both urlopen call sites)
+# HTTP fetch helpers
 # ---------------------------------------------------------------------------
+
+_GITHUB_RAW_HOST_EXPECTED = "raw.githubusercontent.com"
+
+
+def _fetch_github_raw(url: str, *, timeout: int = 15) -> bytes:
+    """
+    Fetch a ``raw.githubusercontent.com`` URL and return the raw bytes.
+
+    The URL MUST have been constructed by :func:`_make_github_raw_url`, which
+    verifies the host is exactly ``raw.githubusercontent.com`` — the host is
+    therefore NOT user-controlled.  Only the path contains user-supplied repo /
+    branch / file-path components, none of which alter the host.  This makes
+    the request a *partial*-SSRF scenario (controlled host, user-controlled
+    path) rather than a full-SSRF scenario.
+    """
+    parsed = _urlparse(url)
+    if parsed.hostname != _GITHUB_RAW_HOST_EXPECTED:
+        raise SkillLoadError(
+            f"Internal error: expected host {_GITHUB_RAW_HOST_EXPECTED!r}, "
+            f"got {parsed.hostname!r} — possible injection in URL construction"
+        )
+    ctx = ssl.create_default_context()
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "agenticbrowser-skills/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310
+            return resp.read()
+    except Exception as exc:
+        raise SkillLoadError(f"Failed to fetch {url!r}: {exc}") from exc
+
 
 def _safe_urlopen(url: str, *, timeout: int = 15) -> bytes:
     """
-    Fetch *url* over HTTPS and return the raw response bytes.
+    Fetch a user-supplied *url* over HTTPS/HTTP and return the raw bytes.
 
     Security guards applied before the network call:
     - Only ``https://`` and ``http://`` schemes are accepted.
-    - Raw IP-address hosts are rejected (domain names only).
+    - Raw IPv4/IPv6 addresses are rejected as hosts (domain names only).
     - An explicit SSL context with certificate verification is used.
 
-    This consolidates both ``urllib.request.urlopen`` call sites so that
-    CodeQL's ``py/full-ssrf`` taint-tracking sees a single, well-guarded
-    entry point rather than tracking taint across multiple call sites.
+    This function is intentionally designed to accept user-provided HTTPS URLs
+    (e.g. a skill registry chosen by the operator), which is why the host is
+    not fixed.  The mitigations above (scheme allowlist, IP block, TLS
+    verification) address the associated SSRF risk.  The ``load_from_github``
+    code path uses :func:`_fetch_github_raw` instead, where the host is fixed.
     """
     _validate_url_scheme(url)
     parsed = _urlparse(url)
@@ -212,14 +246,13 @@ def _safe_urlopen(url: str, *, timeout: int = 15) -> bytes:
             f"Skill URL host must be a domain name, not a raw IP address: {url!r}"
         )
     ctx = ssl.create_default_context()  # verifies certificates
-    # URL is validated above: scheme-checked and IP-blocked — not a full SSRF risk.
-    # codeql[py/full-ssrf]
     req = urllib.request.Request(
         url,
         headers={"User-Agent": "agenticbrowser-skills/1.0"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310  # codeql[py/full-ssrf]
+        # noqa: S310 — URL is scheme-checked and IP-blocked above.
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310
             return resp.read()
     except Exception as exc:
         raise SkillLoadError(f"Failed to fetch skill from {url!r}: {exc}") from exc
@@ -592,12 +625,21 @@ def load_from_github(
     is_file = any(path.endswith(ext) for ext in (".json", ".yaml", ".yml"))
 
     if is_file:
-        return load_from_url(_raw_url(path), timeout=timeout)
+        # Use _fetch_github_raw — host is verified to be raw.githubusercontent.com
+        text = _fetch_github_raw(_raw_url(path), timeout=timeout).decode("utf-8")
+        data = _parse_text(text, _raw_url(path))
+        if isinstance(data, dict):
+            data = [data]
+        elif not isinstance(data, list):
+            raise SkillLoadError(
+                f"{_raw_url(path)}: expected a skill object or list of skill objects"
+            )
+        return [_dict_to_skill(item, _raw_url(path)) for item in data]
 
     # Treat as directory — fetch index.json
     index_url = _raw_url(f"{path}/index.json")
     try:
-        index = json.loads(_safe_urlopen(index_url, timeout=timeout).decode("utf-8"))
+        index = json.loads(_fetch_github_raw(index_url, timeout=timeout).decode("utf-8"))
     except SkillLoadError as exc:
         raise SkillLoadError(
             f"Failed to fetch skill index from {index_url!r}: {exc}. "
@@ -612,7 +654,15 @@ def load_from_github(
     for fname in file_names:
         file_url = _raw_url(f"{path}/{fname}")
         try:
-            skills.extend(load_from_url(file_url, timeout=timeout))
+            text = _fetch_github_raw(file_url, timeout=timeout).decode("utf-8")
+            data = _parse_text(text, file_url)
+            if isinstance(data, dict):
+                data = [data]
+            elif not isinstance(data, list):
+                raise SkillLoadError(
+                    f"{file_url}: expected a skill object or list of skill objects"
+                )
+            skills.extend(_dict_to_skill(item, file_url) for item in data)
         except SkillLoadError as exc:
             import sys
             print(f"[skills] Warning: skipping {fname} from {repo} — {exc}", file=sys.stderr)
