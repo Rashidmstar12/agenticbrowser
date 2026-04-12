@@ -525,6 +525,12 @@ export OPENAI_MODEL=gpt-4o-mini   # optional, default: gpt-4o-mini
 | `BROWSER_API_KEY` | — | When set, all API server requests must include `X-API-Key: <value>` header (or `?api_key=<value>` for WebSocket connections). Omit to run without authentication (local/trusted-network use only). |
 | `BROWSER_CORS_ORIGINS` | — | Comma-separated list of allowed CORS origins, e.g. `https://app.example.com,https://dev.example.com`. Use `*` for development only. When unset, no CORS headers are added (safest default). |
 | `BROWSER_RATE_LIMIT` | — | Per-IP request rate limit using `slowapi` format, e.g. `100/minute`, `10/second`, `1000/hour`. Clients exceeding the limit receive **429 Too Many Requests**. When unset, no rate limiting is applied. |
+| `BROWSER_SECURITY_HEADERS` | — | Set to `1` (or `true`/`yes`/`on`) to inject security response headers on every reply: `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`, `Referrer-Policy`, `Content-Security-Policy`, `Permissions-Policy`, and (over HTTPS only) `Strict-Transport-Security`. When unset, no extra headers are added. |
+| `BROWSER_CSP` | `default-src 'self'` | Overrides the `Content-Security-Policy` header value (only used when `BROWSER_SECURITY_HEADERS` is enabled). |
+| `BROWSER_HSTS_MAX_AGE` | `31536000` | Overrides the HSTS `max-age` in seconds (only used when `BROWSER_SECURITY_HEADERS` is enabled and the request arrives over HTTPS). |
+| `BROWSER_REFERRER_POLICY` | `strict-origin-when-cross-origin` | Overrides the `Referrer-Policy` header value (only used when `BROWSER_SECURITY_HEADERS` is enabled). |
+| `BROWSER_FRAME_OPTIONS` | `DENY` | Overrides the `X-Frame-Options` header value, e.g. `SAMEORIGIN` (only used when `BROWSER_SECURITY_HEADERS` is enabled). |
+| `BROWSER_PERMISSIONS_POLICY` | `geolocation=(), microphone=(), camera=()` | Overrides the `Permissions-Policy` header value (only used when `BROWSER_SECURITY_HEADERS` is enabled). |
 
 ---
 

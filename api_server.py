@@ -23,6 +23,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, W
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 try:
     from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -199,6 +202,92 @@ if _rate_limit_str and _SLOWAPI_AVAILABLE:
     app.state.limiter = _limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_middleware(SlowAPIMiddleware)
+
+# ---------------------------------------------------------------------------
+# Security response headers — configured via BROWSER_SECURITY_HEADERS env var.
+#
+# Set BROWSER_SECURITY_HEADERS=1 to enable a sensible set of security headers
+# on every HTTP response.  When unset (or set to an empty string / "0" / "false")
+# the middleware is not registered and no extra headers are added.
+#
+# Default headers injected when enabled:
+#   X-Content-Type-Options: nosniff
+#   X-Frame-Options: DENY
+#   X-XSS-Protection: 1; mode=block
+#   Referrer-Policy: strict-origin-when-cross-origin
+#   Content-Security-Policy: default-src 'self'
+#   Permissions-Policy: geolocation=(), microphone=(), camera=()
+#   Strict-Transport-Security: max-age=<BROWSER_HSTS_MAX_AGE>; includeSubDomains
+#     (only injected over HTTPS — skipped for plain HTTP to avoid breaking local dev)
+#
+# Individual headers can be overridden via environment variables:
+#   BROWSER_CSP                 — Content-Security-Policy value
+#   BROWSER_HSTS_MAX_AGE        — HSTS max-age in seconds (default: 31536000)
+#   BROWSER_REFERRER_POLICY     — Referrer-Policy value
+#   BROWSER_FRAME_OPTIONS       — X-Frame-Options value (DENY / SAMEORIGIN)
+#   BROWSER_PERMISSIONS_POLICY  — Permissions-Policy value
+# ---------------------------------------------------------------------------
+
+_SECURITY_HEADERS_ENABLED_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _security_headers_enabled() -> bool:
+    val = os.environ.get("BROWSER_SECURITY_HEADERS", "").strip().lower()
+    return val in _SECURITY_HEADERS_ENABLED_TRUTHY
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """
+    Inject security-hardening HTTP response headers on every response.
+
+    Enabled only when ``BROWSER_SECURITY_HEADERS`` is set to a truthy value
+    (``1``, ``true``, ``yes``, or ``on``).  Individual header values can be
+    overridden via dedicated environment variables documented above.
+    """
+
+    # Defaults used when the corresponding env var is not set.
+    _DEFAULT_CSP = "default-src 'self'"
+    _DEFAULT_HSTS_MAX_AGE = "31536000"
+    _DEFAULT_REFERRER = "strict-origin-when-cross-origin"
+    _DEFAULT_FRAME = "DENY"
+    _DEFAULT_PERMISSIONS = "geolocation=(), microphone=(), camera=()"
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response: Response = await call_next(request)
+
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+
+        response.headers["X-Frame-Options"] = os.environ.get(
+            "BROWSER_FRAME_OPTIONS", self._DEFAULT_FRAME
+        )
+        response.headers["Referrer-Policy"] = os.environ.get(
+            "BROWSER_REFERRER_POLICY", self._DEFAULT_REFERRER
+        )
+        response.headers["Content-Security-Policy"] = os.environ.get(
+            "BROWSER_CSP", self._DEFAULT_CSP
+        )
+        response.headers["Permissions-Policy"] = os.environ.get(
+            "BROWSER_PERMISSIONS_POLICY", self._DEFAULT_PERMISSIONS
+        )
+
+        # HSTS is only meaningful over HTTPS.  Sending it over plain HTTP
+        # can break local development by causing browsers to preload HSTS
+        # prematurely.  Detect HTTPS via the scheme of the first hop or the
+        # X-Forwarded-Proto header set by a TLS-terminating proxy.
+        forwarded_proto = request.headers.get("x-forwarded-proto", "")
+        is_https = request.url.scheme == "https" or forwarded_proto.lower() == "https"
+        if is_https:
+            max_age = os.environ.get("BROWSER_HSTS_MAX_AGE", self._DEFAULT_HSTS_MAX_AGE)
+            response.headers["Strict-Transport-Security"] = (
+                f"max-age={max_age}; includeSubDomains"
+            )
+
+        return response
+
+
+if _security_headers_enabled():
+    app.add_middleware(SecurityHeadersMiddleware)
 
 # ---------------------------------------------------------------------------
 # Request / Response models — session
