@@ -19,7 +19,8 @@ from pathlib import Path as _Path
 from typing import Any, AsyncIterator
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -66,22 +67,32 @@ def _safe_response(data: Any) -> Any:
 _API_KEY_ENV = "BROWSER_API_KEY"
 
 
-def _check_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+def _check_api_key(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    api_key: str | None = Query(default=None, alias="api_key", include_in_schema=False),
+) -> None:
     """
     Enforce API key authentication when ``BROWSER_API_KEY`` is set.
 
+    Accepts the key from **either** source (header takes priority):
+
+    * ``X-API-Key: <key>`` HTTP request header — preferred for regular HTTP routes.
+    * ``?api_key=<key>`` URL query parameter — fallback for WebSocket connections
+      where the browser's native ``WebSocket`` API cannot send custom headers.
+
     If the environment variable is **not** set the server runs without
     authentication (convenient for local / trusted-network use).  When it
-    **is** set every request must supply the matching key in the
-    ``X-API-Key`` header; missing or wrong keys get a **401 Unauthorized**.
+    **is** set every request must supply the matching key; missing or wrong
+    keys get a **401 Unauthorized**.
     """
     required = os.environ.get(_API_KEY_ENV)
     if not required:
         return  # auth not configured — allow all requests
-    if not x_api_key or x_api_key != required:
+    provided = x_api_key or api_key
+    if not provided or provided != required:
         raise HTTPException(
             status_code=401,
-            detail="Unauthorized: provide a valid X-API-Key header.",
+            detail="Unauthorized: provide a valid X-API-Key header or api_key query parameter.",
         )
 
 
@@ -139,6 +150,26 @@ app = FastAPI(
     lifespan=lifespan,
     dependencies=[Depends(_check_api_key)],
 )
+
+# ---------------------------------------------------------------------------
+# CORS middleware — configured via BROWSER_CORS_ORIGINS env var.
+#
+# Set BROWSER_CORS_ORIGINS to a comma-separated list of allowed origins, e.g.:
+#   BROWSER_CORS_ORIGINS=https://app.example.com,https://dev.example.com
+#
+# Use "*" to allow all origins (development only — not recommended with auth).
+# When the variable is unset no CORS headers are added (safest default).
+# ---------------------------------------------------------------------------
+_cors_origins_raw = os.environ.get("BROWSER_CORS_ORIGINS", "")
+_cors_origins = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*", "X-API-Key"],
+    )
 
 # ---------------------------------------------------------------------------
 # Request / Response models — session
