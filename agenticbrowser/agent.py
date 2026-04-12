@@ -39,7 +39,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from agenticbrowser.browser import Browser
-from agenticbrowser.models import ActionResult, BrowserOptions
+from agenticbrowser.models import BrowserOptions
 
 
 class AgentBrowser:
