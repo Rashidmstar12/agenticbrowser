@@ -1193,8 +1193,14 @@ class BrowserAgent:
             ``{"url": ..., "save_path": ..., "size_bytes": N}``
         """
         import os as _os
-        # Resolve the path to eliminate any traversal components (e.g. ../).
+        # Resolve the path and ensure it stays within the current working directory
+        # (workspace root) to prevent path traversal attacks.
+        workspace_root = _os.path.realpath(_os.getcwd())
         resolved_path = _os.path.realpath(save_path)
+        if not (resolved_path.startswith(workspace_root + _os.sep) or resolved_path == workspace_root):
+            raise ValueError(
+                f"save_path must be inside the workspace directory ({workspace_root!r})."
+            )
         logger.info("Downloading '%s' → '%s'", url, resolved_path)
         with self.page.expect_download() as dl_info:
             self.page.evaluate(
@@ -1203,7 +1209,7 @@ class BrowserAgent:
             )
         download = dl_info.value
         download.save_as(resolved_path)
-        # Try to get the file size; ignore if the path does not exist yet.
+        # Use the resolved path so os.path calls operate on a validated path.
         size = _os.path.getsize(resolved_path) if _os.path.exists(resolved_path) else 0
         return {"url": url, "save_path": resolved_path, "size_bytes": size}
 

@@ -921,8 +921,12 @@ class TestPhase2BrowserAgentMethods:
     # download_file
     # ------------------------------------------------------------------
 
-    def test_download_file_saves_and_returns_size(self, tmp_path) -> None:
+    def test_download_file_saves_and_returns_size(self, tmp_path, monkeypatch) -> None:
         ba, page, ctx, pw = self._make_ba()
+        # Patch getcwd so that tmp_path is treated as the workspace root
+        import os as _os
+        monkeypatch.setattr(_os, "getcwd", lambda: str(tmp_path))
+
         save_path = str(tmp_path / "output.pdf")
         # Create a fake file so getsize works
         (tmp_path / "output.pdf").write_bytes(b"PDF content")
@@ -938,14 +942,18 @@ class TestPhase2BrowserAgentMethods:
 
         result = ba.download_file("https://example.com/file.pdf", save_path)
         page.evaluate.assert_called_once()
-        mock_dl.save_as.assert_called_once_with(save_path)
+        resolved = _os.path.realpath(save_path)
+        mock_dl.save_as.assert_called_once_with(resolved)
         assert result["url"] == "https://example.com/file.pdf"
-        assert result["save_path"] == save_path
+        assert result["save_path"] == resolved
         # size comes from the real file we created
         assert result["size_bytes"] == 11
 
-    def test_download_file_zero_size_when_file_absent(self, tmp_path) -> None:
+    def test_download_file_zero_size_when_file_absent(self, tmp_path, monkeypatch) -> None:
         ba, page, ctx, pw = self._make_ba()
+        import os as _os
+        monkeypatch.setattr(_os, "getcwd", lambda: str(tmp_path))
+
         save_path = str(tmp_path / "ghost.bin")
 
         mock_dl = MagicMock()
@@ -957,6 +965,13 @@ class TestPhase2BrowserAgentMethods:
 
         result = ba.download_file("https://example.com/ghost.bin", save_path)
         assert result["size_bytes"] == 0
+
+    def test_download_file_rejects_path_traversal(self, tmp_path, monkeypatch) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        import os as _os
+        monkeypatch.setattr(_os, "getcwd", lambda: str(tmp_path))
+        with pytest.raises(ValueError, match="workspace directory"):
+            ba.download_file("https://example.com/file", "/etc/passwd")
 
     # ------------------------------------------------------------------
     # emulate_device
