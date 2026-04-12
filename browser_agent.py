@@ -130,6 +130,7 @@ class BrowserAgent:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._pages: list[Page] = []  # all open tabs; self._page is the active one
+        self._active_frame: Any = None  # set by iframe_switch; None = use active page
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -172,6 +173,7 @@ class BrowserAgent:
         self._browser = None
         self._playwright = None
         self._pages = []
+        self._active_frame = None
         logger.info("BrowserAgent stopped")
 
     # Context manager support
@@ -190,6 +192,13 @@ class BrowserAgent:
         if self._page is None:
             raise RuntimeError("Browser is not started. Call start() first.")
         return self._page
+
+    @property
+    def _frame(self) -> Any:
+        """Return the active frame (or the active page if no iframe is active)."""
+        if self._active_frame is not None:
+            return self._active_frame
+        return self.page
 
     def _handle_dialog(self, dialog: Any) -> None:
         """Automatically dismiss native JS dialogs."""
@@ -312,7 +321,7 @@ class BrowserAgent:
     def resolve_selector(self, selector: str) -> str:
         """
         Resolve *selector* to one that actually matches an element on the
-        current page.
+        current page (or the active iframe frame).
 
         Semantic selectors (``text=``, ``role=``, ``label=``, ``placeholder=``,
         ``title=``, ``alt=``) are handled via Playwright's locator engine which
@@ -332,10 +341,11 @@ class BrowserAgent:
         str
             The first selector (primary or fallback) that matches an element.
         """
-        # Semantic selectors use page.locator(), not query_selector().
+        frame = self._frame
+        # Semantic selectors use locator(), not query_selector().
         if selector.startswith(_SEMANTIC_PREFIXES):
             try:
-                if self.page.locator(selector).count() > 0:
+                if frame.locator(selector).count() > 0:
                     return selector
             except Exception:
                 pass
@@ -349,7 +359,7 @@ class BrowserAgent:
 
         for candidate in candidates:
             try:
-                el = self.page.query_selector(candidate)
+                el = frame.query_selector(candidate)
             except Exception:
                 continue
             if el is not None:
@@ -372,7 +382,7 @@ class BrowserAgent:
         """Click the first element matching *selector*."""
         selector = self.resolve_selector(selector)
         logger.info("Clicking '%s'", selector)
-        self.page.click(selector, timeout=timeout or self.default_timeout)
+        self._frame.click(selector, timeout=timeout or self.default_timeout)
         return {"clicked": selector, "url": self.page.url}
 
     def type_text(
@@ -392,16 +402,16 @@ class BrowserAgent:
         """
         logger.info("Typing into '%s'", selector)
         selector = self.resolve_selector(selector)
-        self.page.click(selector, timeout=timeout or self.default_timeout)
+        self._frame.click(selector, timeout=timeout or self.default_timeout)
         if clear_first:
-            self.page.fill(selector, "", timeout=timeout or self.default_timeout)
-        self.page.type(selector, text)
+            self._frame.fill(selector, "", timeout=timeout or self.default_timeout)
+        self._frame.type(selector, text)
         return {"typed": text, "selector": selector}
 
     def fill(self, selector: str, value: str, timeout: int | None = None) -> dict[str, Any]:
         """Fill *selector* with *value* (faster than type_text for long text)."""
         selector = self.resolve_selector(selector)
-        self.page.fill(selector, value, timeout=timeout or self.default_timeout)
+        self._frame.fill(selector, value, timeout=timeout or self.default_timeout)
         return {"filled": value, "selector": selector}
 
     def press_key(self, key: str) -> dict[str, Any]:
@@ -412,13 +422,13 @@ class BrowserAgent:
     def hover(self, selector: str) -> dict[str, Any]:
         """Move the mouse over *selector*."""
         selector = self.resolve_selector(selector)
-        self.page.hover(selector)
+        self._frame.hover(selector)
         return {"hovered": selector}
 
     def select_option(self, selector: str, value: str) -> dict[str, Any]:
         """Select an ``<option>`` in a ``<select>`` element by value or label."""
         selector = self.resolve_selector(selector)
-        self.page.select_option(selector, value)
+        self._frame.select_option(selector, value)
         return {"selected": value, "selector": selector}
 
     # ------------------------------------------------------------------
@@ -453,22 +463,22 @@ class BrowserAgent:
 
     def get_text(self, selector: str = "body") -> str:
         """Return the inner text of the element matching *selector*."""
-        return self.page.inner_text(selector)
+        return self._frame.inner_text(selector)
 
     def get_html(self, selector: str = "body") -> str:
         """Return the inner HTML of the element matching *selector*."""
-        return self.page.inner_html(selector)
+        return self._frame.inner_html(selector)
 
     def get_attribute(self, selector: str, attribute: str) -> str | None:
         """Return the value of *attribute* on the element matching *selector*."""
-        return self.page.get_attribute(selector, attribute)
+        return self._frame.get_attribute(selector, attribute)
 
     def query_all(self, selector: str) -> list[dict[str, Any]]:
         """
         Return a list of ``{text, href}`` dicts for all elements matching
         *selector*.
         """
-        elements = self.page.query_selector_all(selector)
+        elements = self._frame.query_selector_all(selector)
         results = []
         for el in elements:
             results.append(
@@ -853,3 +863,609 @@ class BrowserAgent:
             except Exception:
                 tabs.append({"index": i, "url": "unknown", "title": "unknown", "active": page is self._page})
         return {"tabs": tabs, "count": len(tabs)}
+
+    # ------------------------------------------------------------------
+    # New browser interactions (Category 1)
+    # ------------------------------------------------------------------
+
+    def drag_drop(self, source: str, target: str) -> dict[str, Any]:
+        """
+        Drag the element matching *source* and drop it onto *target*.
+
+        Parameters
+        ----------
+        source:
+            CSS selector of the element to drag.
+        target:
+            CSS selector of the drop destination.
+
+        Returns
+        -------
+        dict
+            ``{"source": ..., "target": ...}``
+        """
+        source = self.resolve_selector(source)
+        target = self.resolve_selector(target)
+        logger.info("Dragging '%s' → '%s'", source, target)
+        self.page.drag_and_drop(source, target)
+        return {"source": source, "target": target}
+
+    def right_click(self, selector: str) -> dict[str, Any]:
+        """
+        Right-click the element matching *selector* to open its context menu.
+
+        Returns
+        -------
+        dict
+            ``{"right_clicked": selector}``
+        """
+        selector = self.resolve_selector(selector)
+        logger.info("Right-clicking '%s'", selector)
+        self._frame.click(selector, button="right")
+        return {"right_clicked": selector}
+
+    def double_click(self, selector: str) -> dict[str, Any]:
+        """
+        Double-click the element matching *selector*.
+
+        Returns
+        -------
+        dict
+            ``{"double_clicked": selector}``
+        """
+        selector = self.resolve_selector(selector)
+        logger.info("Double-clicking '%s'", selector)
+        self._frame.dblclick(selector)
+        return {"double_clicked": selector}
+
+    def upload_file(self, selector: str, path: str) -> dict[str, Any]:
+        """
+        Attach a local file to an ``<input type="file">`` element.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector of the file input element.
+        path:
+            Absolute or workspace-relative path to the file to attach.
+
+        Returns
+        -------
+        dict
+            ``{"uploaded": path, "selector": selector}``
+        """
+        selector = self.resolve_selector(selector)
+        logger.info("Uploading '%s' to '%s'", path, selector)
+        self._frame.set_input_files(selector, path)
+        return {"uploaded": path, "selector": selector}
+
+    def set_viewport(self, width: int, height: int) -> dict[str, Any]:
+        """
+        Resize the browser viewport.
+
+        Parameters
+        ----------
+        width:
+            Viewport width in pixels.
+        height:
+            Viewport height in pixels.
+
+        Returns
+        -------
+        dict
+            ``{"width": ..., "height": ...}``
+        """
+        logger.info("Setting viewport to %dx%d", width, height)
+        self.page.set_viewport_size({"width": width, "height": height})
+        return {"width": width, "height": height}
+
+    def block_resource(self, types: list[str] | None = None) -> dict[str, Any]:
+        """
+        Block requests for specified resource types to speed up page loads.
+
+        Common types: ``"image"``, ``"stylesheet"``, ``"font"``, ``"media"``,
+        ``"script"``.  When *types* is empty or omitted, ``["image", "stylesheet",
+        "font"]`` is used as the default.
+
+        Parameters
+        ----------
+        types:
+            List of Playwright resource-type strings to abort.
+
+        Returns
+        -------
+        dict
+            ``{"blocked_types": [...]}``
+
+        Notes
+        -----
+        This installs a Playwright route handler on the active page.  It only
+        affects requests made *after* this call.
+        """
+        if not types:
+            types = ["image", "stylesheet", "font"]
+        blocked = list(types)
+        logger.info("Blocking resource types: %s", blocked)
+
+        def _abort_if_blocked(route: Any) -> None:
+            if route.request.resource_type in blocked:
+                route.abort()
+            else:
+                route.continue_()
+
+        self.page.route("**/*", _abort_if_blocked)
+        return {"blocked_types": blocked}
+
+    def iframe_switch(self, selector: str) -> dict[str, Any]:
+        """
+        Switch the active interaction context to the ``<iframe>`` element
+        matching *selector*.
+
+        All subsequent browser interactions (click, fill, get_text, etc.) will
+        operate within this iframe until :meth:`iframe_exit` is called.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector of the ``<iframe>`` element.
+
+        Returns
+        -------
+        dict
+            ``{"frame_url": ..., "selector": selector}``
+        """
+        el = self.page.query_selector(selector)
+        if el is None:
+            raise ValueError(f"No iframe element found for selector: {selector!r}")
+        frame = el.content_frame()
+        if frame is None:
+            raise ValueError(f"Element {selector!r} is not an iframe or has no content frame.")
+        self._active_frame = frame
+        logger.info("Switched to iframe '%s' (url=%s)", selector, frame.url)
+        return {"frame_url": frame.url, "selector": selector}
+
+    def iframe_exit(self) -> dict[str, Any]:
+        """
+        Return to the top-level page context after a previous :meth:`iframe_switch`.
+
+        Returns
+        -------
+        dict
+            ``{"frame_url": current_page_url}``
+        """
+        self._active_frame = None
+        logger.info("Exited iframe context; now on top-level page")
+        return {"frame_url": self.page.url}
+
+    # ------------------------------------------------------------------
+    # Data extraction (Category 2)
+    # ------------------------------------------------------------------
+
+    def extract_json_ld(self) -> dict[str, Any]:
+        """
+        Extract all Schema.org JSON-LD metadata blocks from the page.
+
+        Returns
+        -------
+        dict
+            ``{"items": [...], "count": N}``
+        """
+        items: list[Any] = self.page.evaluate(
+            """() => {
+                const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+                return Array.from(scripts).map(s => {
+                    try { return JSON.parse(s.textContent || ""); }
+                    catch { return null; }
+                }).filter(x => x !== null);
+            }"""
+        )
+        return {"items": items, "count": len(items)}
+
+    def extract_headings(self) -> dict[str, Any]:
+        """
+        Extract all headings (h1–h6) from the page as a structured outline.
+
+        Returns
+        -------
+        dict
+            ``{"headings": [{"level": N, "text": "..."}, ...], "count": N}``
+        """
+        headings: list[dict[str, Any]] = self.page.evaluate(
+            """() => {
+                const els = document.querySelectorAll("h1,h2,h3,h4,h5,h6");
+                return Array.from(els).map(el => ({
+                    level: parseInt(el.tagName.slice(1), 10),
+                    text: (el.textContent || "").trim(),
+                }));
+            }"""
+        )
+        return {"headings": headings, "count": len(headings)}
+
+    def extract_images(self, selector: str = "img", limit: int = 100) -> dict[str, Any]:
+        """
+        Extract all images from the page.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector used to find image elements (default ``"img"``).
+        limit:
+            Maximum number of images to return (default ``100``).
+
+        Returns
+        -------
+        dict
+            ``{"images": [{"src": ..., "alt": ..., "width": ..., "height": ...}], "count": N}``
+        """
+        images: list[dict[str, Any]] = self.page.evaluate(
+            """([sel, lim]) => {
+                const els = Array.from(document.querySelectorAll(sel)).slice(0, lim);
+                return els.map(el => ({
+                    src:    el.src || el.getAttribute("src") || "",
+                    alt:    (el.alt || "").trim(),
+                    width:  el.naturalWidth || el.width || null,
+                    height: el.naturalHeight || el.height || null,
+                }));
+            }""",
+            [selector, limit],
+        )
+        return {"images": images, "count": len(images)}
+
+    def extract_form_fields(self, selector: str = "form") -> dict[str, Any]:
+        """
+        Describe all interactive form fields within the first ``<form>``
+        (or element) matching *selector*.
+
+        Returns
+        -------
+        dict
+            ``{"fields": [{"name": ..., "type": ..., "id": ..., "placeholder": ...,
+            "value": ..., "required": bool}], "count": N}``
+        """
+        fields: list[dict[str, Any]] = self.page.evaluate(
+            """([sel]) => {
+                const form = document.querySelector(sel) || document.body;
+                const inputs = form.querySelectorAll("input,select,textarea,button");
+                return Array.from(inputs).map(el => ({
+                    tag:         el.tagName.toLowerCase(),
+                    name:        el.name || "",
+                    id:          el.id || "",
+                    type:        el.type || el.tagName.toLowerCase(),
+                    placeholder: el.placeholder || "",
+                    value:       el.value || "",
+                    required:    el.required || false,
+                }));
+            }""",
+            [selector],
+        )
+        return {"fields": fields, "count": len(fields)}
+
+    def extract_meta(self) -> dict[str, Any]:
+        """
+        Extract ``<meta>`` tag values including title, description, and
+        Open Graph / Twitter card tags.
+
+        Returns
+        -------
+        dict
+            ``{"title": ..., "description": ..., "tags": [{name, property, content}], "count": N}``
+        """
+        result: dict[str, Any] = self.page.evaluate(
+            """() => {
+                const tags = Array.from(document.querySelectorAll("meta")).map(m => ({
+                    name:     m.name || "",
+                    property: m.getAttribute("property") || "",
+                    content:  m.content || "",
+                }));
+                const title = document.title || "";
+                const desc = (document.querySelector('meta[name="description"]') || {}).content || "";
+                return {title, description: desc, tags, count: tags.length};
+            }"""
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Authentication & Session Management (Category 3)
+    # ------------------------------------------------------------------
+
+    def set_extra_headers(self, headers: dict[str, str]) -> dict[str, Any]:
+        """
+        Inject additional HTTP request headers for all subsequent requests in
+        the current browser context.
+
+        Parameters
+        ----------
+        headers:
+            Mapping of header name → value, e.g.
+            ``{"Authorization": "Bearer <token>"}``.
+
+        Returns
+        -------
+        dict
+            ``{"headers_set": ["Header-Name", ...]}``
+        """
+        if self._context is None:
+            raise RuntimeError("Browser is not started. Call start() first.")
+        self._context.set_extra_http_headers(headers)
+        logger.info("Extra HTTP headers set: %s", list(headers.keys()))
+        return {"headers_set": list(headers.keys())}
+
+    def http_auth(self, username: str, password: str) -> dict[str, Any]:
+        """
+        Set HTTP Basic Authentication credentials for all subsequent requests.
+
+        This encodes the credentials as a Base64 ``Authorization: Basic ...``
+        header and injects it via :meth:`set_extra_headers`.
+
+        Parameters
+        ----------
+        username:
+            HTTP Basic Auth username.
+        password:
+            HTTP Basic Auth password.
+
+        Returns
+        -------
+        dict
+            ``{"auth_set": True, "username": ...}``
+        """
+        import base64 as _b64
+        token = _b64.b64encode(f"{username}:{password}".encode()).decode()
+        self.set_extra_headers({"Authorization": f"Basic {token}"})
+        logger.info("HTTP Basic Auth set for user %r", username)
+        return {"auth_set": True, "username": username}
+
+    def local_storage_set(self, key: str, value: str) -> dict[str, Any]:
+        """
+        Write a key–value pair into the page's ``localStorage``.
+
+        Parameters
+        ----------
+        key:
+            Storage key.
+        value:
+            String value to store.
+
+        Returns
+        -------
+        dict
+            ``{"key": ..., "value": ...}``
+        """
+        self.page.evaluate(
+            "([k, v]) => localStorage.setItem(k, v)",
+            [key, value],
+        )
+        return {"key": key, "value": value}
+
+    def local_storage_get(self, key: str) -> dict[str, Any]:
+        """
+        Read a value from the page's ``localStorage``.
+
+        Parameters
+        ----------
+        key:
+            Storage key to read.
+
+        Returns
+        -------
+        dict
+            ``{"key": ..., "value": ...}``  (``value`` is ``None`` if not set)
+        """
+        value: str | None = self.page.evaluate(
+            "([k]) => localStorage.getItem(k)",
+            [key],
+        )
+        return {"key": key, "value": value}
+
+    def session_storage_set(self, key: str, value: str) -> dict[str, Any]:
+        """
+        Write a key–value pair into the page's ``sessionStorage``.
+
+        Parameters
+        ----------
+        key:
+            Storage key.
+        value:
+            String value to store.
+
+        Returns
+        -------
+        dict
+            ``{"key": ..., "value": ...}``
+        """
+        self.page.evaluate(
+            "([k, v]) => sessionStorage.setItem(k, v)",
+            [key, value],
+        )
+        return {"key": key, "value": value}
+
+    def session_storage_get(self, key: str) -> dict[str, Any]:
+        """
+        Read a value from the page's ``sessionStorage``.
+
+        Parameters
+        ----------
+        key:
+            Storage key to read.
+
+        Returns
+        -------
+        dict
+            ``{"key": ..., "value": ...}``  (``value`` is ``None`` if not set)
+        """
+        value: str | None = self.page.evaluate(
+            "([k]) => sessionStorage.getItem(k)",
+            [key],
+        )
+        return {"key": key, "value": value}
+
+    # ------------------------------------------------------------------
+    # Assertions & Verification (Category 4)
+    # ------------------------------------------------------------------
+
+    def assert_element_count(
+        self,
+        selector: str,
+        count: int,
+        *,
+        operator: str = "eq",
+    ) -> dict[str, Any]:
+        """
+        Assert the number of elements matching *selector*.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector to count.
+        count:
+            Expected element count.
+        operator:
+            Comparison operator: ``"eq"`` (default), ``"gte"``, ``"lte"``,
+            ``"gt"``, ``"lt"``.
+
+        Returns
+        -------
+        dict
+            ``{"selector": ..., "expected": ..., "actual": ..., "operator": ...}``
+
+        Raises
+        ------
+        AssertionError
+            When the count does not satisfy the expected condition.
+        """
+        actual = len(self.page.query_selector_all(selector))
+        ops = {
+            "eq":  actual == count,
+            "gte": actual >= count,
+            "lte": actual <= count,
+            "gt":  actual >  count,
+            "lt":  actual <  count,
+        }
+        if operator not in ops:
+            raise ValueError(f"Unknown operator {operator!r}. Use: eq, gte, lte, gt, lt.")
+        if not ops[operator]:
+            raise AssertionError(
+                f"assert_element_count failed: selector={selector!r} "
+                f"expected {operator} {count} but got {actual}."
+            )
+        return {"selector": selector, "expected": count, "actual": actual, "operator": operator}
+
+    def assert_attribute(
+        self,
+        selector: str,
+        attribute: str,
+        value: str,
+        *,
+        case_sensitive: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Assert that the HTML *attribute* of the element matching *selector*
+        equals *value*.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector of the element.
+        attribute:
+            HTML attribute name (e.g. ``"href"``, ``"class"``, ``"data-id"``).
+        value:
+            Expected attribute value.
+        case_sensitive:
+            When ``False``, comparison is case-insensitive.
+
+        Returns
+        -------
+        dict
+            ``{"selector": ..., "attribute": ..., "expected": ..., "actual": ...}``
+
+        Raises
+        ------
+        AssertionError
+            When the attribute value does not match.
+        """
+        actual = self.page.get_attribute(selector, attribute)
+        haystack = actual if case_sensitive else (actual or "").lower()
+        needle   = value  if case_sensitive else value.lower()
+        if haystack != needle:
+            raise AssertionError(
+                f"assert_attribute failed: {selector!r}[{attribute}]="
+                f"{actual!r} ≠ {value!r}."
+            )
+        return {"selector": selector, "attribute": attribute, "expected": value, "actual": actual}
+
+    def assert_title(
+        self,
+        pattern: str,
+        *,
+        case_sensitive: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Assert that the page title contains *pattern* as a substring.
+
+        Parameters
+        ----------
+        pattern:
+            Literal substring that must appear in the page title.
+        case_sensitive:
+            When ``False`` (default), comparison is case-insensitive.
+
+        Returns
+        -------
+        dict
+            ``{"title": ..., "pattern": ..., "matched": True}``
+
+        Raises
+        ------
+        AssertionError
+            When the title does not contain the pattern.
+        """
+        title = self.page.title()
+        haystack = title   if case_sensitive else title.lower()
+        needle   = pattern if case_sensitive else pattern.lower()
+        if needle not in haystack:
+            raise AssertionError(
+                f"assert_title failed: title={title!r} does not contain {pattern!r}."
+            )
+        return {"title": title, "pattern": pattern, "matched": True}
+
+    def assert_visible(self, selector: str) -> dict[str, Any]:
+        """
+        Assert that the element matching *selector* is visible on the page.
+
+        Returns
+        -------
+        dict
+            ``{"selector": ..., "visible": True}``
+
+        Raises
+        ------
+        AssertionError
+            When the element is not found or not visible.
+        """
+        el = self.page.query_selector(selector)
+        if el is None or not el.is_visible():
+            raise AssertionError(
+                f"assert_visible failed: element {selector!r} is not visible."
+            )
+        return {"selector": selector, "visible": True}
+
+    def assert_hidden(self, selector: str) -> dict[str, Any]:
+        """
+        Assert that the element matching *selector* is NOT visible (or absent).
+
+        Returns
+        -------
+        dict
+            ``{"selector": ..., "hidden": True}``
+
+        Raises
+        ------
+        AssertionError
+            When the element is found and visible.
+        """
+        el = self.page.query_selector(selector)
+        if el is not None and el.is_visible():
+            raise AssertionError(
+                f"assert_hidden failed: element {selector!r} is visible."
+            )
+        return {"selector": selector, "hidden": True}

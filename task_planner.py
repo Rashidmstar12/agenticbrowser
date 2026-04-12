@@ -201,6 +201,130 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
         "optional": {},
         "description": "Return info about all open tabs (index, url, title, active).",
     },
+    # ---- New browser interactions (Category 1) ----
+    "drag_drop": {
+        "required": ["source", "target"],
+        "optional": {},
+        "description": "Drag the element matching source and drop it onto target.",
+    },
+    "right_click": {
+        "required": ["selector"],
+        "optional": {},
+        "description": "Right-click an element to open its context menu.",
+    },
+    "double_click": {
+        "required": ["selector"],
+        "optional": {},
+        "description": "Double-click an element.",
+    },
+    "upload_file": {
+        "required": ["selector", "path"],
+        "optional": {},
+        "description": "Attach a local file to an <input type='file'> element.",
+    },
+    "set_viewport": {
+        "required": ["width", "height"],
+        "optional": {},
+        "description": "Resize the browser viewport to the given width and height in pixels.",
+    },
+    "block_resource": {
+        "required": [],
+        "optional": {"types": ["image", "stylesheet", "font"]},
+        "description": "Block requests for the given resource types (image, stylesheet, font, script, media).",
+    },
+    "iframe_switch": {
+        "required": ["selector"],
+        "optional": {},
+        "description": "Switch the interaction context to the <iframe> matching selector.",
+    },
+    "iframe_exit": {
+        "required": [],
+        "optional": {},
+        "description": "Exit the current iframe context and return to the top-level page.",
+    },
+    # ---- Data extraction (Category 2) ----
+    "extract_json_ld": {
+        "required": [],
+        "optional": {},
+        "description": "Extract all Schema.org JSON-LD metadata blocks from the page.",
+    },
+    "extract_headings": {
+        "required": [],
+        "optional": {},
+        "description": "Extract all headings (h1–h6) as a structured outline.",
+    },
+    "extract_images": {
+        "required": [],
+        "optional": {"selector": "img", "limit": 100},
+        "description": "Extract all images from the page (src, alt, width, height).",
+    },
+    "extract_form_fields": {
+        "required": [],
+        "optional": {"selector": "form"},
+        "description": "Describe all interactive form fields on the page.",
+    },
+    "extract_meta": {
+        "required": [],
+        "optional": {},
+        "description": "Extract <meta> tags including title, description, og:* and twitter:* tags.",
+    },
+    # ---- Authentication & Session (Category 3) ----
+    "set_extra_headers": {
+        "required": ["headers"],
+        "optional": {},
+        "description": "Inject extra HTTP request headers (dict) for all subsequent requests.",
+    },
+    "http_auth": {
+        "required": ["username", "password"],
+        "optional": {},
+        "description": "Set HTTP Basic Auth credentials for all subsequent requests.",
+    },
+    "local_storage_set": {
+        "required": ["key", "value"],
+        "optional": {},
+        "description": "Write a key-value pair to the page's localStorage.",
+    },
+    "local_storage_get": {
+        "required": ["key"],
+        "optional": {},
+        "description": "Read a value from the page's localStorage. Stored as {{last}}.",
+    },
+    "session_storage_set": {
+        "required": ["key", "value"],
+        "optional": {},
+        "description": "Write a key-value pair to the page's sessionStorage.",
+    },
+    "session_storage_get": {
+        "required": ["key"],
+        "optional": {},
+        "description": "Read a value from the page's sessionStorage. Stored as {{last}}.",
+    },
+    # ---- Assertions & Verification (Category 4) ----
+    "assert_element_count": {
+        "required": ["selector", "count"],
+        "optional": {"operator": "eq"},
+        "description": "Assert the number of elements matching selector. operator: eq|gte|lte|gt|lt.",
+    },
+    "assert_attribute": {
+        "required": ["selector", "attribute", "value"],
+        "optional": {"case_sensitive": True},
+        "description": "Assert that an element's HTML attribute equals the expected value.",
+    },
+    "assert_title": {
+        "required": ["pattern"],
+        "optional": {"case_sensitive": False},
+        "description": "Assert that the page title contains pattern as a substring.",
+    },
+    "assert_visible": {
+        "required": ["selector"],
+        "optional": {},
+        "description": "Assert that the element matching selector is visible on the page.",
+    },
+    "assert_hidden": {
+        "required": ["selector"],
+        "optional": {},
+        "description": "Assert that the element matching selector is NOT visible (or absent).",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -822,9 +946,15 @@ class TaskPlanner:
                 last = result.get("content", "")
             elif action in ("run_python", "run_shell") and isinstance(result, dict):
                 last = result.get("stdout", "")
-            elif action in ("extract_links", "extract_table") and isinstance(result, dict):
+            elif action in (
+                "extract_links", "extract_table", "extract_json_ld",
+                "extract_headings", "extract_images", "extract_form_fields",
+                "extract_meta",
+            ) and isinstance(result, dict):
                 import json as _json
                 last = _json.dumps(result, ensure_ascii=False)
+            elif action in ("local_storage_get", "session_storage_get") and isinstance(result, dict):
+                last = result.get("value") or ""
             ok_record: dict[str, Any] = {"step": i, "action": action, "status": "ok", "result": result}
             results.append(ok_record)
             if step_callback is not None:
@@ -1042,6 +1172,101 @@ class TaskPlanner:
             cookies = _json.loads(result["content"])
             agent.add_cookies(cookies)
             return {"cookies_loaded": len(cookies), "path": step["path"]}
+
+        # ---- New browser interactions (Category 1) ----
+
+        if action == "drag_drop":
+            return agent.drag_drop(step["source"], step["target"])
+
+        if action == "right_click":
+            return agent.right_click(step["selector"])
+
+        if action == "double_click":
+            return agent.double_click(step["selector"])
+
+        if action == "upload_file":
+            return agent.upload_file(step["selector"], step["path"])
+
+        if action == "set_viewport":
+            return agent.set_viewport(step["width"], step["height"])
+
+        if action == "block_resource":
+            return agent.block_resource(types=step.get("types"))
+
+        if action == "iframe_switch":
+            return agent.iframe_switch(step["selector"])
+
+        if action == "iframe_exit":
+            return agent.iframe_exit()
+
+        # ---- Data extraction (Category 2) ----
+
+        if action == "extract_json_ld":
+            return agent.extract_json_ld()
+
+        if action == "extract_headings":
+            return agent.extract_headings()
+
+        if action == "extract_images":
+            return agent.extract_images(
+                selector=step.get("selector", "img"),
+                limit=step.get("limit", 100),
+            )
+
+        if action == "extract_form_fields":
+            return agent.extract_form_fields(selector=step.get("selector", "form"))
+
+        if action == "extract_meta":
+            return agent.extract_meta()
+
+        # ---- Authentication & Session (Category 3) ----
+
+        if action == "set_extra_headers":
+            return agent.set_extra_headers(step["headers"])
+
+        if action == "http_auth":
+            return agent.http_auth(step["username"], step["password"])
+
+        if action == "local_storage_set":
+            return agent.local_storage_set(step["key"], step["value"])
+
+        if action == "local_storage_get":
+            return agent.local_storage_get(step["key"])
+
+        if action == "session_storage_set":
+            return agent.session_storage_set(step["key"], step["value"])
+
+        if action == "session_storage_get":
+            return agent.session_storage_get(step["key"])
+
+        # ---- Assertions & Verification (Category 4) ----
+
+        if action == "assert_element_count":
+            return agent.assert_element_count(
+                step["selector"],
+                step["count"],
+                operator=step.get("operator", "eq"),
+            )
+
+        if action == "assert_attribute":
+            return agent.assert_attribute(
+                step["selector"],
+                step["attribute"],
+                step["value"],
+                case_sensitive=step.get("case_sensitive", True),
+            )
+
+        if action == "assert_title":
+            return agent.assert_title(
+                step["pattern"],
+                case_sensitive=step.get("case_sensitive", False),
+            )
+
+        if action == "assert_visible":
+            return agent.assert_visible(step["selector"])
+
+        if action == "assert_hidden":
+            return agent.assert_hidden(step["selector"])
 
         raise ValueError(f"Unknown action: {action!r}")
 

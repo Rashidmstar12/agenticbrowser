@@ -267,6 +267,118 @@ class CloseTabRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Request models — new browser interactions (Category 1)
+# ---------------------------------------------------------------------------
+
+class DragDropRequest(BaseModel):
+    source: str = Field(..., description="CSS selector of the element to drag")
+    target: str = Field(..., description="CSS selector of the drop destination")
+
+
+class RightClickRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector of the element to right-click")
+
+
+class DoubleClickRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector of the element to double-click")
+
+
+class UploadFileRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector of the <input type='file'> element")
+    path: str = Field(..., description="Workspace-relative path to the file to attach")
+
+
+class SetViewportRequest(BaseModel):
+    width: int = Field(..., description="Viewport width in pixels")
+    height: int = Field(..., description="Viewport height in pixels")
+
+
+class BlockResourceRequest(BaseModel):
+    types: list[str] = Field(
+        default=["image", "stylesheet", "font"],
+        description="Resource types to block: image, stylesheet, font, script, media",
+    )
+
+
+class IframeSwitchRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector of the <iframe> element to switch into")
+
+
+# ---------------------------------------------------------------------------
+# Request models — data extraction (Category 2)
+# ---------------------------------------------------------------------------
+
+class ExtractImagesRequest(BaseModel):
+    selector: str = Field("img", description="CSS selector for image elements")
+    limit: int = Field(100, description="Maximum number of images to return")
+
+
+class ExtractFormFieldsRequest(BaseModel):
+    selector: str = Field("form", description="CSS selector of the form element")
+
+
+# ---------------------------------------------------------------------------
+# Request models — authentication & session (Category 3)
+# ---------------------------------------------------------------------------
+
+class SetExtraHeadersRequest(BaseModel):
+    headers: dict[str, str] = Field(..., description="HTTP header name → value mapping")
+
+
+class HttpAuthRequest(BaseModel):
+    username: str = Field(..., description="HTTP Basic Auth username")
+    password: str = Field(..., description="HTTP Basic Auth password")
+
+
+class LocalStorageSetRequest(BaseModel):
+    key: str = Field(..., description="localStorage key")
+    value: str = Field(..., description="Value to store")
+
+
+class LocalStorageGetRequest(BaseModel):
+    key: str = Field(..., description="localStorage key to read")
+
+
+class SessionStorageSetRequest(BaseModel):
+    key: str = Field(..., description="sessionStorage key")
+    value: str = Field(..., description="Value to store")
+
+
+class SessionStorageGetRequest(BaseModel):
+    key: str = Field(..., description="sessionStorage key to read")
+
+
+# ---------------------------------------------------------------------------
+# Request models — assertions & verification (Category 4)
+# ---------------------------------------------------------------------------
+
+class AssertElementCountRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector to count")
+    count: int = Field(..., description="Expected element count")
+    operator: str = Field("eq", description="Comparison operator: eq | gte | lte | gt | lt")
+
+
+class AssertAttributeRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector of the element")
+    attribute: str = Field(..., description="HTML attribute name")
+    value: str = Field(..., description="Expected attribute value")
+    case_sensitive: bool = Field(True, description="Case-sensitive comparison")
+
+
+class AssertTitleRequest(BaseModel):
+    pattern: str = Field(..., description="Substring that must be present in the page title")
+    case_sensitive: bool = Field(False, description="Case-sensitive comparison")
+
+
+class AssertVisibleRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector of the element that must be visible")
+
+
+class AssertHiddenRequest(BaseModel):
+    selector: str = Field(..., description="CSS selector of the element that must not be visible")
+
+
+# ---------------------------------------------------------------------------
 # Request models — system tools
 # ---------------------------------------------------------------------------
 
@@ -580,6 +692,159 @@ def close_tab(req: CloseTabRequest) -> dict[str, Any]:
 @app.get("/tabs/list", summary="List all open browser tabs")
 def list_tabs() -> dict[str, Any]:
     return get_agent().list_tabs()
+
+
+# ---------------------------------------------------------------------------
+# Routes: new browser interactions (Category 1)
+# ---------------------------------------------------------------------------
+
+@app.post("/drag_drop", summary="Drag an element and drop it onto another")
+def drag_drop(req: DragDropRequest) -> dict[str, Any]:
+    return get_agent().drag_drop(req.source, req.target)
+
+
+@app.post("/right_click", summary="Right-click an element to open its context menu")
+def right_click(req: RightClickRequest) -> dict[str, Any]:
+    return get_agent().right_click(req.selector)
+
+
+@app.post("/double_click", summary="Double-click an element")
+def double_click(req: DoubleClickRequest) -> dict[str, Any]:
+    return get_agent().double_click(req.selector)
+
+
+@app.post("/upload_file", summary="Attach a file to an <input type='file'> element")
+def upload_file(req: UploadFileRequest) -> dict[str, Any]:
+    return get_agent().upload_file(req.selector, req.path)
+
+
+@app.post("/set_viewport", summary="Resize the browser viewport")
+def set_viewport(req: SetViewportRequest) -> dict[str, Any]:
+    return get_agent().set_viewport(req.width, req.height)
+
+
+@app.post("/block_resource", summary="Block requests for specified resource types")
+def block_resource(req: BlockResourceRequest) -> dict[str, Any]:
+    return get_agent().block_resource(types=req.types)
+
+
+@app.post("/iframe/switch", summary="Switch interaction context to an iframe")
+def iframe_switch(req: IframeSwitchRequest) -> dict[str, Any]:
+    return get_agent().iframe_switch(req.selector)
+
+
+@app.post("/iframe/exit", summary="Exit the iframe context and return to the top-level page")
+def iframe_exit() -> dict[str, Any]:
+    return get_agent().iframe_exit()
+
+
+# ---------------------------------------------------------------------------
+# Routes: data extraction (Category 2)
+# ---------------------------------------------------------------------------
+
+@app.get("/page/extract_json_ld", summary="Extract Schema.org JSON-LD metadata blocks")
+def extract_json_ld() -> dict[str, Any]:
+    return get_agent().extract_json_ld()
+
+
+@app.get("/page/extract_headings", summary="Extract all headings (h1–h6) from the page")
+def extract_headings() -> dict[str, Any]:
+    return get_agent().extract_headings()
+
+
+@app.post("/page/extract_images", summary="Extract all images from the page")
+def extract_images(req: ExtractImagesRequest) -> dict[str, Any]:
+    return get_agent().extract_images(selector=req.selector, limit=req.limit)
+
+
+@app.post("/page/extract_form_fields", summary="Describe all form fields on the page")
+def extract_form_fields(req: ExtractFormFieldsRequest) -> dict[str, Any]:
+    return get_agent().extract_form_fields(selector=req.selector)
+
+
+@app.get("/page/extract_meta", summary="Extract <meta> tags from the page")
+def extract_meta() -> dict[str, Any]:
+    return get_agent().extract_meta()
+
+
+# ---------------------------------------------------------------------------
+# Routes: authentication & session (Category 3)
+# ---------------------------------------------------------------------------
+
+@app.post("/session/set_headers", summary="Set extra HTTP request headers for the session")
+def set_extra_headers(req: SetExtraHeadersRequest) -> dict[str, Any]:
+    return get_agent().set_extra_headers(req.headers)
+
+
+@app.post("/session/http_auth", summary="Set HTTP Basic Auth credentials")
+def http_auth(req: HttpAuthRequest) -> dict[str, Any]:
+    return get_agent().http_auth(req.username, req.password)
+
+
+@app.post("/storage/local/set", summary="Write a value to localStorage")
+def local_storage_set(req: LocalStorageSetRequest) -> dict[str, Any]:
+    return get_agent().local_storage_set(req.key, req.value)
+
+
+@app.post("/storage/local/get", summary="Read a value from localStorage")
+def local_storage_get(req: LocalStorageGetRequest) -> dict[str, Any]:
+    return get_agent().local_storage_get(req.key)
+
+
+@app.post("/storage/session/set", summary="Write a value to sessionStorage")
+def session_storage_set(req: SessionStorageSetRequest) -> dict[str, Any]:
+    return get_agent().session_storage_set(req.key, req.value)
+
+
+@app.post("/storage/session/get", summary="Read a value from sessionStorage")
+def session_storage_get(req: SessionStorageGetRequest) -> dict[str, Any]:
+    return get_agent().session_storage_get(req.key)
+
+
+# ---------------------------------------------------------------------------
+# Routes: assertions & verification (Category 4)
+# ---------------------------------------------------------------------------
+
+@app.post("/assert/element_count", summary="Assert the number of elements matching a selector")
+def assert_element_count(req: AssertElementCountRequest) -> dict[str, Any]:
+    try:
+        return get_agent().assert_element_count(req.selector, req.count, operator=req.operator)
+    except (AssertionError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+
+@app.post("/assert/attribute", summary="Assert an element's attribute value")
+def assert_attribute(req: AssertAttributeRequest) -> dict[str, Any]:
+    try:
+        return get_agent().assert_attribute(
+            req.selector, req.attribute, req.value, case_sensitive=req.case_sensitive
+        )
+    except AssertionError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+
+@app.post("/assert/title", summary="Assert the page title contains a pattern")
+def assert_title(req: AssertTitleRequest) -> dict[str, Any]:
+    try:
+        return get_agent().assert_title(req.pattern, case_sensitive=req.case_sensitive)
+    except AssertionError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+
+@app.post("/assert/visible", summary="Assert that an element is visible")
+def assert_visible(req: AssertVisibleRequest) -> dict[str, Any]:
+    try:
+        return get_agent().assert_visible(req.selector)
+    except AssertionError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+
+@app.post("/assert/hidden", summary="Assert that an element is not visible")
+def assert_hidden(req: AssertHiddenRequest) -> dict[str, Any]:
+    try:
+        return get_agent().assert_hidden(req.selector)
+    except AssertionError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
 
 
 # ---------------------------------------------------------------------------

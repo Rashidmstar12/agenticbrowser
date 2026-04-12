@@ -151,15 +151,41 @@ COMMANDS: dict[str, str] = {
     "info":               "info",
     "wait":               "wait <selector>",
     "wait_state":         "wait_state [networkidle|load|domcontentloaded]",
+    # New browser interactions
+    "drag_drop":          "drag_drop <source_selector> <target_selector>",
+    "right_click":        "right_click <selector>",
+    "double_click":       "double_click <selector>",
+    "upload_file":        "upload_file <selector> <path>",
+    "set_viewport":       "set_viewport <width> <height>",
+    "block_resource":     "block_resource [image,stylesheet,font]",
+    "iframe_switch":      "iframe_switch <selector>",
+    "iframe_exit":        "iframe_exit",
     # Smart extraction / assertion / wait_text
     "extract_links":      "extract_links [selector=a] [limit=100]",
     "extract_table":      "extract_table [selector=table] [table_index=0]",
+    "extract_json_ld":    "extract_json_ld",
+    "extract_headings":   "extract_headings",
+    "extract_images":     "extract_images [selector=img] [limit=100]",
+    "extract_form_fields": "extract_form_fields [selector=form]",
+    "extract_meta":       "extract_meta",
     "assert_text":        "assert_text <text> [selector=body]",
     "assert_url":         "assert_url <pattern>",
+    "assert_title":       "assert_title <pattern>",
+    "assert_element_count": "assert_element_count <selector> <count> [operator=eq]",
+    "assert_attribute":   "assert_attribute <selector> <attribute> <value>",
+    "assert_visible":     "assert_visible <selector>",
+    "assert_hidden":      "assert_hidden <selector>",
     "wait_text":          "wait_text <text> [selector=body]",
     # Cookie persistence
     "save_cookies":       "save_cookies <path>",
     "load_cookies":       "load_cookies <path>",
+    # Auth & session
+    "set_extra_headers":  "set_extra_headers <header>=<value> [<header>=<value> ...]",
+    "http_auth":          "http_auth <username> <password>",
+    "local_storage_set":  "local_storage_set <key> <value>",
+    "local_storage_get":  "local_storage_get <key>",
+    "session_storage_set": "session_storage_set <key> <value>",
+    "session_storage_get": "session_storage_get <key>",
     # Multi-tab
     "new_tab":            "new_tab [url]",
     "switch_tab":         "switch_tab <index>",
@@ -301,6 +327,51 @@ def _dispatch(
             state = parts[1] if len(parts) > 1 else "networkidle"
             return agent.wait_for_load_state(state)
 
+        # ---- New browser interactions ----
+
+        elif cmd == "drag_drop":
+            source = parts[1] if len(parts) > 1 else input("  Source selector: ").strip()
+            target = parts[2] if len(parts) > 2 else input("  Target selector: ").strip()
+            return agent.drag_drop(source, target)
+
+        elif cmd == "right_click":
+            selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            return agent.right_click(selector)
+
+        elif cmd == "double_click":
+            selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            return agent.double_click(selector)
+
+        elif cmd == "upload_file":
+            selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            path     = parts[2] if len(parts) > 2 else input("  File path: ").strip()
+            return agent.upload_file(selector, path)
+
+        elif cmd == "set_viewport":
+            width  = int(parts[1]) if len(parts) > 1 else int(input("  Width: ").strip())
+            height = int(parts[2]) if len(parts) > 2 else int(input("  Height: ").strip())
+            result = agent.set_viewport(width, height)
+            print(f"  Viewport set to {width}x{height}")
+            return result
+
+        elif cmd == "block_resource":
+            types_raw = parts[1] if len(parts) > 1 else "image,stylesheet,font"
+            types = [t.strip() for t in types_raw.split(",") if t.strip()]
+            result = agent.block_resource(types=types)
+            print(f"  Blocking resource types: {result['blocked_types']}")
+            return result
+
+        elif cmd == "iframe_switch":
+            selector = parts[1] if len(parts) > 1 else input("  iframe selector: ").strip()
+            result = agent.iframe_switch(selector)
+            print(f"  Switched to iframe: {result['frame_url']}")
+            return result
+
+        elif cmd == "iframe_exit":
+            result = agent.iframe_exit()
+            print(f"  Exited iframe; now on: {result['frame_url']}")
+            return result
+
         # ---- Smart extraction / assertion / wait_text ----
 
         elif cmd == "extract_links":
@@ -323,6 +394,51 @@ def _dispatch(
                 print(f"  ... and {result['count'] - 10} more rows")
             return result
 
+        elif cmd == "extract_json_ld":
+            result = agent.extract_json_ld()
+            for i, item in enumerate(result["items"][:5]):
+                print(f"  [{i}] {json.dumps(item)[:120]}")
+            if result["count"] > 5:
+                print(f"  ... and {result['count'] - 5} more")
+            return result
+
+        elif cmd == "extract_headings":
+            result = agent.extract_headings()
+            for h in result["headings"][:20]:
+                print(f"  {'  ' * (h['level'] - 1)}H{h['level']}: {h['text']}")
+            if result["count"] > 20:
+                print(f"  ... and {result['count'] - 20} more")
+            return result
+
+        elif cmd == "extract_images":
+            selector = parts[1] if len(parts) > 1 else "img"
+            limit    = int(parts[2]) if len(parts) > 2 else 100
+            result   = agent.extract_images(selector=selector, limit=limit)
+            for img in result["images"][:10]:
+                print(f"  {img['src']!r:60s} alt={img['alt']!r}")
+            if result["count"] > 10:
+                print(f"  ... and {result['count'] - 10} more")
+            return result
+
+        elif cmd == "extract_form_fields":
+            selector = parts[1] if len(parts) > 1 else "form"
+            result   = agent.extract_form_fields(selector=selector)
+            for f in result["fields"][:20]:
+                print(f"  [{f['tag']}] name={f['name']!r} type={f['type']!r} placeholder={f['placeholder']!r}")
+            if result["count"] > 20:
+                print(f"  ... and {result['count'] - 20} more")
+            return result
+
+        elif cmd == "extract_meta":
+            result = agent.extract_meta()
+            print(f"  title: {result.get('title', '')!r}")
+            print(f"  description: {result.get('description', '')!r}")
+            for tag in result.get("tags", [])[:10]:
+                name = tag.get("name") or tag.get("property") or ""
+                if name:
+                    print(f"  {name}: {tag.get('content', '')!r}")
+            return result
+
         elif cmd == "assert_text":
             text     = parts[1] if len(parts) > 1 else input("  Text: ").strip()
             selector = parts[2] if len(parts) > 2 else "body"
@@ -331,6 +447,30 @@ def _dispatch(
         elif cmd == "assert_url":
             pattern = parts[1] if len(parts) > 1 else input("  Pattern: ").strip()
             return agent.assert_url(pattern)
+
+        elif cmd == "assert_title":
+            pattern = parts[1] if len(parts) > 1 else input("  Pattern: ").strip()
+            return agent.assert_title(pattern)
+
+        elif cmd == "assert_element_count":
+            selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            count    = int(parts[2]) if len(parts) > 2 else int(input("  Count: ").strip())
+            operator = parts[3] if len(parts) > 3 else "eq"
+            return agent.assert_element_count(selector, count, operator=operator)
+
+        elif cmd == "assert_attribute":
+            selector  = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            attribute = parts[2] if len(parts) > 2 else input("  Attribute: ").strip()
+            value     = parts[3] if len(parts) > 3 else input("  Value: ").strip()
+            return agent.assert_attribute(selector, attribute, value)
+
+        elif cmd == "assert_visible":
+            selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            return agent.assert_visible(selector)
+
+        elif cmd == "assert_hidden":
+            selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            return agent.assert_hidden(selector)
 
         elif cmd == "wait_text":
             text     = parts[1] if len(parts) > 1 else input("  Text: ").strip()
@@ -359,6 +499,52 @@ def _dispatch(
             agent.add_cookies(cookies)
             print(f"  Loaded {len(cookies)} cookies from {path}")
             return {"cookies_loaded": len(cookies), "path": path}
+
+        # ---- Auth & session ----
+
+        elif cmd == "set_extra_headers":
+            # Accept pairs like  Authorization=Bearer abc  X-Custom=value
+            headers: dict[str, str] = {}
+            for token in parts[1:]:
+                if "=" in token:
+                    k, _, v = token.partition("=")
+                    headers[k.strip()] = v.strip()
+            if not headers:
+                raw = input("  Header (Name=Value): ").strip()
+                k, _, v = raw.partition("=")
+                headers[k.strip()] = v.strip()
+            result = agent.set_extra_headers(headers)
+            print(f"  Headers set: {result['headers_set']}")
+            return result
+
+        elif cmd == "http_auth":
+            username = parts[1] if len(parts) > 1 else input("  Username: ").strip()
+            password = parts[2] if len(parts) > 2 else input("  Password: ").strip()
+            result = agent.http_auth(username, password)
+            print(f"  HTTP Basic Auth set for {result['username']!r}")
+            return result
+
+        elif cmd == "local_storage_set":
+            key   = parts[1] if len(parts) > 1 else input("  Key: ").strip()
+            value = parts[2] if len(parts) > 2 else input("  Value: ").strip()
+            return agent.local_storage_set(key, value)
+
+        elif cmd == "local_storage_get":
+            key    = parts[1] if len(parts) > 1 else input("  Key: ").strip()
+            result = agent.local_storage_get(key)
+            print(f"  {result['key']!r} = {result['value']!r}")
+            return result
+
+        elif cmd == "session_storage_set":
+            key   = parts[1] if len(parts) > 1 else input("  Key: ").strip()
+            value = parts[2] if len(parts) > 2 else input("  Value: ").strip()
+            return agent.session_storage_set(key, value)
+
+        elif cmd == "session_storage_get":
+            key    = parts[1] if len(parts) > 1 else input("  Key: ").strip()
+            result = agent.session_storage_get(key)
+            print(f"  {result['key']!r} = {result['value']!r}")
+            return result
 
         # ---- Multi-tab ----
 
