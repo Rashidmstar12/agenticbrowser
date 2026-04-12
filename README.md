@@ -531,6 +531,8 @@ export OPENAI_MODEL=gpt-4o-mini   # optional, default: gpt-4o-mini
 | `BROWSER_REFERRER_POLICY` | `strict-origin-when-cross-origin` | Overrides the `Referrer-Policy` header value (only used when `BROWSER_SECURITY_HEADERS` is enabled). |
 | `BROWSER_FRAME_OPTIONS` | `DENY` | Overrides the `X-Frame-Options` header value, e.g. `SAMEORIGIN` (only used when `BROWSER_SECURITY_HEADERS` is enabled). |
 | `BROWSER_PERMISSIONS_POLICY` | `geolocation=(), microphone=(), camera=()` | Overrides the `Permissions-Policy` header value (only used when `BROWSER_SECURITY_HEADERS` is enabled). |
+| `BROWSER_MAX_BODY_SIZE` | — | Maximum allowed request body size in bytes. Requests with a larger body receive **413 Request Entity Too Large**. e.g. `1048576` (1 MiB), `524288` (512 KiB). When unset or `0`, no limit is applied. |
+| `BROWSER_ACCESS_LOG` | — | Set to `1` (or `true`/`yes`/`on`) to emit a structured JSON access-log line per request to the `agenticbrowser.access` Python logger at INFO level. Each record includes `timestamp`, `method`, `path`, `status`, `duration_ms`, and `client_ip`. When unset, no access logging is performed. |
 
 ---
 

@@ -14,6 +14,7 @@ import asyncio
 import json as _json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path as _Path
 from typing import Any, AsyncIterator
@@ -288,6 +289,139 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 if _security_headers_enabled():
     app.add_middleware(SecurityHeadersMiddleware)
+
+# ---------------------------------------------------------------------------
+# Request body size limiting — configured via BROWSER_MAX_BODY_SIZE env var.
+#
+# Set BROWSER_MAX_BODY_SIZE to the maximum allowed request body in bytes, e.g.:
+#   BROWSER_MAX_BODY_SIZE=1048576    # 1 MiB
+#   BROWSER_MAX_BODY_SIZE=524288     # 512 KiB
+#   BROWSER_MAX_BODY_SIZE=10485760   # 10 MiB
+#
+# Requests whose body exceeds this limit receive HTTP 413 Request Entity Too Large.
+# The check is performed before the body is fully buffered, using the
+# Content-Length header when present; bodies sent without Content-Length are
+# streamed and rejected as soon as the running total exceeds the limit.
+# When the variable is unset (or set to 0) no size limit is applied.
+# ---------------------------------------------------------------------------
+
+def _max_body_size() -> int:
+    """Return the configured max request body size in bytes, or 0 (unlimited)."""
+    raw = os.environ.get("BROWSER_MAX_BODY_SIZE", "").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+class MaxBodySizeMiddleware(BaseHTTPMiddleware):
+    """
+    Reject requests whose body exceeds ``BROWSER_MAX_BODY_SIZE`` bytes with
+    HTTP 413 Request Entity Too Large.
+
+    The limit is re-read from the environment on every request so that tests
+    can override it without restarting the process.
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        limit = _max_body_size()
+        if limit > 0:
+            content_length = request.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > limit:
+                        return Response(
+                            content=f"Request body too large (limit: {limit} bytes).",
+                            status_code=413,
+                            media_type="text/plain",
+                        )
+                except ValueError:
+                    pass
+            else:
+                # Stream and count bytes until we hit the limit.
+                body_size = 0
+                chunks: list[bytes] = []
+                async for chunk in request.stream():
+                    body_size += len(chunk)
+                    if body_size > limit:
+                        return Response(
+                            content=f"Request body too large (limit: {limit} bytes).",
+                            status_code=413,
+                            media_type="text/plain",
+                        )
+                    chunks.append(chunk)
+
+                # Reconstruct a new request with the buffered body so downstream
+                # middleware and route handlers can still read it.
+                async def _body_iter(data=b"".join(chunks)):
+                    yield data
+
+                request = Request(request.scope, _body_iter().__anext__)
+
+        return await call_next(request)
+
+
+if _max_body_size() > 0:
+    app.add_middleware(MaxBodySizeMiddleware)
+
+# ---------------------------------------------------------------------------
+# Structured JSON access logging — configured via BROWSER_ACCESS_LOG env var.
+#
+# Set BROWSER_ACCESS_LOG=1 to emit one JSON log line per request to the
+# ``agenticbrowser.access`` logger at INFO level.  Each record contains:
+#   {
+#     "timestamp": "<ISO-8601>",
+#     "method":    "GET",
+#     "path":      "/sessions",
+#     "status":    200,
+#     "duration_ms": 4.2,
+#     "client_ip": "1.2.3.4"
+#   }
+#
+# The logger uses the standard Python logging hierarchy so it respects any
+# ``logging.basicConfig`` / dictConfig already configured by the host
+# application.  When the variable is unset no access-log middleware is added.
+# ---------------------------------------------------------------------------
+
+_ACCESS_LOGGER = logging.getLogger("agenticbrowser.access")
+
+
+def _access_log_enabled() -> bool:
+    val = os.environ.get("BROWSER_ACCESS_LOG", "").strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+class AccessLogMiddleware(BaseHTTPMiddleware):
+    """
+    Emit a structured JSON access-log record for every HTTP request.
+
+    Enabled only when ``BROWSER_ACCESS_LOG`` is set to a truthy value.
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        start = time.monotonic()
+        response: Response = await call_next(request)
+        duration_ms = round((time.monotonic() - start) * 1000, 2)
+
+        client_ip = (
+            request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+            or (request.client.host if request.client else "unknown")
+        )
+
+        record = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "method": request.method,
+            "path": request.url.path,
+            "status": response.status_code,
+            "duration_ms": duration_ms,
+            "client_ip": client_ip,
+        }
+        _ACCESS_LOGGER.info(_json.dumps(record))
+        return response
+
+
+if _access_log_enabled():
+    app.add_middleware(AccessLogMiddleware)
 
 # ---------------------------------------------------------------------------
 # Request / Response models — session
