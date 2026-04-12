@@ -542,11 +542,15 @@ class TestWaitHelpers:
 
     def test_wait_for_navigation(self):
         agent, page, _ = _make_agent()
-        # page.expect_navigation is a context manager
-        cm = MagicMock()
-        cm.__enter__ = MagicMock(return_value=None)
-        cm.__exit__ = MagicMock(return_value=False)
-        page.expect_navigation.return_value = cm
+        result = agent.wait_for_navigation()
+        # Should use wait_for_load_state, not expect_navigation
+        page.wait_for_load_state.assert_called_once_with("domcontentloaded")
+        assert "url" in result
+
+    def test_wait_for_navigation_handles_exception(self):
+        """wait_for_navigation should not raise if the page is already loaded."""
+        agent, page, _ = _make_agent()
+        page.wait_for_load_state.side_effect = Exception("already loaded")
         result = agent.wait_for_navigation()
         assert "url" in result
 
@@ -838,3 +842,83 @@ class TestMultiTab:
 
         assert result["count"] == 2
         assert result["tabs"][1]["url"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# URL scheme validation
+# ---------------------------------------------------------------------------
+
+class TestNavigateURLValidation:
+    def test_navigate_http_allowed(self):
+        agent, page, _ = _make_agent()
+        page.url = "http://example.com"
+        result = agent.navigate("http://example.com")
+        assert "url" in result
+
+    def test_navigate_https_allowed(self):
+        agent, page, _ = _make_agent()
+        result = agent.navigate("https://example.com")
+        assert "url" in result
+
+    def test_navigate_javascript_blocked(self):
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.navigate("javascript:alert(1)")
+
+    def test_navigate_file_blocked(self):
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.navigate("file:///etc/passwd")
+
+    def test_navigate_data_blocked(self):
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.navigate("data:text/html,<h1>xss</h1>")
+
+    def test_navigate_no_scheme_blocked(self):
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.navigate("example.com")
+
+
+# ---------------------------------------------------------------------------
+# _intercept_patterns initialized in __init__
+# ---------------------------------------------------------------------------
+
+class TestInterceptPatternsInit:
+    def test_intercept_patterns_initialized(self):
+        """_intercept_patterns should be a list from the start, not require hasattr."""
+        agent = BrowserAgent()
+        assert hasattr(agent, "_intercept_patterns")
+        assert isinstance(agent._intercept_patterns, list)
+        assert len(agent._intercept_patterns) == 0
+
+    def test_clear_network_intercepts_on_fresh_agent(self):
+        """clear_network_intercepts should work even without prior set_network_intercept."""
+        agent, page, _ = _make_agent()
+        result = agent.clear_network_intercepts()
+        assert result["cleared"] == 0
+        assert result["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# set_network_intercept intercept_action key (Bug fix regression)
+# ---------------------------------------------------------------------------
+
+class TestSetNetworkIntercept:
+    def test_set_intercept_appends_pattern(self):
+        agent, page, _ = _make_agent()
+        agent.set_network_intercept("**/*.png", action="abort")
+        assert "**/*.png" in agent._intercept_patterns
+
+    def test_set_intercept_invalid_action_raises(self):
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="action must be 'abort' or 'continue'"):
+            agent.set_network_intercept("**/*.png", action="block")
+
+    def test_clear_intercepts_resets_patterns(self):
+        agent, page, _ = _make_agent()
+        agent.set_network_intercept("**/*.png", action="abort")
+        result = agent.clear_network_intercepts()
+        assert result["cleared"] == 1
+        assert len(agent._intercept_patterns) == 0

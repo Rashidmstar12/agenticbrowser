@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 from browser_agent import BrowserAgent
 from doctor import run_checks
 from skills import SkillLoadError, get_default_registry
-from system_tools import SystemTools
+from system_tools import PathTraversalError, SystemTools, safe_path
 from task_planner import STEP_SCHEMA, StepValidationError, TaskPlanner, validate_steps
 
 # ---------------------------------------------------------------------------
@@ -303,8 +303,8 @@ class SetNetworkInterceptRequest(BaseModel):
 
 
 class SetViewportRequest(BaseModel):
-    width: int = Field(..., description="Viewport width in pixels")
-    height: int = Field(..., description="Viewport height in pixels")
+    width: int = Field(..., ge=1, description="Viewport width in pixels")
+    height: int = Field(..., ge=1, description="Viewport height in pixels")
 
 
 class SetGeolocationRequest(BaseModel):
@@ -635,13 +635,21 @@ def list_tabs() -> dict[str, Any]:
 
 @app.post("/upload_file", summary="Set file(s) on a file input element")
 def upload_file(req: UploadFileRequest) -> dict[str, Any]:
-    file_path = str(get_tools().workspace / req.path)
+    tools = get_tools()
+    try:
+        file_path = str(safe_path(tools.workspace, req.path))
+    except PathTraversalError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
     return get_agent().upload_file(req.selector, file_path)
 
 
 @app.post("/download_file", summary="Navigate to a URL and save the triggered download")
 def download_file(req: DownloadFileRequest) -> dict[str, Any]:
-    save_path = str(get_tools().workspace / req.path)
+    tools = get_tools()
+    try:
+        save_path = str(safe_path(tools.workspace, req.path))
+    except PathTraversalError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
     return get_agent().download_file(req.url, save_path)
 
 

@@ -234,8 +234,8 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
     },
     "set_network_intercept": {
         "required": ["url_pattern"],
-        "optional": {"action": "abort"},
-        "description": "Intercept requests matching url_pattern. action: 'abort' (block) or 'continue' (pass through).",
+        "optional": {"intercept_action": "abort"},
+        "description": "Intercept requests matching url_pattern. intercept_action: 'abort' (block) or 'continue' (pass through).",
     },
     "clear_network_intercepts": {
         "required": [],
@@ -481,7 +481,7 @@ RULES (MUST follow all):
 1. Output ONLY a valid JSON array. No prose, no markdown, no explanation.
 2. Each element must have an "action" key matching one of the allowed actions below.
 3. Use the fewest steps possible. Never add unnecessary steps.
-4. Maximum 12 steps. If you cannot do the task in 12 steps, return an error step.
+4. Maximum 20 steps. If you cannot do the task in 20 steps, return an error step.
 5. For well-known sites (Google, Bing, YouTube, Wikipedia, DuckDuckGo) use the
    exact selectors listed below — never invent selectors.
 6. After navigate always add close_popups.
@@ -1082,7 +1082,7 @@ class TaskPlanner:
         if action == "set_network_intercept":
             return agent.set_network_intercept(
                 step["url_pattern"],
-                action=step.get("action", "abort"),
+                action=step.get("intercept_action", "abort"),
             )
 
         if action == "clear_network_intercepts":

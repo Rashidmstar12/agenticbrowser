@@ -637,3 +637,87 @@ class TestGetPlannerError:
             json={"steps": [{"action": "navigate", "url": "https://example.com"}]},
         )
         assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Upload/Download file — path traversal protection
+# ---------------------------------------------------------------------------
+
+class TestUploadDownloadPathTraversal:
+    def test_upload_file_traversal_rejected(self):
+        """Paths outside the workspace should be rejected with 422."""
+        agent = _make_agent()
+        tools = SystemTools()
+
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post(
+                "/upload_file",
+                json={"selector": "input[type=file]", "path": "../../../etc/passwd"},
+            )
+        assert r.status_code == 422
+
+    def test_download_file_traversal_rejected(self):
+        """Paths outside the workspace should be rejected with 422."""
+        agent = _make_agent()
+        tools = SystemTools()
+
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post(
+                "/download_file",
+                json={"url": "https://example.com/file.zip", "path": "../../etc/passwd"},
+            )
+        assert r.status_code == 422
+
+    def test_upload_file_valid_path_accepted(self):
+        """A normal workspace-relative path should succeed."""
+        agent = _make_agent()
+        agent.upload_file.return_value = {"selector": "input", "uploaded": "file.txt", "ok": True}
+        tools = SystemTools()
+
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post(
+                "/upload_file",
+                json={"selector": "input[type=file]", "path": "file.txt"},
+            )
+        assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# SetViewportRequest — dimension validation
+# ---------------------------------------------------------------------------
+
+class TestSetViewportValidation:
+    def test_negative_width_rejected(self):
+        agent = _make_agent()
+        with patch.object(api_server, "_agent", agent):
+            c = TestClient(app)
+            r = c.post("/session/viewport", json={"width": -1, "height": 600})
+        assert r.status_code == 422
+
+    def test_zero_width_rejected(self):
+        agent = _make_agent()
+        with patch.object(api_server, "_agent", agent):
+            c = TestClient(app)
+            r = c.post("/session/viewport", json={"width": 0, "height": 600})
+        assert r.status_code == 422
+
+    def test_negative_height_rejected(self):
+        agent = _make_agent()
+        with patch.object(api_server, "_agent", agent):
+            c = TestClient(app)
+            r = c.post("/session/viewport", json={"width": 1280, "height": -1})
+        assert r.status_code == 422
+
+    def test_valid_dimensions_accepted(self):
+        agent = _make_agent()
+        agent.set_viewport.return_value = {"width": 1280, "height": 720, "ok": True}
+        with patch.object(api_server, "_agent", agent):
+            c = TestClient(app)
+            r = c.post("/session/viewport", json={"width": 1280, "height": 720})
+        assert r.status_code == 200

@@ -93,6 +93,9 @@ _POPUP_SELECTORS = [
     "[class*='overlay'] button[class*='close']",
 ]
 
+# Allowed URL schemes for navigation (prevents javascript:, file:, data: injection).
+_ALLOWED_URL_SCHEMES: tuple[str, ...] = ("http://", "https://")
+
 
 class BrowserAgent:
     """
@@ -130,6 +133,7 @@ class BrowserAgent:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._pages: list[Page] = []  # all open tabs; self._page is the active one
+        self._intercept_patterns: list[str] = []  # patterns registered via set_network_intercept
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -242,7 +246,9 @@ class BrowserAgent:
         Parameters
         ----------
         url:
-            Target URL (e.g. ``"https://example.com"``).
+            Target URL (e.g. ``"https://example.com"``).  Only ``http://`` and
+            ``https://`` schemes are accepted; ``javascript:``, ``file://``, and
+            ``data:`` URIs are rejected with a ``ValueError``.
         wait_until:
             Playwright load-state strategy: ``"load"``, ``"domcontentloaded"``,
             or ``"networkidle"``.  When ``"networkidle"`` is requested the page
@@ -255,6 +261,11 @@ class BrowserAgent:
         dict
             ``{"url": ..., "title": ...}``
         """
+        if not url.startswith(_ALLOWED_URL_SCHEMES):
+            raise ValueError(
+                f"Unsafe URL scheme in {url!r}. "
+                "Only http:// and https:// are allowed."
+            )
         logger.info("Navigating to %s", url)
         # Navigate with a reliable load event; networkidle is attempted separately
         # to avoid infinite hangs on SPAs that never stop making network requests.
@@ -534,9 +545,35 @@ class BrowserAgent:
         return {"visible": selector}
 
     def wait_for_navigation(self, url: str | None = None) -> dict[str, Any]:
-        """Wait for any navigation to complete (optionally matching *url*)."""
-        with self.page.expect_navigation(url=url):
-            pass
+        """
+        Wait for the current page to reach a settled load state.
+
+        This method waits for ``domcontentloaded`` (falling back gracefully if
+        the page is already loaded) so it is safe to call after an action that
+        triggers navigation has already been started.
+
+        .. note::
+            To wait for navigation that is *about to be triggered* by a click or
+            form submission, use ``wait_for_load_state()`` immediately after the
+            triggering action instead — Playwright's ``expect_navigation``
+            context manager requires the triggering action to occur *inside* the
+            ``with`` block, which is not possible from this convenience wrapper.
+
+        Parameters
+        ----------
+        url:
+            Ignored (kept for backwards-compatibility).  Use ``assert_url()``
+            after this call if you need to verify the destination URL.
+
+        Returns
+        -------
+        dict
+            ``{"url": <current_url>}``
+        """
+        try:
+            self.page.wait_for_load_state("domcontentloaded")
+        except Exception:
+            pass  # already loaded — not an error
         return {"url": self.page.url}
 
     def wait_for_load_state(self, state: str = "networkidle") -> dict[str, Any]:
@@ -1028,8 +1065,6 @@ class BrowserAgent:
                 route.continue_()
             self.page.route(url_pattern, _continue_handler)
 
-        if not hasattr(self, "_intercept_patterns"):
-            self._intercept_patterns: list[str] = []
         self._intercept_patterns.append(url_pattern)
         return {"url_pattern": url_pattern, "action": action, "ok": True}
 
@@ -1043,19 +1078,18 @@ class BrowserAgent:
         dict
             ``{"cleared": N, "ok": True}``
         """
-        count = len(getattr(self, "_intercept_patterns", []))
+        count = len(self._intercept_patterns)
         try:
             self.page.unroute_all()
         except AttributeError:
             # Playwright < 1.32 does not have unroute_all(); fall back to
             # unrouting each pattern individually.
-            for pattern in getattr(self, "_intercept_patterns", []):
+            for pattern in self._intercept_patterns:
                 try:
                     self.page.unroute(pattern)
                 except Exception:
                     pass
-        if hasattr(self, "_intercept_patterns"):
-            self._intercept_patterns.clear()
+        self._intercept_patterns.clear()
         return {"cleared": count, "ok": True}
 
     def set_viewport(self, width: int, height: int) -> dict[str, Any]:
