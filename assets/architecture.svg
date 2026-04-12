@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 340" width="780" height="340" font-family="'Segoe UI', Arial, sans-serif">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0d1b2e"/>
+      <stop offset="100%" style="stop-color:#0d2440"/>
+    </linearGradient>
+    <linearGradient id="topBoxGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a4a7a"/>
+      <stop offset="100%" style="stop-color:#0d6e8a"/>
+    </linearGradient>
+    <linearGradient id="leftBoxGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a3a5f"/>
+      <stop offset="100%" style="stop-color:#0d4e6a"/>
+    </linearGradient>
+    <linearGradient id="rightBoxGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a3a2e"/>
+      <stop offset="100%" style="stop-color:#0d5e4a"/>
+    </linearGradient>
+    <linearGradient id="entryGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2d1a4a"/>
+      <stop offset="100%" style="stop-color:#4a2d6e"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="coloredBlur"/>
+      <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="780" height="340" rx="16" fill="url(#bgGrad)"/>
+
+  <!-- ─── Entry point box (top-centre) ─── -->
+  <rect x="280" y="18" width="220" height="56" rx="10" fill="url(#entryGrad)" stroke="#7a50c8" stroke-width="1.5"/>
+  <text x="390" y="40" font-size="12" fill="#c8a8ff" text-anchor="middle" font-weight="600">Your code / CLI</text>
+  <text x="390" y="58" font-size="10" fill="#9a78e8" text-anchor="middle">local_runner.py  ·  api_server.py</text>
+
+  <!-- Arrow: entry → planner -->
+  <line x1="390" y1="74" x2="390" y2="108" stroke="#00d4ff" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ─── TaskPlanner box (centre) ─── -->
+  <rect x="260" y="108" width="260" height="66" rx="10" fill="url(#topBoxGrad)" stroke="#00d4ff" stroke-width="1.5"/>
+  <text x="390" y="130" font-size="13" fill="#fff" text-anchor="middle" font-weight="700">TaskPlanner</text>
+  <text x="390" y="148" font-size="10" fill="#a0d8ef" text-anchor="middle">intent → validated steps → execution</text>
+  <text x="390" y="163" font-size="9"  fill="#7ab8d8" text-anchor="middle">task_planner.py</text>
+
+  <!-- Arrow: planner → browser agent -->
+  <line x1="310" y1="174" x2="195" y2="212" stroke="#00d4ff" stroke-width="2" marker-end="url(#arrowL)"/>
+  <!-- Arrow: planner → system tools -->
+  <line x1="470" y1="174" x2="585" y2="212" stroke="#28c840" stroke-width="2" marker-end="url(#arrowR)"/>
+
+  <!-- ─── BrowserAgent box (left) ─── -->
+  <rect x="60" y="212" width="248" height="100" rx="10" fill="url(#leftBoxGrad)" stroke="#00aacc" stroke-width="1.5"/>
+  <text x="184" y="234" font-size="13" fill="#fff" text-anchor="middle" font-weight="700">BrowserAgent</text>
+  <text x="184" y="252" font-size="9"  fill="#80c8e8" text-anchor="middle">browser_agent.py</text>
+  <!-- Feature pills -->
+  <rect x="72"  y="262" width="78" height="18" rx="9" fill="#0a2a3f" stroke="#00aacc" stroke-width="1"/>
+  <text x="111" y="274" font-size="8" fill="#00d4ff" text-anchor="middle">Navigate / Click</text>
+  <rect x="158" y="262" width="60" height="18" rx="9" fill="#0a2a3f" stroke="#00aacc" stroke-width="1"/>
+  <text x="188" y="274" font-size="8" fill="#00d4ff" text-anchor="middle">Screenshot</text>
+  <rect x="72"  y="285" width="74" height="18" rx="9" fill="#0a2a3f" stroke="#00aacc" stroke-width="1"/>
+  <text x="109" y="297" font-size="8" fill="#00d4ff" text-anchor="middle">JS Evaluation</text>
+  <rect x="154" y="285" width="64" height="18" rx="9" fill="#0a2a3f" stroke="#00aacc" stroke-width="1"/>
+  <text x="186" y="297" font-size="8" fill="#00d4ff" text-anchor="middle">Popup Guard</text>
+
+  <!-- Playwright label -->
+  <text x="184" y="320" font-size="9" fill="#4a8aaa" text-anchor="middle">Playwright / Chromium</text>
+
+  <!-- ─── SystemTools box (right) ─── -->
+  <rect x="472" y="212" width="248" height="100" rx="10" fill="url(#rightBoxGrad)" stroke="#28c840" stroke-width="1.5"/>
+  <text x="596" y="234" font-size="13" fill="#fff" text-anchor="middle" font-weight="700">SystemTools</text>
+  <text x="596" y="252" font-size="9"  fill="#80e8a8" text-anchor="middle">system_tools.py</text>
+  <!-- Feature pills -->
+  <rect x="484" y="262" width="58" height="18" rx="9" fill="#0a2a1a" stroke="#28c840" stroke-width="1"/>
+  <text x="513" y="274" font-size="8" fill="#28c840" text-anchor="middle">File I/O</text>
+  <rect x="550" y="262" width="76" height="18" rx="9" fill="#0a2a1a" stroke="#28c840" stroke-width="1"/>
+  <text x="588" y="274" font-size="8" fill="#28c840" text-anchor="middle">Python exec</text>
+  <rect x="484" y="285" width="72" height="18" rx="9" fill="#0a2a1a" stroke="#28c840" stroke-width="1"/>
+  <text x="520" y="297" font-size="8" fill="#28c840" text-anchor="middle">Shell exec</text>
+  <rect x="564" y="285" width="62" height="18" rx="9" fill="#0a2a1a" stroke="#28c840" stroke-width="1"/>
+  <text x="595" y="297" font-size="8" fill="#28c840" text-anchor="middle">Workspace</text>
+
+  <!-- Safe workspace label -->
+  <text x="596" y="320" font-size="9" fill="#3a7a4a" text-anchor="middle">sandboxed workspace dir</text>
+
+  <!-- ─── Arrow markers ─── -->
+  <defs>
+    <marker id="arrow"  markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0,10 3.5,0 7" fill="#00d4ff"/>
+    </marker>
+    <marker id="arrowL" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0,10 3.5,0 7" fill="#00d4ff"/>
+    </marker>
+    <marker id="arrowR" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0,10 3.5,0 7" fill="#28c840"/>
+    </marker>
+  </defs>
+
+  <!-- ─── Two-entry labels at bottom ─── -->
+  <text x="184" y="340" font-size="0" fill="none"/> <!-- spacer -->
+</svg>
