@@ -1187,7 +1187,7 @@ class BrowserAgent:
         if self._context is None:
             raise RuntimeError("Browser is not started. Call start() first.")
         self._context.set_extra_http_headers(headers)
-        logger.info("Extra HTTP headers set: %s", list(headers.keys()))
+        logger.info("Extra HTTP headers set (%d header(s))", len(headers))
         return {"headers_set": list(headers.keys())}
 
     def http_auth(self, username: str, password: str) -> dict[str, Any]:
@@ -1212,7 +1212,7 @@ class BrowserAgent:
         import base64 as _b64
         token = _b64.b64encode(f"{username}:{password}".encode()).decode()
         self.set_extra_headers({"Authorization": f"Basic {token}"})
-        logger.info("HTTP Basic Auth set for user %r", username)
+        logger.info("HTTP Basic Auth set")
         return {"auth_set": True, "username": username}
 
     def local_storage_set(self, key: str, value: str) -> dict[str, Any]:
