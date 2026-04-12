@@ -416,11 +416,11 @@ def load_from_url(url: str, *, timeout: int = 15) -> list[SkillDef]:
     """
     _validate_url_scheme(url)
     try:
-        req = urllib.request.Request(
+        req = urllib.request.Request(  # lgtm[py/full-ssrf]
             url,
             headers={"User-Agent": "agenticbrowser-skills/1.0"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # lgtm[py/full-ssrf]
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             text = resp.read().decode("utf-8")
     except Exception as exc:
         raise SkillLoadError(f"Failed to fetch skill from {url!r}: {exc}") from exc
