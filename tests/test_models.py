@@ -1,6 +1,5 @@
 """Tests for agenticbrowser models."""
 
-import pytest
 from agenticbrowser.models import (
     ActionResult,
     BrowserOptions,
