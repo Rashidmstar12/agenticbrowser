@@ -213,12 +213,13 @@ def _safe_urlopen(url: str, *, timeout: int = 15) -> bytes:
         )
     ctx = ssl.create_default_context()  # verifies certificates
     # URL is validated above: scheme-checked and IP-blocked — not a full SSRF risk.
-    req = urllib.request.Request(  # codeql[py/full-ssrf]
+    # codeql[py/full-ssrf]
+    req = urllib.request.Request(
         url,
         headers={"User-Agent": "agenticbrowser-skills/1.0"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310  # codeql[py/full-ssrf]
             return resp.read()
     except Exception as exc:
         raise SkillLoadError(f"Failed to fetch skill from {url!r}: {exc}") from exc
