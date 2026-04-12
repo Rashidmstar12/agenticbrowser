@@ -19,7 +19,7 @@ from pathlib import Path as _Path
 from typing import Any, AsyncIterator
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -59,6 +59,31 @@ def _safe_response(data: Any) -> Any:
     findings in HTTP responses.
     """
     return _json.loads(_json.dumps(data, default=str))
+
+# ---------------------------------------------------------------------------
+# API key authentication
+# ---------------------------------------------------------------------------
+_API_KEY_ENV = "BROWSER_API_KEY"
+
+
+def _check_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> None:
+    """
+    Enforce API key authentication when ``BROWSER_API_KEY`` is set.
+
+    If the environment variable is **not** set the server runs without
+    authentication (convenient for local / trusted-network use).  When it
+    **is** set every request must supply the matching key in the
+    ``X-API-Key`` header; missing or wrong keys get a **401 Unauthorized**.
+    """
+    required = os.environ.get(_API_KEY_ENV)
+    if not required:
+        return  # auth not configured — allow all requests
+    if not x_api_key or x_api_key != required:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: provide a valid X-API-Key header.",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Global singletons (one per server process)
@@ -112,6 +137,7 @@ app = FastAPI(
     ),
     version="2.0.0",
     lifespan=lifespan,
+    dependencies=[Depends(_check_api_key)],
 )
 
 # ---------------------------------------------------------------------------
@@ -123,6 +149,13 @@ class SessionStartRequest(BaseModel):
     slow_mo: int = Field(0, description="Slow down operations by this many ms (for debugging)")
     auto_close_popups: bool = Field(True, description="Auto-dismiss common popups on page load")
     default_timeout: int = Field(30_000, description="Default timeout in milliseconds")
+    proxy: str | None = Field(
+        None,
+        description=(
+            "Optional proxy server URL, e.g. 'http://user:pass@host:port' or "
+            "'socks5://host:port'. When omitted no proxy is used."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -474,11 +507,17 @@ def session_start(req: SessionStartRequest) -> dict[str, Any]:
         slow_mo=req.slow_mo,
         auto_close_popups=req.auto_close_popups,
         default_timeout=req.default_timeout,
+        proxy=req.proxy,
     )
     _agent.start()
     _planner = TaskPlanner()
     _planner._system_tools = _tools  # share workspace
-    return {"status": "started", "headless": req.headless, "workspace": str(_tools.workspace)}
+    return {
+        "status": "started",
+        "headless": req.headless,
+        "proxy": req.proxy,
+        "workspace": str(_tools.workspace),
+    }
 
 
 @app.post("/session/stop", summary="Stop the browser session")

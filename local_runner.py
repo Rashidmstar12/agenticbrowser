@@ -929,6 +929,15 @@ def main() -> None:
         help="Directory for file I/O operations (default: ./workspace or BROWSER_WORKSPACE env var)",
     )
     parser.add_argument(
+        "--proxy",
+        metavar="URL",
+        default=None,
+        help=(
+            "Proxy server URL, e.g. 'http://user:pass@host:port' or 'socks5://host:port'. "
+            "When omitted no proxy is used."
+        ),
+    )
+    parser.add_argument(
         "--doctor",
         action="store_true",
         help="Run environment health checks and exit",
@@ -975,6 +984,7 @@ def main() -> None:
         headless=not args.no_headless,
         slow_mo=args.slow_mo,
         auto_close_popups=not args.no_auto_popups,
+        proxy=args.proxy,
     )
 
     with agent:

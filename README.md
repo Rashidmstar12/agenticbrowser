@@ -197,6 +197,7 @@ curl -s -X POST http://localhost:8000/session/stop
 | `--task FILE` | — | Run a JSON task file and exit |
 | `--cmd TEXT` | — | Run a single low-level command and exit |
 | `--workspace DIR` | `./workspace` | Directory for file I/O operations |
+| `--proxy URL` | — | Proxy server, e.g. `http://user:pass@host:port` or `socks5://host:port` |
 
 ### REPL commands — browser
 
@@ -521,6 +522,7 @@ export OPENAI_MODEL=gpt-4o-mini   # optional, default: gpt-4o-mini
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `llama3` | Ollama model to use |
 | `BROWSER_WORKSPACE` | `./workspace` | Root directory for all file operations |
+| `BROWSER_API_KEY` | — | When set, all API server requests must include `X-API-Key: <value>` header. Omit to run without authentication (local/trusted-network use only). |
 
 ---
 

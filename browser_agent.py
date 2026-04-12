@@ -111,6 +111,9 @@ class BrowserAgent:
     default_timeout : int
         Default timeout in milliseconds for Playwright operations (default
         ``30000``).
+    proxy : str | None
+        Optional proxy server URL, e.g. ``"http://user:pass@host:port"`` or
+        ``"socks5://host:port"``.  When ``None`` (default) no proxy is used.
     """
 
     def __init__(
@@ -119,11 +122,13 @@ class BrowserAgent:
         slow_mo: int = 0,
         auto_close_popups: bool = True,
         default_timeout: int = 30_000,
+        proxy: str | None = None,
     ) -> None:
         self.headless = headless
         self.slow_mo = slow_mo
         self.auto_close_popups = auto_close_popups
         self.default_timeout = default_timeout
+        self.proxy = proxy
 
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
@@ -140,11 +145,16 @@ class BrowserAgent:
     def start(self) -> "BrowserAgent":
         """Launch the Chromium browser and open a new page."""
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(
-            headless=self.headless,
-            slow_mo=self.slow_mo,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
+
+        launch_kwargs: dict[str, Any] = {
+            "headless": self.headless,
+            "slow_mo": self.slow_mo,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+        }
+        if self.proxy:
+            launch_kwargs["proxy"] = {"server": self.proxy}
+
+        self._browser = self._playwright.chromium.launch(**launch_kwargs)
         self._context = self._browser.new_context(
             viewport={"width": 1280, "height": 800},
             user_agent=(
@@ -160,7 +170,7 @@ class BrowserAgent:
         self._page.on("dialog", self._handle_dialog)
         self._pages = [self._page]  # track all open tabs
 
-        logger.info("BrowserAgent started (headless=%s)", self.headless)
+        logger.info("BrowserAgent started (headless=%s, proxy=%s)", self.headless, self.proxy or "none")
         return self
 
     def stop(self) -> None:
