@@ -106,7 +106,7 @@ def test_skills_load_success(client):
     mock_skill = MagicMock()
     mock_skill.name = "test_skill"
     with patch("api_server.get_default_registry") as mock_reg:
-        mock_reg.return_value.load_from_source.return_value = [mock_skill]
+        mock_reg.return_value.load_from_remote_source.return_value = [mock_skill]
         res = client.post("/skills/load", json={"source": "gh:example/skills"})
     assert res.status_code == 200
     data = res.json()
@@ -117,7 +117,7 @@ def test_skills_load_success(client):
 def test_skills_load_invalid_source(client):
     from skills import SkillLoadError
     with patch("api_server.get_default_registry") as mock_reg:
-        mock_reg.return_value.load_from_source.side_effect = SkillLoadError("bad source")
+        mock_reg.return_value.load_from_remote_source.side_effect = SkillLoadError("bad source")
         res = client.post("/skills/load", json={"source": "bad://source"})
     assert res.status_code == 422
 

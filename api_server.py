@@ -812,7 +812,7 @@ def skills_load(req: SkillLoadRequest) -> dict[str, Any]:
 
     reg = get_default_registry()
     try:
-        loaded = reg.load_from_source(req.source)
+        loaded = reg.load_from_remote_source(req.source)
     except (SkillLoadError, FileNotFoundError, OSError) as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
     return {

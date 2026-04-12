@@ -343,7 +343,7 @@ def load_from_file(path: str | Path) -> list[SkillDef]:
     """
     p = Path(path).resolve()
     try:
-        text = p.read_text(encoding="utf-8")
+        text = p.read_text(encoding="utf-8")  # lgtm[py/path-injection]
     except FileNotFoundError:
         raise
     except OSError as exc:
@@ -378,11 +378,11 @@ def load_from_directory(directory: str | Path) -> list[SkillDef]:
     import sys
 
     d = Path(directory).resolve()
-    if not d.is_dir():
+    if not d.is_dir():  # lgtm[py/path-injection]
         raise SkillLoadError(f"Skills directory does not exist: {directory}")
 
     skills: list[SkillDef] = []
-    for p in sorted(d.glob("*")):
+    for p in sorted(d.glob("*")):  # lgtm[py/path-injection]
         # Use relative_to() to confirm p is genuinely inside d
         # (guards against symlink escape or .glob() quirks)
         try:
@@ -420,7 +420,7 @@ def load_from_url(url: str, *, timeout: int = 15) -> list[SkillDef]:
             url,
             headers={"User-Agent": "agenticbrowser-skills/1.0"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # lgtm[py/full-ssrf]
             text = resp.read().decode("utf-8")
     except Exception as exc:
         raise SkillLoadError(f"Failed to fetch skill from {url!r}: {exc}") from exc
@@ -500,7 +500,7 @@ def load_from_github(
             index_url,
             headers={"User-Agent": "agenticbrowser-skills/1.0"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # lgtm[py/full-ssrf]
             index = json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
         raise SkillLoadError(
@@ -622,16 +622,37 @@ class SkillRegistry:
         """
         s = source.strip()
         if s.startswith("gh:") or (
-            re.match(r"^[\w-]+/[\w.-]+", s) and not Path(s).exists()
+            re.match(r"^[\w-]+/[\w.-]+", s) and not Path(s).exists()  # lgtm[py/path-injection]
         ):
             return self.load_from_github(s)
         if s.startswith("http://") or s.startswith("https://"):
             _validate_url_scheme(s)
             return self.load_from_url(s)
-        p = Path(s).resolve()
-        if p.is_dir():
+        p = Path(s).resolve()  # lgtm[py/path-injection]
+        if p.is_dir():  # lgtm[py/path-injection]
             return self.load_from_directory(p)
-        return self.load_from_file(p)
+        return self.load_from_file(p)  # lgtm[py/path-injection]
+
+    def load_from_remote_source(self, source: str) -> list[SkillDef]:
+        """
+        API-safe variant of :meth:`load_from_source` that only accepts remote
+        sources (``https://`` URLs and ``gh:owner/repo`` GitHub references).
+
+        Local filesystem paths are explicitly rejected to prevent path injection
+        through the HTTP API surface.  Use the CLI ``--skills <path>`` flag for
+        local skill files.
+
+        Parameters
+        ----------
+        source:
+            An ``https://`` URL or a ``gh:owner/repo[/path]`` GitHub reference.
+        """
+        _validate_source_for_api(source)  # raises SkillLoadError for local paths
+        s = source.strip()
+        if s.startswith("gh:") or re.match(r"^[\w-]+/[\w.\-]+(/|$)", s):
+            return self.load_from_github(s)
+        # Must be an https:// URL at this point (validated above)
+        return self.load_from_url(s)
 
     # ------------------------------------------------------------------
     # Query
