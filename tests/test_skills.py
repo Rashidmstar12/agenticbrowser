@@ -17,6 +17,8 @@ from skills import (
     SkillDef,
     SkillLoadError,
     SkillRegistry,
+    _parse_semver,
+    _semver_satisfies,
     _trigger_to_pattern,
     load_from_file,
     load_from_url,
@@ -293,3 +295,207 @@ def test_registry_clear():
     reg.register(SkillDef(name="x", steps=[{"action": "close_popups"}]))
     reg.clear()
     assert len(reg) == 0
+
+
+# ---------------------------------------------------------------------------
+# Semver helpers
+# ---------------------------------------------------------------------------
+
+def test_parse_semver_full():
+    assert _parse_semver("1.2.3") == (1, 2, 3)
+
+
+def test_parse_semver_short():
+    assert _parse_semver("1.2") == (1, 2, 0)
+    assert _parse_semver("1") == (1, 0, 0)
+
+
+def test_parse_semver_invalid():
+    with pytest.raises(SkillLoadError):
+        _parse_semver("not.a.version")
+
+
+def test_semver_satisfies_gte():
+    assert _semver_satisfies("1.3.0", ">=1.2.0") is True
+    assert _semver_satisfies("1.2.0", ">=1.2.0") is True
+    assert _semver_satisfies("1.1.9", ">=1.2.0") is False
+
+
+def test_semver_satisfies_gt():
+    assert _semver_satisfies("2.0.0", ">1.9.9") is True
+    assert _semver_satisfies("1.9.9", ">1.9.9") is False
+
+
+def test_semver_satisfies_lt():
+    assert _semver_satisfies("1.1.0", "<2.0.0") is True
+    assert _semver_satisfies("2.0.0", "<2.0.0") is False
+
+
+def test_semver_satisfies_bare():
+    assert _semver_satisfies("2.0.0", "1.0.0") is True
+    assert _semver_satisfies("0.9.0", "1.0.0") is False
+
+
+def test_semver_satisfies_eq():
+    assert _semver_satisfies("1.2.3", "==1.2.3") is True
+    assert _semver_satisfies("1.2.4", "==1.2.3") is False
+
+
+# ---------------------------------------------------------------------------
+# Dependency resolution
+# ---------------------------------------------------------------------------
+
+def test_check_dependencies_satisfied():
+    reg = SkillRegistry()
+    dep = SkillDef(name="lib", version="2.0.0", steps=[{"action": "close_popups"}])
+    consumer = SkillDef(
+        name="main",
+        steps=[{"action": "close_popups"}],
+        depends_on=["lib"],
+        min_version={"lib": ">=1.0.0"},
+    )
+    reg.register(dep)
+    # Should not raise
+    reg.check_dependencies(consumer)
+
+
+def test_check_dependencies_missing():
+    reg = SkillRegistry()
+    consumer = SkillDef(
+        name="main",
+        steps=[{"action": "close_popups"}],
+        depends_on=["missing_skill"],
+    )
+    with pytest.raises(SkillLoadError, match="depends on 'missing_skill'"):
+        reg.check_dependencies(consumer)
+
+
+def test_check_dependencies_version_too_old():
+    reg = SkillRegistry()
+    dep = SkillDef(name="lib", version="0.9.0", steps=[{"action": "close_popups"}])
+    consumer = SkillDef(
+        name="main",
+        steps=[{"action": "close_popups"}],
+        depends_on=["lib"],
+        min_version={"lib": ">=1.0.0"},
+    )
+    reg.register(dep)
+    with pytest.raises(SkillLoadError, match="requires 'lib >=1.0.0'"):
+        reg.check_dependencies(consumer)
+
+
+def test_register_many_resolves_mutual_deps():
+    """Skills that depend on each other within the same batch should resolve."""
+    dep = SkillDef(name="base", version="1.0.0", steps=[{"action": "close_popups"}])
+    consumer = SkillDef(
+        name="top",
+        steps=[{"action": "close_popups"}],
+        depends_on=["base"],
+        min_version={"base": ">=1.0.0"},
+    )
+    reg = SkillRegistry()
+    # register_many must not raise even though consumer comes first in the list
+    reg.register_many([consumer, dep])
+    assert reg.get("top") is not None
+    assert reg.get("base") is not None
+
+
+def test_register_many_dep_check_fails():
+    """register_many raises if a dependency is genuinely absent after the batch."""
+    consumer = SkillDef(
+        name="top",
+        steps=[{"action": "close_popups"}],
+        depends_on=["absent"],
+    )
+    reg = SkillRegistry()
+    with pytest.raises(SkillLoadError, match="depends on 'absent'"):
+        reg.register_many([consumer])
+
+
+def test_skill_def_to_dict_includes_dep_fields():
+    s = SkillDef(
+        name="s",
+        steps=[{"action": "close_popups"}],
+        depends_on=["lib"],
+        min_version={"lib": ">=1.0.0"},
+    )
+    d = s.to_dict()
+    assert d["depends_on"] == ["lib"]
+    assert d["min_version"] == {"lib": ">=1.0.0"}
+
+
+# ---------------------------------------------------------------------------
+# YAML loading
+# ---------------------------------------------------------------------------
+
+MINIMAL_SKILL_YAML = """\
+name: yaml_skill
+triggers:
+  - do the yaml thing
+steps:
+  - action: navigate
+    url: https://example.com
+"""
+
+
+def test_load_from_file_yaml(tmp_path):
+    pytest.importorskip("yaml", reason="PyYAML not installed")
+    f = tmp_path / "skill.yaml"
+    f.write_text(MINIMAL_SKILL_YAML)
+    with patch("skills._get_allowed_actions", return_value={"navigate"}):
+        skills = load_from_file(f)
+    assert len(skills) == 1
+    assert skills[0].name == "yaml_skill"
+
+
+def test_load_from_file_yml_extension(tmp_path):
+    pytest.importorskip("yaml", reason="PyYAML not installed")
+    f = tmp_path / "skill.yml"
+    f.write_text(MINIMAL_SKILL_YAML)
+    with patch("skills._get_allowed_actions", return_value={"navigate"}):
+        skills = load_from_file(f)
+    assert skills[0].name == "yaml_skill"
+
+
+def test_load_from_file_yaml_list(tmp_path):
+    pytest.importorskip("yaml", reason="PyYAML not installed")
+    yaml_list = """\
+- name: skill_a
+  steps:
+    - action: navigate
+      url: https://a.example.com
+- name: skill_b
+  steps:
+    - action: navigate
+      url: https://b.example.com
+"""
+    f = tmp_path / "skills.yaml"
+    f.write_text(yaml_list)
+    with patch("skills._get_allowed_actions", return_value={"navigate"}):
+        skills = load_from_file(f)
+    assert len(skills) == 2
+    assert {s.name for s in skills} == {"skill_a", "skill_b"}
+
+
+def test_load_from_url_yaml():
+    pytest.importorskip("yaml", reason="PyYAML not installed")
+    resp_mock = MagicMock()
+    resp_mock.__enter__ = lambda s: s
+    resp_mock.__exit__ = MagicMock(return_value=False)
+    resp_mock.read.return_value = MINIMAL_SKILL_YAML.encode()
+
+    with patch("urllib.request.urlopen", return_value=resp_mock), \
+         patch("skills._get_allowed_actions", return_value={"navigate"}):
+        skills = load_from_url("https://example.com/skill.yaml")
+
+    assert len(skills) == 1
+    assert skills[0].name == "yaml_skill"
+
+
+def test_load_from_file_no_yaml_raises(tmp_path, monkeypatch):
+    """Without PyYAML installed, loading a non-JSON file raises SkillLoadError."""
+    monkeypatch.setitem(__import__("sys").modules, "yaml", None)
+    f = tmp_path / "skill.yaml"
+    f.write_text(MINIMAL_SKILL_YAML)
+    with pytest.raises((SkillLoadError, ImportError)):
+        load_from_file(f)

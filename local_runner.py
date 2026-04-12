@@ -41,11 +41,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ANSI colour helpers (gracefully disabled when stdout is not a terminal)
-_USE_COLOR = sys.stdout.isatty()
+# ANSI colour helpers — respects NO_COLOR (https://no-color.org) and FORCE_COLOR
+def _color_enabled() -> bool:
+    if os.environ.get("NO_COLOR", ""):
+        return False
+    if os.environ.get("FORCE_COLOR", ""):
+        return True
+    return sys.stdout.isatty()
+
+_USE_COLOR = _color_enabled()
 _GREEN  = "\033[32m" if _USE_COLOR else ""
 _RED    = "\033[31m" if _USE_COLOR else ""
 _YELLOW = "\033[33m" if _USE_COLOR else ""
+_BOLD   = "\033[1m"  if _USE_COLOR else ""
 _RESET  = "\033[0m"  if _USE_COLOR else ""
 
 
@@ -60,9 +68,9 @@ def run_doctor(workspace: str = "workspace", fix: bool = False) -> int:
     """
     from doctor import run_checks
 
-    print(f"\n{'─' * 55}")
-    print("  🩺  Agentic Browser — Environment Doctor")
-    print(f"{'─' * 55}")
+    print(f"\n{_BOLD}{'─' * 55}{_RESET}")
+    print(f"  🩺  {_BOLD}Agentic Browser — Environment Doctor{_RESET}")
+    print(f"{_BOLD}{'─' * 55}{_RESET}")
     print(f"  Mode: {'diagnose + auto-fix' if fix else 'diagnose only  (re-run with --fix to auto-fix)'}\n")
 
     checks = run_checks(workspace=workspace, fix=fix)
@@ -78,12 +86,12 @@ def run_doctor(workspace: str = "workspace", fix: bool = False) -> int:
         fixed_tag = f" {_GREEN}[fixed]{_RESET}" if c.fixed else ""
         print(f"  {icon}  {c.name:<28s}  {c.message}{fixed_tag}")
 
-    print(f"\n{'─' * 55}")
+    print(f"\n{_BOLD}{'─' * 55}{_RESET}")
     if any_fail:
         print(f"  {_RED}Some checks failed.{_RESET}  Re-run with --doctor --fix to auto-fix.")
     else:
         print(f"  {_GREEN}All checks passed.{_RESET}")
-    print(f"{'─' * 55}\n")
+    print(f"{_BOLD}{'─' * 55}{_RESET}\n")
     return 1 if any_fail else 0
 
 

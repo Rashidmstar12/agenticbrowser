@@ -996,13 +996,28 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload on code changes")
     parser.add_argument("--log-level", default="info", help="Log level (default: info)")
+    parser.add_argument(
+        "--ssl-certfile",
+        default=os.environ.get("AGENTICBROWSER_SSL_CERTFILE"),
+        help="Path to TLS certificate file (PEM).  Also read from AGENTICBROWSER_SSL_CERTFILE.",
+    )
+    parser.add_argument(
+        "--ssl-keyfile",
+        default=os.environ.get("AGENTICBROWSER_SSL_KEYFILE"),
+        help="Path to TLS private-key file (PEM).  Also read from AGENTICBROWSER_SSL_KEYFILE.",
+    )
     args = parser.parse_args()
 
-    uvicorn.run(
-        "api_server:app",
+    uvicorn_kwargs: dict = dict(
         host=args.host,
         port=args.port,
         reload=args.reload,
         log_level=args.log_level,
     )
+    if args.ssl_certfile:
+        uvicorn_kwargs["ssl_certfile"] = args.ssl_certfile
+    if args.ssl_keyfile:
+        uvicorn_kwargs["ssl_keyfile"] = args.ssl_keyfile
+
+    uvicorn.run("api_server:app", **uvicorn_kwargs)
 

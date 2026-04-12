@@ -3,7 +3,7 @@
 #
 # Services
 # --------
-#   api      — REST API server (port 8000)
+#   api      — REST API server (port 8000, or 8443 when TLS is enabled)
 #
 # Usage
 # -----
@@ -13,9 +13,23 @@
 #
 # Environment variables (set in a .env file or export before running)
 # -------------------------------------------------------------------
-#   OPENAI_API_KEY   — enables the OpenAI LLM planner
-#   OLLAMA_HOST      — enables the Ollama LLM planner (e.g. http://host.docker.internal:11434)
-#   BROWSER_WORKSPACE — override workspace path inside the container
+#   OPENAI_API_KEY              — enables the OpenAI LLM planner
+#   OLLAMA_HOST                 — enables the Ollama LLM planner
+#                                 (e.g. http://host.docker.internal:11434)
+#   BROWSER_WORKSPACE           — override workspace path inside the container
+#
+# HTTPS (production)
+# ------------------
+#   AGENTICBROWSER_SSL_CERTFILE — path inside the container to the TLS cert
+#   AGENTICBROWSER_SSL_KEYFILE  — path inside the container to the TLS key
+#
+#   Example .env:
+#     AGENTICBROWSER_SSL_CERTFILE=/certs/fullchain.pem
+#     AGENTICBROWSER_SSL_KEYFILE=/certs/privkey.pem
+#
+#   Then mount the certs directory:
+#     volumes:
+#       - /etc/letsencrypt/live/example.com:/certs:ro
 # ---------------------------------------------------------------------------
 
 services:
@@ -27,10 +41,14 @@ services:
       # Mount a host directory so workspace files are accessible outside the
       # container.  Remove this line if you don't need file persistence.
       - ./workspace:/app/workspace
+      # Uncomment and adjust to mount TLS certificates for HTTPS:
+      # - /etc/letsencrypt/live/example.com:/certs:ro
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OLLAMA_HOST=${OLLAMA_HOST:-}
       - BROWSER_WORKSPACE=/app/workspace
+      - AGENTICBROWSER_SSL_CERTFILE=${AGENTICBROWSER_SSL_CERTFILE:-}
+      - AGENTICBROWSER_SSL_KEYFILE=${AGENTICBROWSER_SSL_KEYFILE:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",

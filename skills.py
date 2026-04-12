@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import json
 import re
+import ssl
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -97,6 +98,10 @@ class SkillDef:
     parameters:  dict[str, dict[str, Any]] = field(default_factory=dict)
     steps:       list[dict[str, Any]]      = field(default_factory=list)
     source:      str                       = ""   # path/URL this was loaded from
+    # Dependency declarations: list of required skill names.
+    depends_on:  list[str]                 = field(default_factory=list)
+    # Version constraints for dependencies: {skill_name: ">=1.2.0"} (semver).
+    min_version: dict[str, str]            = field(default_factory=dict)
 
     # Compiled (trigger_pattern, [param_names]) pairs — populated by __post_init__
     _compiled: list[tuple[re.Pattern[str], list[str]]] = field(
@@ -116,7 +121,106 @@ class SkillDef:
             "parameters":  self.parameters,
             "steps":       self.steps,
             "source":      self.source,
+            "depends_on":  self.depends_on,
+            "min_version": self.min_version,
         }
+
+
+# ---------------------------------------------------------------------------
+# Semver helpers (major.minor.patch — no pre-release)
+# ---------------------------------------------------------------------------
+
+def _parse_semver(version: str) -> tuple[int, int, int]:
+    """
+    Parse a ``"MAJOR.MINOR.PATCH"`` string into an integer triple.
+
+    Accepts shortened forms like ``"1"`` and ``"1.2"`` by zero-padding the
+    missing components.  Raises :class:`SkillLoadError` on invalid input.
+    """
+    parts = version.strip().split(".")
+    if not parts or len(parts) > 3:
+        raise SkillLoadError(f"Invalid semver string: {version!r}")
+    try:
+        padded = parts + ["0"] * (3 - len(parts))
+        return (int(padded[0]), int(padded[1]), int(padded[2]))
+    except ValueError:
+        raise SkillLoadError(f"Invalid semver string: {version!r}")
+
+
+def _semver_satisfies(version: str, constraint: str) -> bool:
+    """
+    Return ``True`` if *version* satisfies *constraint*.
+
+    Supported operators: ``>=``, ``>``, ``<=``, ``<``, ``==``, ``=``.
+    Bare version strings (no operator) are treated as ``>=``.
+
+    Examples::
+
+        _semver_satisfies("1.3.0", ">=1.2.0")  # True
+        _semver_satisfies("1.1.0", ">=1.2.0")  # False
+        _semver_satisfies("2.0.0", "<2.0.0")   # False
+    """
+    constraint = constraint.strip()
+    for op in (">=", ">", "<=", "<", "==", "="):
+        if constraint.startswith(op):
+            req_ver = constraint[len(op):].strip()
+            break
+    else:
+        op = ">="
+        req_ver = constraint
+
+    v = _parse_semver(version)
+    r = _parse_semver(req_ver)
+
+    if op in (">=", "="):
+        return v >= r
+    if op == ">":
+        return v > r
+    if op == "<=":
+        return v <= r
+    if op == "<":
+        return v < r
+    if op == "==":
+        return v == r
+    return False  # unreachable
+
+
+# ---------------------------------------------------------------------------
+# Safe HTTP helper (guards against SSRF for both urlopen call sites)
+# ---------------------------------------------------------------------------
+
+def _safe_urlopen(url: str, *, timeout: int = 15) -> bytes:
+    """
+    Fetch *url* over HTTPS and return the raw response bytes.
+
+    Security guards applied before the network call:
+    - Only ``https://`` and ``http://`` schemes are accepted.
+    - Raw IP-address hosts are rejected (domain names only).
+    - An explicit SSL context with certificate verification is used.
+
+    This consolidates both ``urllib.request.urlopen`` call sites so that
+    CodeQL's ``py/full-ssrf`` taint-tracking sees a single, well-guarded
+    entry point rather than tracking taint across multiple call sites.
+    """
+    _validate_url_scheme(url)
+    parsed = _urlparse(url)
+    if not parsed.hostname or re.fullmatch(
+        r"(\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+]?",
+        parsed.hostname,
+    ):
+        raise SkillLoadError(
+            f"Skill URL host must be a domain name, not a raw IP address: {url!r}"
+        )
+    ctx = ssl.create_default_context()  # verifies certificates
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "agenticbrowser-skills/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:  # noqa: S310
+            return resp.read()
+    except Exception as exc:
+        raise SkillLoadError(f"Failed to fetch skill from {url!r}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +381,8 @@ def _validate_skill_dict(data: dict[str, Any], source: str = "") -> None:
 
 def _dict_to_skill(data: dict[str, Any], source: str = "") -> SkillDef:
     _validate_skill_dict(data, source)
+    depends_on = [str(d) for d in data.get("depends_on", [])]
+    min_version = {str(k): str(v) for k, v in data.get("min_version", {}).items()}
     return SkillDef(
         name        = str(data["name"]).strip(),
         description = str(data.get("description", "")),
@@ -286,6 +392,8 @@ def _dict_to_skill(data: dict[str, Any], source: str = "") -> SkillDef:
         parameters  = dict(data.get("parameters", {})),
         steps       = list(data["steps"]),
         source      = source,
+        depends_on  = depends_on,
+        min_version = min_version,
     )
 
 
@@ -414,26 +522,7 @@ def load_from_url(url: str, *, timeout: int = 15) -> list[SkillDef]:
     -------
     list[SkillDef]
     """
-    _validate_url_scheme(url)
-    # Guard against common SSRF targets: reject raw IPv4/IPv6 addresses as hosts.
-    # Legitimate skill registries always use domain names.
-    _parsed_host = _urlparse(url)
-    if not _parsed_host.hostname or re.fullmatch(
-        r"(\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+]?",
-        _parsed_host.hostname,
-    ):
-        raise SkillLoadError(
-            f"Skill URL host must be a domain name, not a raw IP address: {url!r}"
-        )
-    try:
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "agenticbrowser-skills/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            text = resp.read().decode("utf-8")
-    except Exception as exc:
-        raise SkillLoadError(f"Failed to fetch skill from {url!r}: {exc}") from exc
+    text = _safe_urlopen(url, timeout=timeout).decode("utf-8")
 
     data = _parse_text(text, url)
     if isinstance(data, dict):
@@ -506,13 +595,8 @@ def load_from_github(
     # Treat as directory — fetch index.json
     index_url = _raw_url(f"{path}/index.json")
     try:
-        req = urllib.request.Request(
-            index_url,
-            headers={"User-Agent": "agenticbrowser-skills/1.0"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # lgtm[py/full-ssrf]
-            index = json.loads(resp.read().decode("utf-8"))
-    except Exception as exc:
+        index = json.loads(_safe_urlopen(index_url, timeout=timeout).decode("utf-8"))
+    except SkillLoadError as exc:
         raise SkillLoadError(
             f"Failed to fetch skill index from {index_url!r}: {exc}. "
             "Ensure the repo has an 'index.json' listing skill file names."
@@ -568,9 +652,44 @@ class SkillRegistry:
         """Add a skill to the registry (overwrites any existing skill with the same name)."""
         self._skills[skill.name] = skill
 
+    def check_dependencies(self, skill: SkillDef) -> None:
+        """
+        Verify that all skills listed in *skill.depends_on* are present in
+        the registry and that their versions satisfy *skill.min_version*
+        constraints.
+
+        Raises
+        ------
+        SkillLoadError
+            If a required dependency is missing or its version is too old.
+
+        Notes
+        -----
+        Call this *after* registering all skills in a batch so that mutual
+        dependencies between skills loaded together can be satisfied.
+        """
+        for dep_name in skill.depends_on:
+            dep = self._skills.get(dep_name)
+            if dep is None:
+                raise SkillLoadError(
+                    f"Skill '{skill.name}' depends on '{dep_name}', "
+                    f"which is not loaded. Load '{dep_name}' first."
+                )
+            constraint = skill.min_version.get(dep_name)
+            if constraint:
+                if not _semver_satisfies(dep.version, constraint):
+                    raise SkillLoadError(
+                        f"Skill '{skill.name}' requires '{dep_name} {constraint}', "
+                        f"but the loaded version is {dep.version!r}."
+                    )
+
     def register_many(self, skills: list[SkillDef]) -> None:
+        # Register all first so mutual dependencies within the batch resolve.
         for s in skills:
-            self.register(s)
+            self._skills[s.name] = s
+        # Validate dependencies after the whole batch is present.
+        for s in skills:
+            self.check_dependencies(s)
 
     def unregister(self, name: str) -> bool:
         """Remove a skill by name.  Returns ``True`` if it existed."""
