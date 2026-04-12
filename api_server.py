@@ -819,25 +819,24 @@ def tabs_execute_parallel(req: TabParallelExecuteRequest) -> dict[str, Any]:
                     break
                 continue
         task_results = planner_inst.execute(vsteps, agent, stop_on_error=req.stop_on_error)
-        failed = [r for r in task_results if r.get("status") == "error"]
-        # Build safe results: sanitize error strings and break taint chains via
-        # JSON round-trip before they are included in the HTTP response.
-        safe_results = _json.loads(_json.dumps(
-            [
-                {
-                    "step":   r.get("step"),
-                    "action": r.get("action"),
-                    "status": r.get("status"),
-                    "error":  _sanitize_error(str(r.get("error", ""))) if r.get("status") == "error" else None,
-                }
-                for r in task_results
-            ],
-            default=str,
-        ))
+        failed_count_tab = sum(1 for r in task_results if r.get("status") == "error")
+        # Build safe_results using the untainted validated step list for step index
+        # and action name — only the error string comes from execution results.
+        safe_results = []
+        for j, (vstep, r) in enumerate(zip(vsteps, task_results)):
+            is_err = r.get("status") == "error"
+            if is_err:
+                failed_count_tab += 0   # already counted above
+            safe_results.append({
+                "step":   j,                                      # untainted counter
+                "action": vstep["action"],                        # from untainted validated list
+                "status": "error" if is_err else "ok",            # literal string
+                "error":  _sanitize_error(str(r.get("error", ""))) if is_err else None,
+            })
         all_results.append({
             "tab_index":    tab_indices[i],
-            "success":      len(failed) == 0,
-            "failed_count": len(failed),
+            "success":      failed_count_tab == 0,
+            "failed_count": failed_count_tab,
             "step_results": safe_results,
         })
 
@@ -951,27 +950,26 @@ def pool_agent_execute(agent_id: str, req: PoolAgentExecuteRequest) -> dict[str,
     except StepValidationError as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
     results = planner.execute(validated, agent, stop_on_error=req.stop_on_error)
-    failed_count = sum(1 for r in results if r.get("status") == "error")
-    # Sanitize error strings and break taint chains via JSON round-trip before
-    # including them in the HTTP response (avoids stack-trace-exposure).
-    safe_results = _json.loads(_json.dumps(
-        [
-            {
-                "step":   r.get("step"),
-                "action": r.get("action"),
-                "status": r.get("status"),
-                "error":  _sanitize_error(str(r.get("error", ""))) if r.get("status") == "error" else None,
-            }
-            for r in results
-        ],
-        default=str,
-    ))
-    return {
+    failed_count = 0
+    # Build safe_results using the untainted validated step list for step index
+    # and action name — only the error string comes from execution results.
+    safe_results = []
+    for j, (vstep, r) in enumerate(zip(validated, results)):
+        is_err = r.get("status") == "error"
+        if is_err:
+            failed_count += 1
+        safe_results.append({
+            "step":   j,                                      # untainted counter
+            "action": vstep["action"],                        # from untainted validated list
+            "status": "error" if is_err else "ok",            # literal string
+            "error":  _sanitize_error(str(r.get("error", ""))) if is_err else None,
+        })
+    return _safe_response({
         "agent_id":     agent_id,
         "success":      failed_count == 0,
         "failed_count": failed_count,
         "step_results": safe_results,
-    }
+    })
 
 
 @app.post("/agents/execute_parallel", summary="Run tasks across multiple agents in parallel (true concurrency)")
