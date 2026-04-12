@@ -979,3 +979,144 @@ class TestDownloadFileURLValidation:
         with pytest.raises(ValueError, match="Unsafe URL scheme"):
             agent.download_file("example.com/file.zip", "/tmp/file.zip")
         page.goto.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Video recording
+# ---------------------------------------------------------------------------
+
+class TestVideoRecording:
+    """BrowserAgent.start_video_recording / stop_video_recording."""
+
+    def _make_recording_agent(self):
+        """Agent with a fully mocked browser so _make_context() works."""
+        agent, page, context = _make_agent()
+
+        browser = MagicMock()
+        new_ctx = MagicMock()
+        new_page = MagicMock()
+        new_page.url = "about:blank"
+        new_page.video = MagicMock()
+        new_page.video.path.return_value = "/tmp/playwright-video-xyz.webm"
+        new_ctx.new_page.return_value = new_page
+        browser.new_context.return_value = new_ctx
+        agent._browser = browser
+
+        # pre-existing page URL so navigate-back can be tested
+        page.url = "about:blank"
+        return agent, page, context, browser, new_ctx, new_page
+
+    def test_start_sets_recording_flag(self, tmp_path):
+        agent, *_ = self._make_recording_agent()
+        save = str(tmp_path / "out.webm")
+        agent.start_video_recording(save)
+        assert agent._recording is True
+        assert agent._recording_path == save
+
+    def test_start_creates_context_with_record_video_dir(self, tmp_path):
+        agent, _, _, browser, *_ = self._make_recording_agent()
+        save = str(tmp_path / "video.webm")
+        agent.start_video_recording(save)
+        call_kwargs = browser.new_context.call_args[1]
+        assert "record_video_dir" in call_kwargs
+        assert call_kwargs["record_video_dir"] == str(tmp_path)
+
+    def test_start_raises_if_already_recording(self, tmp_path):
+        agent, *_ = self._make_recording_agent()
+        agent.start_video_recording(str(tmp_path / "a.webm"))
+        with pytest.raises(RuntimeError, match="already active"):
+            agent.start_video_recording(str(tmp_path / "b.webm"))
+
+    def test_stop_clears_recording_flag(self, tmp_path):
+        agent, *_, new_ctx, new_page = self._make_recording_agent()
+        save = str(tmp_path / "out.webm")
+        agent.start_video_recording(save)
+        # point _page at new_page so stop_video_recording can read .video.path()
+        agent._page = new_page
+        agent._pages = [new_page]
+        with patch("shutil.move"):
+            result = agent.stop_video_recording()
+        assert agent._recording is False
+        assert agent._recording_path is None
+        assert result["ok"] is True
+
+    def test_stop_raises_if_not_recording(self):
+        agent, *_ = _make_agent()
+        agent._browser = MagicMock()
+        with pytest.raises(RuntimeError, match="No video recording"):
+            agent.stop_video_recording()
+
+    def test_stop_renames_video_file(self, tmp_path):
+        agent, _, _, browser, new_ctx, new_page = self._make_recording_agent()
+        desired = str(tmp_path / "session.webm")
+        raw_path = "/tmp/playwright-video-xyz.webm"
+        new_page.video.path.return_value = raw_path
+
+        agent.start_video_recording(desired)
+        agent._page = new_page
+        agent._pages = [new_page]
+
+        with patch("shutil.move") as mv:
+            result = agent.stop_video_recording()
+        mv.assert_called_once_with(raw_path, desired)
+        assert result["saved_to"] == desired
+
+    def test_stop_warning_on_shutdown_while_recording(self):
+        agent, *_ = _make_agent()
+        agent._recording = True
+        agent._browser = MagicMock()
+        agent._playwright = MagicMock()
+        import logging
+        with patch.object(logging.getLogger("browser_agent"), "warning") as warn:
+            agent.stop()
+        warn.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# GIF recording
+# ---------------------------------------------------------------------------
+
+class TestRecordGif:
+    """BrowserAgent.record_gif."""
+
+    def test_record_gif_saves_file(self, tmp_path):
+        agent, page, _ = _make_agent()
+        dest = tmp_path / "out.gif"
+
+        # Stub PIL.Image so we don't need a real PNG decoder.
+        fake_img = MagicMock()
+        fake_img.save = MagicMock()
+        with patch("PIL.Image.open", return_value=fake_img), \
+             patch("time.sleep"):
+            result = agent.record_gif(str(dest), duration=1.0, fps=2)
+
+        assert result["ok"] is True
+        assert result["frames"] == 2
+        assert result["fps"] == 2
+        fake_img.save.assert_called_once()
+
+    def test_record_gif_respects_fps_duration(self, tmp_path):
+        agent, page, _ = _make_agent()
+        fake_img = MagicMock()
+        with patch("PIL.Image.open", return_value=fake_img), \
+             patch("time.sleep"):
+            result = agent.record_gif(str(tmp_path / "g.gif"), duration=2.0, fps=3)
+        assert result["frames"] == 6  # ceil(2.0 * 3)
+
+    def test_record_gif_creates_parent_dirs(self, tmp_path):
+        agent, page, _ = _make_agent()
+        dest = tmp_path / "subdir" / "deep" / "out.gif"
+        fake_img = MagicMock()
+        with patch("PIL.Image.open", return_value=fake_img), \
+             patch("time.sleep"):
+            agent.record_gif(str(dest), duration=0.5, fps=1)
+        assert dest.parent.exists()
+
+    def test_record_gif_min_one_frame(self, tmp_path):
+        """duration * fps < 1 should still produce at least one frame."""
+        agent, page, _ = _make_agent()
+        fake_img = MagicMock()
+        with patch("PIL.Image.open", return_value=fake_img), \
+             patch("time.sleep"):
+            result = agent.record_gif(str(tmp_path / "g.gif"), duration=0.1, fps=1)
+        assert result["frames"] >= 1
