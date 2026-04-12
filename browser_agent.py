@@ -1192,18 +1192,20 @@ class BrowserAgent:
         dict
             ``{"url": ..., "save_path": ..., "size_bytes": N}``
         """
-        logger.info("Downloading '%s' → '%s'", url, save_path)
+        import os as _os
+        # Resolve the path to eliminate any traversal components (e.g. ../).
+        resolved_path = _os.path.realpath(save_path)
+        logger.info("Downloading '%s' → '%s'", url, resolved_path)
         with self.page.expect_download() as dl_info:
             self.page.evaluate(
                 "([u]) => { const a = document.createElement('a'); a.href = u; a.download = ''; document.body.appendChild(a); a.click(); document.body.removeChild(a); }",
                 [url],
             )
         download = dl_info.value
-        download.save_as(save_path)
+        download.save_as(resolved_path)
         # Try to get the file size; ignore if the path does not exist yet.
-        import os as _os
-        size = _os.path.getsize(save_path) if _os.path.exists(save_path) else 0
-        return {"url": url, "save_path": save_path, "size_bytes": size}
+        size = _os.path.getsize(resolved_path) if _os.path.exists(resolved_path) else 0
+        return {"url": url, "save_path": resolved_path, "size_bytes": size}
 
     def emulate_device(self, device_name: str) -> dict[str, Any]:
         """
