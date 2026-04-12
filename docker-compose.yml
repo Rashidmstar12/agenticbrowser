@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# Agentic Browser — docker compose file
+#
+# Services
+# --------
+#   api      — REST API server (port 8000, or 8443 when TLS is enabled)
+#
+# Usage
+# -----
+#   docker compose up --build       # first run
+#   docker compose up               # subsequent runs
+#   docker compose down             # stop and remove containers
+#
+# Environment variables (set in a .env file or export before running)
+# -------------------------------------------------------------------
+#   OPENAI_API_KEY              — enables the OpenAI LLM planner
+#   OLLAMA_HOST                 — enables the Ollama LLM planner
+#                                 (e.g. http://host.docker.internal:11434)
+#   BROWSER_WORKSPACE           — override workspace path inside the container
+#
+# HTTPS (production)
+# ------------------
+#   AGENTICBROWSER_SSL_CERTFILE — path inside the container to the TLS cert
+#   AGENTICBROWSER_SSL_KEYFILE  — path inside the container to the TLS key
+#
+#   Example .env:
+#     AGENTICBROWSER_SSL_CERTFILE=/certs/fullchain.pem
+#     AGENTICBROWSER_SSL_KEYFILE=/certs/privkey.pem
+#
+#   Then mount the certs directory:
+#     volumes:
+#       - /etc/letsencrypt/live/example.com:/certs:ro
+# ---------------------------------------------------------------------------
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount a host directory so workspace files are accessible outside the
+      # container.  Remove this line if you don't need file persistence.
+      - ./workspace:/app/workspace
+      # Uncomment and adjust to mount TLS certificates for HTTPS:
+      # - /etc/letsencrypt/live/example.com:/certs:ro
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OLLAMA_HOST=${OLLAMA_HOST:-}
+      - BROWSER_WORKSPACE=/app/workspace
+      - AGENTICBROWSER_SSL_CERTFILE=${AGENTICBROWSER_SSL_CERTFILE:-}
+      - AGENTICBROWSER_SSL_KEYFILE=${AGENTICBROWSER_SSL_KEYFILE:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/task/schema')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

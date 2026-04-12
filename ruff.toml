@@ -1,0 +1,14 @@
+# Ruff configuration
+# https://docs.astral.sh/ruff/configuration/
+
+[lint]
+# Enable pyflakes (F) and pycodestyle errors (E) — fast, safe defaults.
+select = ["E", "F", "W", "I"]
+
+# E501 (line too long) is noisy in documentation-heavy files; keep it as a
+# warning via W505 (doc-line-too-long) instead.
+ignore = ["E501"]
+
+[format]
+# Use double quotes (Python community default).
+quote-style = "double"
