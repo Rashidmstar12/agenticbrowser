@@ -467,18 +467,39 @@ class BrowserAgent:
         """Return the inner text of the element matching *selector*."""
         return self._frame.inner_text(selector)
 
-    def get_html(self, selector: str = "body") -> str:
-        """Return the inner HTML of the element matching *selector*."""
-        return self._frame.inner_html(selector)
+    def get_html(self, selector: str = "body") -> dict[str, Any]:
+        """
+        Return the inner HTML of the element matching *selector*.
 
-    def get_attribute(self, selector: str, attribute: str) -> str | None:
-        """Return the value of *attribute* on the element matching *selector*."""
-        return self._frame.get_attribute(selector, attribute)
+        Returns
+        -------
+        dict
+            ``{"selector": ..., "html": ...}``
+        """
+        html = self._frame.inner_html(selector)
+        return {"selector": selector, "html": html}
 
-    def query_all(self, selector: str) -> list[dict[str, Any]]:
+    def get_attribute(self, selector: str, attribute: str) -> dict[str, Any]:
+        """
+        Return the value of *attribute* on the element matching *selector*.
+
+        Returns
+        -------
+        dict
+            ``{"selector": ..., "attribute": ..., "value": ...}``
+        """
+        value = self._frame.get_attribute(selector, attribute)
+        return {"selector": selector, "attribute": attribute, "value": value}
+
+    def query_all(self, selector: str) -> dict[str, Any]:
         """
         Return a list of ``{text, href}`` dicts for all elements matching
         *selector*.
+
+        Returns
+        -------
+        dict
+            ``{"selector": ..., "elements": [{text, href}, ...], "count": N}``
         """
         elements = self._frame.query_selector_all(selector)
         results = []
@@ -489,7 +510,7 @@ class BrowserAgent:
                     "href": el.get_attribute("href"),
                 }
             )
-        return results
+        return {"selector": selector, "elements": results, "count": len(results)}
 
     # ------------------------------------------------------------------
     # JavaScript execution
