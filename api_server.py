@@ -14,6 +14,9 @@ import asyncio
 import json as _json
 import logging
 import os
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path as _Path
 from typing import Any, AsyncIterator
@@ -67,6 +70,13 @@ _agent:   BrowserAgent | None = None
 _planner: TaskPlanner  | None = None
 _tools:   SystemTools  | None = None
 
+# ---------------------------------------------------------------------------
+# Agent pool — named agents that run alongside the default session
+# ---------------------------------------------------------------------------
+_agent_pool:   dict[str, BrowserAgent]   = {}
+_planner_pool: dict[str, TaskPlanner]    = {}
+_pool_lock:    threading.Lock            = threading.Lock()
+
 
 def _workspace() -> str:
     return os.environ.get("BROWSER_WORKSPACE", "workspace")
@@ -89,6 +99,17 @@ def get_tools() -> SystemTools:
     if _tools is None:
         _tools = SystemTools(workspace=_workspace())
     return _tools
+
+
+def get_pooled_agent(agent_id: str) -> BrowserAgent:
+    """Return the pooled agent identified by *agent_id*, or raise 404/400."""
+    with _pool_lock:
+        agent = _agent_pool.get(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent {agent_id!r} not found in pool.")
+    if agent._page is None:
+        raise HTTPException(status_code=400, detail=f"Agent {agent_id!r} has no active page.")
+    return agent
 
 
 # ---------------------------------------------------------------------------
