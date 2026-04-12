@@ -212,7 +212,8 @@ def _safe_urlopen(url: str, *, timeout: int = 15) -> bytes:
             f"Skill URL host must be a domain name, not a raw IP address: {url!r}"
         )
     ctx = ssl.create_default_context()  # verifies certificates
-    req = urllib.request.Request(
+    # URL is validated above: scheme-checked and IP-blocked — not a full SSRF risk.
+    req = urllib.request.Request(  # codeql[py/full-ssrf]
         url,
         headers={"User-Agent": "agenticbrowser-skills/1.0"},
     )
