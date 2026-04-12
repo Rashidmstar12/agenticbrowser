@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -20,7 +20,6 @@ from task_planner import (
     _interpolate_last,
     validate_steps,
 )
-
 
 # ---------------------------------------------------------------------------
 # validate_steps — happy-path

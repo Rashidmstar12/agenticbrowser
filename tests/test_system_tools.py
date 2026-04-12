@@ -8,7 +8,6 @@ repository checkout or to the default ``./workspace`` folder.
 from __future__ import annotations
 
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -17,7 +16,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from system_tools import PathTraversalError, SystemTools, safe_path
-
 
 # ---------------------------------------------------------------------------
 # safe_path

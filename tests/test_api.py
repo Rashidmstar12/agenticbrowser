@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -33,7 +32,6 @@ from fastapi.testclient import TestClient
 import api_server
 from api_server import app
 from system_tools import SystemTools
-
 
 # ---------------------------------------------------------------------------
 # Helpers

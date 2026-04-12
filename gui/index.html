@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Agentic Browser</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    #console-output { min-height: 320px; max-height: 480px; overflow-y: auto; }
+    .step-row { animation: fadeIn .25s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+    .spinner { display: inline-block; width: 14px; height: 14px;
+      border: 2px solid #6366f1; border-top-color: transparent;
+      border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+  </style>
+</head>
+<body class="h-full flex overflow-hidden bg-gray-100">
+
+<!-- ═══════════════════════════ SIDEBAR ═══════════════════════════ -->
+<aside class="w-52 bg-gray-900 flex flex-col shrink-0 select-none">
+
+  <!-- Logo -->
+  <div class="px-4 py-4 border-b border-gray-700">
+    <div class="text-white font-bold text-base">🤖 AgenticBrowser</div>
+    <div class="mt-1.5 flex items-center gap-1.5 text-xs">
+      <span id="session-dot" class="w-2 h-2 rounded-full bg-red-500 shrink-0"></span>
+      <span id="session-label" class="text-gray-400">Inactive</span>
+    </div>
+  </div>
+
+  <!-- Nav -->
+  <nav class="flex-1 p-2 space-y-0.5 overflow-y-auto">
+    <button data-tab="tasks"   onclick="showTab('tasks')"   class="nav-btn w-full text-left px-3 py-2 rounded text-sm text-gray-400 hover:bg-gray-700">🚀 Tasks</button>
+    <button data-tab="browser" onclick="showTab('browser')" class="nav-btn w-full text-left px-3 py-2 rounded text-sm text-gray-400 hover:bg-gray-700">🌐 Browser</button>
+    <button data-tab="console" onclick="showTab('console')" class="nav-btn w-full text-left px-3 py-2 rounded text-sm text-gray-400 hover:bg-gray-700">💻 Console</button>
+    <button data-tab="files"   onclick="showTab('files')"   class="nav-btn w-full text-left px-3 py-2 rounded text-sm text-gray-400 hover:bg-gray-700">📁 Files</button>
+    <button data-tab="skills"  onclick="showTab('skills')"  class="nav-btn w-full text-left px-3 py-2 rounded text-sm text-gray-400 hover:bg-gray-700">🧩 Skills</button>
+    <button data-tab="doctor"  onclick="showTab('doctor')"  class="nav-btn w-full text-left px-3 py-2 rounded text-sm text-gray-400 hover:bg-gray-700">🩺 Doctor</button>
+  </nav>
+
+  <!-- Session controls -->
+  <div class="p-3 border-t border-gray-700 space-y-1.5">
+    <button onclick="startSession()" class="w-full text-xs font-medium bg-green-600 hover:bg-green-500 text-white px-3 py-1.5 rounded">▶ Start Session</button>
+    <button onclick="stopSession()"  class="w-full text-xs font-medium bg-red-700  hover:bg-red-600  text-white px-3 py-1.5 rounded">■ Stop Session</button>
+  </div>
+</aside>
+
+<!-- ═══════════════════════════ MAIN ═══════════════════════════ -->
+<div class="flex-1 flex flex-col min-w-0 overflow-hidden">
+
+  <!-- Top bar -->
+  <header class="bg-white border-b border-gray-200 px-5 py-2.5 flex items-center justify-between shrink-0">
+    <div id="page-url" class="text-sm text-gray-400 truncate max-w-2xl italic">No page loaded</div>
+    <button onclick="refreshStatus()" class="text-xs text-gray-400 hover:text-gray-600 shrink-0 ml-4">↻ Refresh</button>
+  </header>
+
+  <!-- Toast container -->
+  <div id="toasts" class="fixed bottom-4 right-4 z-50 space-y-2 pointer-events-none"></div>
+
+  <!-- Tab panels -->
+  <div class="flex-1 overflow-y-auto p-5">
+
+    <!-- ─────────────── TASKS ─────────────── -->
+    <div id="tab-tasks" class="tab-panel space-y-4">
+      <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+        <h2 class="text-sm font-semibold text-gray-700 mb-3">🚀 Run a Task</h2>
+        <div class="flex gap-2">
+          <input id="task-intent" type="text" placeholder="e.g. go to google and search python asyncio"
+            class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+            onkeydown="if(event.key==='Enter') runTask()" />
+          <button onclick="planOnly()" title="Preview steps without running"
+            class="px-3 py-2 text-xs bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg border border-gray-300">📋 Plan</button>
+          <button id="task-run-btn" onclick="runTask()"
+            class="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg">▶ Run</button>
+          <button id="task-stop-btn" onclick="stopTask()"
+            class="hidden px-3 py-2 text-xs bg-red-100 hover:bg-red-200 text-red-700 rounded-lg border border-red-300">■ Stop</button>
+        </div>
+
+        <!-- Plan preview -->
+        <div id="task-plan" class="mt-3 flex flex-wrap gap-1.5 empty:hidden"></div>
+      </div>
+
+      <!-- Execution log -->
+      <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+        <h3 class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Execution Log</h3>
+        <div id="task-log" class="space-y-0.5 text-sm min-h-[80px]">
+          <div class="text-gray-400 text-xs italic">Results will appear here when you run a task.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ─────────────── BROWSER ─────────────── -->
+    <div id="tab-browser" class="tab-panel space-y-4">
+      <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+        <h2 class="text-sm font-semibold text-gray-700 mb-3">🌐 Navigate</h2>
+        <div class="flex gap-2">
+          <input id="nav-url" type="text" placeholder="https://example.com"
+            class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+            onkeydown="if(event.key==='Enter') navigatePage()" />
+          <button onclick="navigatePage()" class="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg">Go</button>
+        </div>
+        <div class="mt-3 flex flex-wrap gap-2">
+          <button onclick="takeScreenshot()" class="px-3 py-1.5 text-xs bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded-lg">📸 Screenshot</button>
+          <button onclick="closePopups()"    class="px-3 py-1.5 text-xs bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded-lg">✕ Close Popups</button>
+          <button onclick="getPageInfo()"    class="px-3 py-1.5 text-xs bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded-lg">ℹ Page Info</button>
+          <button onclick="scrollDown()"     class="px-3 py-1.5 text-xs bg-gray-100 hover:bg-gray-200 border border-gray-300 rounded-lg">↓ Scroll Down</button>
+        </div>
+      </div>
+
+      <!-- Page info -->
+      <div id="page-info-box" class="hidden bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+        <div id="page-info-content" class="text-sm text-gray-700 space-y-1"></div>
+      </div>
+
+      <!-- Screenshot preview -->
+      <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+        <h3 class="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">Screenshot Preview</h3>
+        <div id="screenshot-placeholder" class="text-gray-400 text-xs italic">Click 'Screenshot' to capture the current page.</div>
+        <img id="screenshot-preview" class="hidden max-w-full rounded border border-gray-200 shadow" alt="screenshot" />
+      </div>
+    </div>
+
+    <!-- ─────────────── CONSOLE ─────────────── -->
+    <div id="tab-console" class="tab-panel space-y-4">
+      <div class="bg-gray-900 rounded-xl shadow-sm border border-gray-700 p-4">
+        <h2 class="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">💻 Console</h2>
+        <div id="console-output" class="font-mono text-xs space-y-0.5 mb-3"></div>
+        <div class="flex gap-2">
+          <input id="console-input" type="text" placeholder="navigate https://example.com  |  click selector  |  help"
+            class="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-xs text-green-400 font-mono focus:outline-none focus:ring-1 focus:ring-green-500 placeholder-gray-500"
+            onkeydown="if(event.key==='Enter') execConsole()" />
+          <button onclick="execConsole()" class="px-4 py-2 text-xs font-semibold bg-green-700 hover:bg-green-600 text-white rounded-lg">Enter</button>
+        </div>
+        <div class="mt-2 text-xs text-gray-600">
+          Commands: navigate, click, type, fill, text, html, info, eval, scroll, popups, screenshot, status, help, clear
+        </div>
+      </div>
+    </div>
+
+    <!-- ─────────────── FILES ─────────────── -->
+    <div id="tab-files" class="tab-panel space-y-4">
+      <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+        <h2 class="text-sm font-semibold text-gray-700 mb-3">📁 Workspace Files</h2>
+        <div class="flex gap-2">
+          <input id="dir-path" type="text" placeholder="." value="."
+            class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+            onkeydown="if(event.key==='Enter') listDir()" />
+          <button onclick="listDir()" class="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg">List</button>
+        </div>
+        <div id="file-list" class="mt-3 divide-y divide-gray-100 empty:hidden"></div>
+      </div>
+
+      <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+        <h3 class="text-sm font-semibold text-gray-700 mb-3">Write / Create File</h3>
+        <div class="space-y-2">
+          <input id="write-path" type="text" placeholder="path/to/file.txt"
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400" />
+          <textarea id="write-content" rows="4" placeholder="File content..."
+            class="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-indigo-400 resize-y"></textarea>
+          <button onclick="writeFile()" class="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg">💾 Save</button>
+        </div>
+      </div>
+
+      <div id="file-content-section" class="hidden bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+        <div class="flex items-center justify-between mb-2">
+          <h3 class="text-sm font-semibold text-gray-700">File Content</h3>
+          <button onclick="document.getElementById('file-content-section').classList.add('hidden')"
+            class="text-xs text-gray-400 hover:text-gray-600">✕ Close</button>
+        </div>
+        <pre id="file-content" class="text-xs font-mono bg-gray-50 rounded p-3 overflow-auto max-h-72 whitespace-pre-wrap text-gray-800"></pre>
+      </div>
+    </div>
+
+    <!-- ─────────────── SKILLS ─────────────── -->
+    <div id="tab-skills" class="tab-panel space-y-4">
+      <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+        <h2 class="text-sm font-semibold text-gray-700 mb-1">🧩 External Skills</h2>
+        <p class="text-xs text-gray-500 mb-4">
+          Load reusable automation recipes from local files, URLs, or GitHub repositories.
+          Loaded skills override built-in templates when their triggers match your intent.
+        </p>
+
+        <div class="flex gap-2">
+          <input id="skill-source" type="text"
+            placeholder="path/to/skill.json  |  https://...  |  gh:owner/repo"
+            class="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+            onkeydown="if(event.key==='Enter') loadSkill()" />
+          <button onclick="loadSkill()" class="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg">Load</button>
+        </div>
+
+        <div class="mt-3 text-xs text-gray-500 space-y-0.5">
+          <div>Examples:</div>
+          <div class="font-mono bg-gray-50 rounded p-2 space-y-1">
+            <div>gh:openclaw/skills</div>
+            <div>gh:openclaw/skills/browser/google_login.json</div>
+            <div>https://raw.githubusercontent.com/owner/repo/main/skills/index.json</div>
+            <div>./skills/my_skill.json</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Loaded skills list -->
+      <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-semibold text-gray-700">Loaded Skills</h3>
+          <button onclick="refreshSkills()" class="text-xs text-gray-400 hover:text-gray-600">↻ Refresh</button>
+        </div>
+        <div id="skills-list" class="text-gray-400 text-xs italic">No skills loaded yet.</div>
+      </div>
+
+      <!-- Skill detail panel -->
+      <div id="skill-detail" class="hidden bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+        <div class="flex items-center justify-between mb-3">
+          <h3 id="skill-detail-name" class="text-sm font-semibold text-gray-700"></h3>
+          <button onclick="document.getElementById('skill-detail').classList.add('hidden')"
+            class="text-xs text-gray-400 hover:text-gray-600">✕ Close</button>
+        </div>
+        <pre id="skill-detail-json" class="text-xs font-mono bg-gray-50 rounded p-3 overflow-auto max-h-72 whitespace-pre-wrap text-gray-800"></pre>
+      </div>
+    </div>
+
+    <!-- ─────────────── DOCTOR ─────────────── -->
+    <div id="tab-doctor" class="tab-panel space-y-4">
+      <div class="bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+        <h2 class="text-sm font-semibold text-gray-700 mb-1">🩺 Environment Doctor</h2>
+        <p class="text-xs text-gray-500 mb-4">
+          Diagnose your agenticbrowser environment. Use the CLI with
+          <code class="bg-gray-100 px-1 rounded">--doctor --fix</code> to auto-remediate failures.
+        </p>
+        <div class="flex gap-2">
+          <button id="check-btn" onclick="runDoctor(false)"
+            class="px-4 py-2 text-xs font-semibold bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg">🔍 Run Checks</button>
+        </div>
+      </div>
+
+      <div id="doctor-results" class="hidden bg-white rounded-xl shadow-sm border border-gray-200 p-5">
+        <div class="flex items-center justify-between mb-3">
+          <h3 class="text-sm font-semibold text-gray-700">Results</h3>
+          <span id="doctor-overall" class="text-xs font-semibold"></span>
+        </div>
+        <div id="doctor-list" class="space-y-2"></div>
+        <div class="mt-4 p-3 bg-gray-50 rounded-lg border border-gray-200 text-xs text-gray-600">
+          💡 To auto-fix failures, run:
+          <code class="font-mono text-indigo-700">python local_runner.py --doctor --fix</code>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /tab panels -->
+</div><!-- /main -->
+
+<!-- ═══════════════════════════ SCRIPT ═══════════════════════════ -->
+<script>
+// ──────────────────────────────────────────────────────────────────
+// STATE
+// ──────────────────────────────────────────────────────────────────
+const state = {
+  sessionActive: false,
+  currentUrl: '',
+  currentTitle: '',
+  wsTask: null,
+  taskRunning: false,
+};
+
+// ──────────────────────────────────────────────────────────────────
+// API HELPER
+// ──────────────────────────────────────────────────────────────────
+async function api(method, path, body = null) {
+  const opts = { method, headers: {} };
+  if (body !== null) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, opts);
+  const ct = res.headers.get('content-type') || '';
+  let data;
+  try { data = ct.includes('json') ? await res.json() : { text: await res.text() }; }
+  catch { data = {}; }
+  if (!res.ok) {
+    const detail = data?.detail;
+    const msg = typeof detail === 'string' ? detail
+               : (detail ? JSON.stringify(detail) : (data?.text || res.statusText));
+    throw new Error(msg);
+  }
+  return data;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// TOASTS
+// ──────────────────────────────────────────────────────────────────
+function toast(msg, type = 'info') {
+  const colors = { info: 'bg-blue-600', success: 'bg-green-600', error: 'bg-red-600', warn: 'bg-yellow-600' };
+  const t = document.createElement('div');
+  t.className = `pointer-events-auto px-4 py-2 rounded-lg text-white text-xs shadow-lg max-w-xs ${colors[type] || colors.info}`;
+  t.textContent = msg;
+  document.getElementById('toasts').appendChild(t);
+  setTimeout(() => t.remove(), 3500);
+}
+
+// ──────────────────────────────────────────────────────────────────
+// TABS
+// ──────────────────────────────────────────────────────────────────
+function showTab(name) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-btn').forEach(b => {
+    const active = b.dataset.tab === name;
+    b.classList.toggle('bg-indigo-700', active);
+    b.classList.toggle('text-white', active);
+    b.classList.toggle('text-gray-400', !active);
+  });
+  const panel = document.getElementById(`tab-${name}`);
+  if (panel) panel.classList.add('active');
+  if (name === 'skills') refreshSkills();
+}
+
+// ──────────────────────────────────────────────────────────────────
+// SESSION
+// ──────────────────────────────────────────────────────────────────
+async function refreshStatus() {
+  try {
+    const data = await api('GET', '/session/status');
+    state.sessionActive = !!data.url;
+    state.currentUrl    = data.url   || '';
+    state.currentTitle  = data.title || '';
+  } catch {
+    state.sessionActive = false;
+    state.currentUrl = '';
+    state.currentTitle = '';
+  }
+  _updateSessionBadge();
+  _updatePageBar();
+}
+
+function _updateSessionBadge() {
+  const dot   = document.getElementById('session-dot');
+  const label = document.getElementById('session-label');
+  dot.className   = `w-2 h-2 rounded-full shrink-0 ${state.sessionActive ? 'bg-green-400' : 'bg-red-500'}`;
+  label.textContent = state.sessionActive ? 'Active' : 'Inactive';
+}
+
+function _updatePageBar() {
+  const el = document.getElementById('page-url');
+  el.textContent = state.currentUrl
+    ? `${state.currentUrl}${state.currentTitle ? ' — ' + state.currentTitle : ''}`
+    : 'No page loaded';
+  // pre-fill nav URL bar
+  const nav = document.getElementById('nav-url');
+  if (nav && state.currentUrl && !nav.value) nav.value = state.currentUrl;
+}
+
+async function startSession() {
+  try {
+    await api('POST', '/session/start', { headless: true, auto_close_popups: true });
+    toast('Session started', 'success');
+    refreshStatus();
+  } catch (e) { toast(`Start failed: ${e.message}`, 'error'); }
+}
+
+async function stopSession() {
+  try {
+    await api('POST', '/session/stop', {});
+    toast('Session stopped', 'info');
+    refreshStatus();
+  } catch (e) { toast(`Stop failed: ${e.message}`, 'error'); }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// TASKS TAB
+// ──────────────────────────────────────────────────────────────────
+function runTask() {
+  const intent = document.getElementById('task-intent').value.trim();
+  if (!intent) { toast('Enter an intent first', 'warn'); return; }
+
+  const logEl  = document.getElementById('task-log');
+  const planEl = document.getElementById('task-plan');
+  logEl.innerHTML  = '';
+  planEl.innerHTML = '';
+  state.taskRunning = true;
+  document.getElementById('task-run-btn').disabled = true;
+  document.getElementById('task-stop-btn').classList.remove('hidden');
+
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${protocol}//${location.host}/ws/task`);
+  state.wsTask = ws;
+
+  ws.onopen = () => ws.send(JSON.stringify({ intent }));
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+
+    if (msg.type === 'planned') {
+      planEl.innerHTML = msg.actions.map((a, i) =>
+        `<span class="inline-flex items-center gap-1 px-2 py-0.5 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full text-xs">
+          <span class="text-indigo-400">${i + 1}.</span>${a}
+          <span id="step-icon-${i}" class="ml-1"><span class="spinner"></span></span>
+        </span>`
+      ).join('');
+
+    } else if (msg.type === 'step_done') {
+      const icon = msg.status === 'ok' ? '✅' : '❌';
+      // Update pill icon
+      const pill = document.getElementById(`step-icon-${msg.step}`);
+      if (pill) pill.innerHTML = icon;
+      // Add to log
+      const row = document.createElement('div');
+      row.className = 'step-row flex items-start gap-2 py-1.5 border-b border-gray-100 last:border-0';
+      row.innerHTML = `
+        <span class="text-base shrink-0 mt-0.5">${icon}</span>
+        <div class="min-w-0">
+          <span class="text-xs font-medium text-gray-800">Step ${msg.step + 1}</span>
+          <span class="text-xs text-gray-500 ml-1.5">${msg.action}</span>
+          ${msg.error ? `<p class="text-red-600 text-xs mt-0.5 break-all">${msg.error}</p>` : ''}
+        </div>`;
+      logEl.appendChild(row);
+      logEl.scrollTop = logEl.scrollHeight;
+
+    } else if (msg.type === 'done') {
+      _finishTask();
+      const ok = msg.success;
+      const summary = document.createElement('div');
+      summary.className = `mt-3 px-3 py-2 rounded-lg text-xs font-semibold ${ok ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-red-50 text-red-700 border border-red-200'}`;
+      summary.textContent = ok
+        ? `✅ All steps completed successfully`
+        : `❌ ${msg.failed_count} step(s) failed — check logs above`;
+      logEl.appendChild(summary);
+      refreshStatus();
+
+    } else if (msg.type === 'error') {
+      _finishTask();
+      const err = document.createElement('div');
+      err.className = 'mt-2 px-3 py-2 bg-red-50 text-red-700 border border-red-200 rounded-lg text-xs font-semibold';
+      err.textContent = `Error: ${msg.message}`;
+      logEl.appendChild(err);
+    }
+  };
+
+  ws.onerror = () => { toast('WebSocket error — is the server running?', 'error'); _finishTask(); };
+  ws.onclose = () => { state.wsTask = null; };
+}
+
+function planOnly() {
+  const intent = document.getElementById('task-intent').value.trim();
+  if (!intent) { toast('Enter an intent first', 'warn'); return; }
+  const planEl = document.getElementById('task-plan');
+  planEl.innerHTML = '<span class="text-gray-400 text-xs italic">Planning…</span>';
+  api('POST', '/task/plan', { intent })
+    .then(data => {
+      planEl.innerHTML = data.steps.map((s, i) => {
+        const params = Object.entries(s).filter(([k]) => k !== 'action')
+          .map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(' ');
+        return `<div class="text-xs py-0.5">
+          <span class="text-indigo-500 font-mono">${i + 1}.</span>
+          <span class="font-semibold ml-1">${s.action}</span>
+          ${params ? `<span class="text-gray-400 ml-1">${params}</span>` : ''}
+        </div>`;
+      }).join('');
+    })
+    .catch(e => { planEl.innerHTML = `<span class="text-red-600 text-xs">${e.message}</span>`; });
+}
+
+function stopTask() {
+  if (state.wsTask) { state.wsTask.close(); state.wsTask = null; }
+  _finishTask();
+  toast('Task stopped', 'warn');
+}
+
+function _finishTask() {
+  state.taskRunning = false;
+  const btn = document.getElementById('task-run-btn');
+  if (btn) btn.disabled = false;
+  document.getElementById('task-stop-btn')?.classList.add('hidden');
+}
+
+// ──────────────────────────────────────────────────────────────────
+// BROWSER TAB
+// ──────────────────────────────────────────────────────────────────
+async function navigatePage() {
+  const url = document.getElementById('nav-url').value.trim();
+  if (!url) { toast('Enter a URL', 'warn'); return; }
+  try {
+    await api('POST', '/navigate', { url });
+    toast('Navigated', 'success');
+    refreshStatus();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function takeScreenshot() {
+  try {
+    const data = await api('POST', '/screenshot', { as_base64: true, full_page: false });
+    const img  = document.getElementById('screenshot-preview');
+    const ph   = document.getElementById('screenshot-placeholder');
+    if (img && data.image_base64) {
+      img.src = `data:image/png;base64,${data.image_base64}`;
+      img.classList.remove('hidden');
+      ph.classList.add('hidden');
+    }
+    refreshStatus();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function closePopups() {
+  try { await api('POST', '/popups/close', {}); toast('Popups closed', 'success'); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
+async function getPageInfo() {
+  try {
+    const data = await api('GET', '/page/info');
+    const box  = document.getElementById('page-info-box');
+    const cont = document.getElementById('page-info-content');
+    cont.innerHTML = `
+      <div><span class="text-gray-500">URL:</span> <span class="break-all">${data.url || '—'}</span></div>
+      <div><span class="text-gray-500">Title:</span> ${data.title || '—'}</div>`;
+    box.classList.remove('hidden');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function scrollDown() {
+  try { await api('POST', '/scroll', { y: 500, x: 0 }); toast('Scrolled ↓', 'info'); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// CONSOLE TAB
+// ──────────────────────────────────────────────────────────────────
+const CONSOLE_CMDS = {
+  navigate:   async ([url])        => api('POST', '/navigate',     { url }),
+  click:      async ([sel])        => api('POST', '/click',         { selector: sel }),
+  type:       async ([sel, ...t])  => api('POST', '/type',          { selector: sel, text: t.join(' ') }),
+  fill:       async ([sel, ...v])  => api('POST', '/fill',          { selector: sel, value: v.join(' ') }),
+  text:       async ([sel='body']) => api('POST', '/page/text',     { selector: sel }),
+  html:       async ([sel='body']) => api('POST', '/page/html',     { selector: sel }),
+  info:       async ()             => api('GET',  '/page/info'),
+  eval:       async ([...js])      => api('POST', '/evaluate',      { script: js.join(' ') }),
+  scroll:     async ([y='500'])    => api('POST', '/scroll',        { y: parseInt(y) || 500, x: 0 }),
+  popups:     async ()             => api('POST', '/popups/close',  {}),
+  screenshot: async () => {
+    const d = await api('POST', '/screenshot', { as_base64: true });
+    if (d.image_base64) {
+      const img = document.createElement('img');
+      img.src = `data:image/png;base64,${d.image_base64}`;
+      img.className = 'mt-1 max-h-48 rounded border border-gray-700';
+      document.getElementById('console-output').appendChild(img);
+      document.getElementById('console-output').scrollTop = 9999;
+    }
+    return { saved: d.path || null };
+  },
+  status:     async () => api('GET',  '/session/status'),
+  help:       async () => ({ commands: Object.keys(CONSOLE_CMDS).join(', ') }),
+};
+
+async function execConsole() {
+  const input = document.getElementById('console-input');
+  const line  = input.value.trim();
+  if (!line) return;
+  input.value = '';
+  _consoleAppend(`> ${line}`, 'text-green-400');
+  if (line === 'clear') { document.getElementById('console-output').innerHTML = ''; return; }
+
+  const [cmd, ...args] = line.split(/\s+/);
+  const handler = CONSOLE_CMDS[cmd];
+  if (!handler) { _consoleAppend(`Unknown: ${cmd} — type 'help'`, 'text-yellow-400'); return; }
+
+  try {
+    const result = await handler(args);
+    if (result !== undefined) _consoleAppend(JSON.stringify(result, null, 2));
+  } catch (e) { _consoleAppend(`Error: ${e.message}`, 'text-red-400'); }
+  document.getElementById('console-output').scrollTop = 9999;
+}
+
+function _consoleAppend(text, colorClass = 'text-gray-300') {
+  const output = document.getElementById('console-output');
+  const pre = document.createElement('pre');
+  pre.className = `${colorClass} text-xs font-mono whitespace-pre-wrap leading-relaxed`;
+  pre.textContent = text;
+  output.appendChild(pre);
+  output.scrollTop = output.scrollHeight;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// FILES TAB
+// ──────────────────────────────────────────────────────────────────
+async function listDir() {
+  const path = document.getElementById('dir-path').value.trim() || '.';
+  try {
+    const data = await api('POST', '/system/list_dir', { path });
+    const list = document.getElementById('file-list');
+    if (!data.entries.length) { list.innerHTML = '<div class="text-gray-400 text-xs italic py-2">Empty directory</div>'; return; }
+    list.innerHTML = data.entries.map(e => {
+      const icon = e.type === 'dir' ? '📁' : '📄';
+      const size = e.size != null ? ` <span class="text-gray-400 text-xs">${e.size} B</span>` : '';
+      return `<div class="flex items-center gap-2 py-1.5 cursor-pointer hover:text-indigo-600 text-sm"
+        onclick="fileClick(${JSON.stringify(e.name)},${JSON.stringify(e.type)})">
+        <span>${icon}</span><span class="flex-1 truncate">${e.name}</span>${size}
+      </div>`;
+    }).join('');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function fileClick(name, type) {
+  if (type === 'dir') {
+    const p = document.getElementById('dir-path');
+    const cur = p.value.trim() || '.';
+    p.value = cur === '.' ? name : `${cur}/${name}`;
+    listDir();
+  } else {
+    readFile(name);
+  }
+}
+
+async function readFile(path) {
+  path = path || document.getElementById('read-path')?.value?.trim();
+  if (!path) { toast('Enter a file path', 'warn'); return; }
+  try {
+    const data = await api('POST', '/system/read_file', { path });
+    document.getElementById('file-content').textContent = data.content;
+    document.getElementById('file-content-section').classList.remove('hidden');
+    document.getElementById('write-path').value   = path;
+    document.getElementById('write-content').value = data.content;
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function writeFile() {
+  const path    = document.getElementById('write-path').value.trim();
+  const content = document.getElementById('write-content').value;
+  if (!path) { toast('Enter a file path', 'warn'); return; }
+  try {
+    await api('POST', '/system/write_file', { path, content: content || '' });
+    toast(`Saved ${path}`, 'success');
+    listDir();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// SKILLS TAB
+// ──────────────────────────────────────────────────────────────────
+async function loadSkill() {
+  const source = document.getElementById('skill-source').value.trim();
+  if (!source) { toast('Enter a source', 'warn'); return; }
+  try {
+    const data = await api('POST', '/skills/load', { source });
+    toast(`Loaded ${data.loaded} skill(s): ${data.skills.join(', ')}`, 'success');
+    document.getElementById('skill-source').value = '';
+    refreshSkills();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function refreshSkills() {
+  try {
+    const data = await api('GET', '/skills');
+    const list = document.getElementById('skills-list');
+    if (!data.skills.length) {
+      list.innerHTML = '<div class="text-gray-400 text-xs italic">No skills loaded. Use the form above to load skills.</div>';
+      return;
+    }
+    list.innerHTML = data.skills.map(s => `
+      <div class="flex items-start justify-between py-2 border-b border-gray-100 last:border-0 gap-3">
+        <div class="min-w-0">
+          <div class="text-sm font-medium text-gray-800 cursor-pointer hover:text-indigo-600"
+               onclick="showSkillDetail(${JSON.stringify(s.name)})">${s.name}</div>
+          <div class="text-xs text-gray-500 truncate">${s.description || '—'}</div>
+          <div class="text-xs text-gray-400 mt-0.5">
+            v${s.version} · ${s.author || 'unknown author'} · ${s.triggers?.length || 0} trigger(s)
+            ${s.source ? `· <span title="${s.source}" class="italic">from ${_shortSource(s.source)}</span>` : ''}
+          </div>
+        </div>
+        <button onclick="unloadSkill(${JSON.stringify(s.name)})"
+          class="shrink-0 text-xs text-red-400 hover:text-red-600 px-2 py-1 rounded hover:bg-red-50">✕</button>
+      </div>`).join('');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function _shortSource(src) {
+  try { return new URL(src).hostname + '…'; } catch { return src.split('/').slice(-1)[0]; }
+}
+
+async function showSkillDetail(name) {
+  try {
+    const data = await api('GET', `/skills/${encodeURIComponent(name)}`);
+    document.getElementById('skill-detail-name').textContent = name;
+    document.getElementById('skill-detail-json').textContent = JSON.stringify(data, null, 2);
+    document.getElementById('skill-detail').classList.remove('hidden');
+    document.getElementById('skill-detail').scrollIntoView({ behavior: 'smooth' });
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function unloadSkill(name) {
+  try {
+    await api('DELETE', `/skills/${encodeURIComponent(name)}`);
+    toast(`Unloaded ${name}`, 'info');
+    refreshSkills();
+    document.getElementById('skill-detail').classList.add('hidden');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// DOCTOR TAB
+// ──────────────────────────────────────────────────────────────────
+async function runDoctor() {
+  const btn = document.getElementById('check-btn');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Running…';
+  try {
+    const data = await api('GET', '/doctor');
+    _renderDoctorResults(data);
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+
+function _renderDoctorResults(data) {
+  const results = document.getElementById('doctor-results');
+  const list    = document.getElementById('doctor-list');
+  const overall = document.getElementById('doctor-overall');
+  results.classList.remove('hidden');
+
+  const icons  = { ok: '✅', warn: '⚠️', fail: '❌' };
+  const colors = {
+    ok:   'bg-green-50  border-green-200  text-green-800',
+    warn: 'bg-yellow-50 border-yellow-200 text-yellow-800',
+    fail: 'bg-red-50    border-red-200    text-red-800',
+  };
+
+  list.innerHTML = (data.checks || []).map(c => `
+    <div class="flex items-start gap-3 p-3 rounded-lg border ${colors[c.status] || ''}">
+      <span class="text-base shrink-0">${icons[c.status] || '?'}</span>
+      <div class="min-w-0">
+        <div class="text-xs font-semibold">${c.name}
+          ${c.fixed ? '<span class="ml-1 text-xs bg-green-200 text-green-800 px-1.5 py-0.5 rounded">fixed</span>' : ''}
+        </div>
+        <div class="text-xs opacity-80 mt-0.5">${c.message}</div>
+      </div>
+    </div>`).join('');
+
+  const ok = data.status === 'ok';
+  overall.textContent  = `Overall: ${data.status}`;
+  overall.className    = `text-xs font-bold ${ok ? 'text-green-600' : 'text-red-600'}`;
+  results.scrollIntoView({ behavior: 'smooth' });
+}
+
+// ──────────────────────────────────────────────────────────────────
+// INIT
+// ──────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  showTab('tasks');
+  refreshStatus();
+  setInterval(refreshStatus, 15000);
+  // Auto-list files when Files tab is shown
+  document.querySelector('[data-tab="files"]').addEventListener('click', () => setTimeout(listDir, 100));
+});
+</script>
+</body>
+</html>

@@ -25,6 +25,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 from typing import Any
 
 from browser_agent import BrowserAgent
@@ -39,6 +40,82 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# ANSI colour helpers (gracefully disabled when stdout is not a terminal)
+_USE_COLOR = sys.stdout.isatty()
+_GREEN  = "\033[32m" if _USE_COLOR else ""
+_RED    = "\033[31m" if _USE_COLOR else ""
+_YELLOW = "\033[33m" if _USE_COLOR else ""
+_RESET  = "\033[0m"  if _USE_COLOR else ""
+
+
+# ---------------------------------------------------------------------------
+# Doctor helpers
+# ---------------------------------------------------------------------------
+
+def run_doctor(workspace: str = "workspace", fix: bool = False) -> int:
+    """
+    Run environment health checks, print coloured results, and return an
+    exit code (0 = all pass/warn, 1 = at least one failure).
+    """
+    from doctor import run_checks
+
+    print(f"\n{'─' * 55}")
+    print("  🩺  Agentic Browser — Environment Doctor")
+    print(f"{'─' * 55}")
+    print(f"  Mode: {'diagnose + auto-fix' if fix else 'diagnose only  (re-run with --fix to auto-fix)'}\n")
+
+    checks = run_checks(workspace=workspace, fix=fix)
+    any_fail = False
+    for c in checks:
+        if c.status == "ok":
+            icon = f"{_GREEN}✓{_RESET}"
+        elif c.status == "warn":
+            icon = f"{_YELLOW}⚠{_RESET}"
+        else:
+            icon = f"{_RED}✗{_RESET}"
+            any_fail = True
+        fixed_tag = f" {_GREEN}[fixed]{_RESET}" if c.fixed else ""
+        print(f"  {icon}  {c.name:<28s}  {c.message}{fixed_tag}")
+
+    print(f"\n{'─' * 55}")
+    if any_fail:
+        print(f"  {_RED}Some checks failed.{_RESET}  Re-run with --doctor --fix to auto-fix.")
+    else:
+        print(f"  {_GREEN}All checks passed.{_RESET}")
+    print(f"{'─' * 55}\n")
+    return 1 if any_fail else 0
+
+
+def _print_failure_report(
+    raw_error: str,
+    *,
+    action: str | None = None,
+    step_index: int | None = None,
+    intent: str | None = None,
+    rerun_cmd: str | None = None,
+) -> None:
+    """Print a structured failure report with reason, suggestions, and re-run hint."""
+    from doctor import explain_failure
+
+    report = explain_failure(
+        raw_error,
+        action=action,
+        step_index=step_index,
+        intent=intent,
+        rerun_cmd=rerun_cmd,
+    )
+
+    print(f"\n  {_RED}● Failure Report{_RESET}")
+    print(f"  Reason : {report.reason}")
+    if raw_error and raw_error not in report.reason:
+        print(f"  Error  : {raw_error[:300]}")
+    print(f"\n  {_YELLOW}Troubleshoot:{_RESET}")
+    for tip in report.suggestions:
+        print(f"    • {tip}")
+    if report.rerun_hint:
+        print(f"\n  {_GREEN}Re-run  :{_RESET}  {report.rerun_hint}")
+    print()
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +169,9 @@ COMMANDS: dict[str, str] = {
     "run_shell":          "run_shell <command>",
     # Meta
     "help":               "help",
+    "rerun":              "rerun  — repeat the last command",
+    "skill":              "skill list | skill load <source> | skill info <name>",
+    "doctor":             "doctor [fix]  — run environment health checks",
     "quit":               "quit",
 }
 
@@ -314,7 +394,18 @@ def _dispatch(
                 failed = [r for r in summary["results"] if r["status"] == "error"]
                 print(f"  Task failed ({len(failed)} step(s) errored).")
                 for r in failed:
-                    print(f"    Step {r['step']} ({r['action']}): {r['error']}")
+                    err = r.get("error", "unknown error")
+                    print(f"    Step {r['step']} ({r['action']}): {err}")
+                # Show structured failure report for the first failed step
+                if failed:
+                    first = failed[0]
+                    _print_failure_report(
+                        first.get("error", ""),
+                        action=first.get("action"),
+                        step_index=first.get("step"),
+                        intent=intent,
+                        rerun_cmd=f'task {intent}',
+                    )
             return summary
 
         elif cmd == "task_plan":
@@ -403,6 +494,45 @@ def _dispatch(
             _print_help()
             return None
 
+        elif cmd == "doctor":
+            fix = len(parts) > 1 and parts[1] == "fix"
+            run_doctor(fix=fix)
+            return None
+
+        elif cmd == "skill":
+            sub = parts[1] if len(parts) > 1 else "list"
+            from skills import SkillLoadError, get_default_registry
+            reg = get_default_registry()
+            if sub == "list":
+                skills = reg.list_skills()
+                if not skills:
+                    print("  No skills loaded. Use:  skill load <source>")
+                else:
+                    print(f"  {len(skills)} skill(s) loaded:")
+                    for s in skills:
+                        print(f"    • {s.name:<25s} v{s.version}  {s.description[:60]}")
+            elif sub == "load":
+                source = " ".join(parts[2:]) if len(parts) > 2 else input("  Source (file/url/gh:owner/repo): ").strip()
+                try:
+                    loaded = reg.load_from_source(source)
+                    print(f"  Loaded {len(loaded)} skill(s): {', '.join(s.name for s in loaded)}")
+                except (SkillLoadError, FileNotFoundError, OSError) as exc:
+                    print(f"  Error loading skills: {exc}")
+            elif sub == "info":
+                name = parts[2] if len(parts) > 2 else input("  Skill name: ").strip()
+                skill = reg.get(name)
+                if skill is None:
+                    print(f"  Skill {name!r} not found. Use 'skill list' to see loaded skills.")
+                else:
+                    print(json.dumps(skill.to_dict(), indent=2))
+            elif sub == "unload":
+                name = parts[2] if len(parts) > 2 else input("  Skill name: ").strip()
+                removed = reg.unregister(name)
+                print(f"  {'Unloaded' if removed else 'Skill not found:'} {name!r}")
+            else:
+                print("  Usage:  skill list | skill load <source> | skill info <name> | skill unload <name>")
+            return None
+
         elif cmd in ("quit", "exit", "q"):
             return "QUIT"
 
@@ -413,6 +543,7 @@ def _dispatch(
     except Exception as exc:
         print(f"  Error: {exc}")
         logger.debug("Command error", exc_info=True)
+        _print_failure_report(str(exc), action=cmd if "cmd" in dir() else None)
         return None
 
 
@@ -467,7 +598,14 @@ def run_task_file(
     if failed:
         print(f"\n  {len(failed)} step(s) failed:")
         for r in failed:
-            print(f"    Step {r['step']} ({r['action']}): {r['error']}")
+            print(f"    Step {r['step']} ({r['action']}): {r.get('error', '')}")
+        first = failed[0]
+        _print_failure_report(
+            first.get("error", ""),
+            action=first.get("action"),
+            step_index=first.get("step"),
+            rerun_cmd=f"python local_runner.py --task {path}",
+        )
     else:
         print(f"\n  All {len(results)} steps completed successfully.")
 
@@ -484,7 +622,9 @@ def run_repl(
 ) -> None:
     """Start an interactive read-eval-print loop."""
     print("Agentic Browser — interactive mode")
-    print("Type 'help' for available commands, 'quit' to exit.\n")
+    print("Type 'help' for available commands, 'rerun' to repeat last command, 'quit' to exit.\n")
+
+    last_line: str = ""
 
     while True:
         try:
@@ -496,13 +636,20 @@ def run_repl(
         if not line:
             continue
 
+        # Handle rerun before updating last_line
+        if line in ("rerun", "r") and last_line:
+            print(f"  ↩ Rerunning: {last_line}")
+            line = last_line
+        elif line not in ("rerun", "r"):
+            last_line = line
+
         result = _dispatch(agent, line, planner=planner, tools=tools)
         if result == "QUIT":
             break
         if result is not None and not isinstance(result, dict):
             print(f"  OK: {result}")
         elif isinstance(result, dict) and "error" not in result:
-            print(f"  OK: {result}")
+            pass  # _dispatch already printed task/step results
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +700,43 @@ def main() -> None:
         default=os.environ.get("BROWSER_WORKSPACE", "workspace"),
         help="Directory for file I/O operations (default: ./workspace or BROWSER_WORKSPACE env var)",
     )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run environment health checks and exit",
+    )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="Auto-fix issues found by --doctor (install missing packages, browsers)",
+    )
+    parser.add_argument(
+        "--skills",
+        metavar="SOURCE",
+        action="append",
+        default=[],
+        help=(
+            "Load skills from a source before running "
+            "(file, directory, URL, or gh:owner/repo). "
+            "Can be specified multiple times."
+        ),
+    )
     args = parser.parse_args()
+
+    # --doctor is standalone — run and exit, no browser needed
+    if args.doctor:
+        sys.exit(run_doctor(workspace=args.workspace, fix=args.fix))
+
+    # Load any external skills into the default registry
+    if args.skills:
+        from skills import SkillLoadError, get_default_registry
+        reg = get_default_registry()
+        for source in args.skills:
+            try:
+                loaded = reg.load_from_source(source)
+                print(f"  Loaded {len(loaded)} skill(s) from {source!r}")
+            except (SkillLoadError, FileNotFoundError, OSError) as exc:
+                print(f"  Warning: could not load skills from {source!r}: {exc}")
 
     workspace = args.workspace
     tools   = SystemTools(workspace=workspace)
@@ -569,6 +752,17 @@ def main() -> None:
     with agent:
         if args.intent:
             summary = planner.run(args.intent, agent)
+            if not summary.get("success"):
+                failed = [r for r in summary.get("results", []) if r.get("status") == "error"]
+                if failed:
+                    first = failed[0]
+                    _print_failure_report(
+                        first.get("error", ""),
+                        action=first.get("action"),
+                        step_index=first.get("step"),
+                        intent=args.intent,
+                        rerun_cmd=f'python {sys.argv[0]} --intent "{args.intent}"',
+                    )
             print(json.dumps(summary, indent=2, default=str))
         elif args.task:
             run_task_file(agent, args.task, workspace=workspace)

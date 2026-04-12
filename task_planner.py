@@ -655,9 +655,12 @@ class TaskPlanner:
         ``None``     – auto-detect from environment; templates only if no LLM.
     """
 
-    def __init__(self, llm: str | None = None) -> None:
+    def __init__(self, llm: str | None = None, skill_registry: Any = None) -> None:
         self.llm = llm or self._detect_llm()
         self._system_tools: Any = None  # lazy-created on first system action
+        # skill_registry is a SkillRegistry instance (or None to use the default).
+        # Typed as Any to avoid a hard import cycle at module load time.
+        self._skill_registry: Any = skill_registry
 
     @staticmethod
     def _detect_llm() -> str | None:
@@ -688,6 +691,27 @@ class TaskPlanner:
         """
         intent = intent.strip()
         logger.info("Planning intent: %r", intent)
+
+        # 0. Skill registry (user-loaded external skills take highest priority)
+        registry = self._skill_registry
+        if registry is None:
+            try:
+                from skills import get_default_registry
+                registry = get_default_registry()
+            except ImportError:
+                registry = None
+        if registry is not None:
+            match = registry.match(intent)
+            if match is not None:
+                skill, params = match
+                try:
+                    from skills import resolve_steps
+                    raw_steps = resolve_steps(skill, params)
+                    steps = validate_steps(raw_steps)
+                    logger.info("Matched skill %r → %d steps", skill.name, len(steps))
+                    return steps
+                except Exception as exc:
+                    logger.warning("Skill %r builder failed: %s", skill.name, exc)
 
         # 1. Template matching (no LLM, no hallucination)
         steps = self._match_template(intent)

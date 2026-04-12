@@ -10,17 +10,22 @@ Or use the helper:
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import logging
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path as _Path
 from typing import Any, AsyncIterator
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from browser_agent import BrowserAgent
+from doctor import run_checks
+from skills import SkillLoadError, get_default_registry
 from system_tools import SystemTools
 from task_planner import STEP_SCHEMA, StepValidationError, TaskPlanner, validate_steps
 
@@ -742,6 +747,189 @@ def task_execute(req: TaskExecuteRequest) -> dict[str, Any]:
 def task_schema() -> dict[str, Any]:
     """Return the full STEP_SCHEMA so clients know what actions are valid."""
     return {"schema": STEP_SCHEMA}
+
+
+# ---------------------------------------------------------------------------
+# Routes: doctor (environment health checks)
+# ---------------------------------------------------------------------------
+
+@app.get("/doctor", summary="Run environment health checks")
+def doctor_check() -> dict[str, Any]:
+    """
+    Run all environment health checks and return a structured report.
+
+    No auto-fix is performed via the API; use ``--doctor --fix`` from the CLI
+    to auto-remediate issues.
+    """
+    checks = run_checks(workspace=_workspace(), fix=False)
+    all_ok = all(c.status != "fail" for c in checks)
+    return _safe_response({
+        "status": "ok" if all_ok else "degraded",
+        "checks": [c.to_dict() for c in checks],
+    })
+
+
+# ---------------------------------------------------------------------------
+# Routes: skills
+# ---------------------------------------------------------------------------
+
+class SkillLoadRequest(BaseModel):
+    source: str = Field(
+        ...,
+        description=(
+            "Skill source: a local file path, directory path, HTTP/HTTPS URL, "
+            "or GitHub shorthand 'gh:owner/repo[/path]'."
+        ),
+    )
+
+
+@app.get("/skills", summary="List loaded skills")
+def skills_list() -> dict[str, Any]:
+    """Return all skills currently registered in the default skill registry."""
+    reg = get_default_registry()
+    return {
+        "count":  len(reg),
+        "skills": [s.to_dict() for s in reg.list_skills()],
+    }
+
+
+@app.post("/skills/load", summary="Load skills from a file, URL, or GitHub repo")
+def skills_load(req: SkillLoadRequest) -> dict[str, Any]:
+    """
+    Load one or more skills from *source* and register them in the default
+    registry.  Existing skills with the same name are overwritten.
+    """
+    reg = get_default_registry()
+    try:
+        loaded = reg.load_from_source(req.source)
+    except (SkillLoadError, FileNotFoundError, OSError) as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+    return {
+        "loaded": len(loaded),
+        "skills": [s.name for s in loaded],
+    }
+
+
+@app.get("/skills/{name}", summary="Get a skill by name")
+def skills_get(name: str) -> dict[str, Any]:
+    """Return the full definition of a single skill."""
+    skill = get_default_registry().get(name)
+    if skill is None:
+        raise HTTPException(status_code=404, detail=f"Skill {name!r} not found")
+    return skill.to_dict()
+
+
+@app.delete("/skills/{name}", summary="Unload a skill by name")
+def skills_delete(name: str) -> dict[str, Any]:
+    """Remove a skill from the default registry."""
+    removed = get_default_registry().unregister(name)
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Skill {name!r} not found")
+    return {"unloaded": name}
+
+
+# ---------------------------------------------------------------------------
+# Routes: web GUI
+# ---------------------------------------------------------------------------
+
+@app.get("/", include_in_schema=False)
+def root_redirect() -> RedirectResponse:
+    """Redirect the root URL to the web GUI."""
+    return RedirectResponse(url="/ui")
+
+
+@app.get("/ui", include_in_schema=False)
+def serve_gui() -> HTMLResponse:
+    """Serve the built-in web GUI (single-page application)."""
+    html_path = _Path(__file__).parent / "gui" / "index.html"
+    try:
+        return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return HTMLResponse(
+            content="<h1>GUI not found</h1><p>gui/index.html is missing.</p>",
+            status_code=404,
+        )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket: streaming task execution
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/task")
+async def ws_task(websocket: WebSocket) -> None:
+    """
+    Stream task execution step-by-step over a WebSocket connection.
+
+    Protocol
+    --------
+    Client  → ``{"intent": "<natural language task>"}``
+
+    Server  → ``{"type": "planned",   "step_count": N, "actions": [...]}``
+            → ``{"type": "step_done", "step": i, "action": "...", "status": "ok"|"error", "error": "..."}``
+            → ``{"type": "done",      "success": bool, "failed_count": N}``
+            → ``{"type": "error",     "message": "..."}``  (on unrecoverable errors)
+    """
+    await websocket.accept()
+    loop = asyncio.get_running_loop()
+    try:
+        data = await websocket.receive_json()
+        intent = str(data.get("intent", "")).strip()
+        if not intent:
+            await websocket.send_json({"type": "error", "message": "intent is required"})
+            return
+
+        try:
+            planner = get_planner()
+            agent   = get_agent()
+        except HTTPException as exc:
+            await websocket.send_json({"type": "error", "message": str(exc.detail)})
+            return
+
+        # Plan steps (synchronous call → run in thread pool)
+        try:
+            steps = await loop.run_in_executor(None, planner.plan, intent)
+        except Exception as exc:
+            await websocket.send_json({"type": "error", "message": _sanitize_error(str(exc))})
+            return
+
+        await websocket.send_json({
+            "type":       "planned",
+            "step_count": len(steps),
+            "actions":    [s["action"] for s in steps],
+        })
+
+        # Execute all steps (synchronous call → run in thread pool)
+        results = await loop.run_in_executor(
+            None,
+            lambda: planner.execute(steps, agent, stop_on_error=True),
+        )
+
+        failed = 0
+        for r in results:
+            is_err = r.get("status") == "error"
+            if is_err:
+                failed += 1
+            await websocket.send_json({
+                "type":   "step_done",
+                "step":   r["step"],
+                "action": r["action"],
+                "status": "error" if is_err else "ok",
+                "error":  _sanitize_error(str(r.get("error", ""))) if is_err else None,
+            })
+
+        await websocket.send_json({
+            "type":         "done",
+            "success":      failed == 0,
+            "failed_count": failed,
+        })
+
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        try:
+            await websocket.send_json({"type": "error", "message": _sanitize_error(str(exc))})
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
