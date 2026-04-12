@@ -156,12 +156,11 @@ class TestNoRateLimitByDefault:
             assert r.status_code == 200
 
     def test_no_limiter_on_app_state_when_env_unset(self) -> None:
-        """app.state.limiter is only present when BROWSER_RATE_LIMIT is set."""
+        """app.state.limiter is absent when BROWSER_RATE_LIMIT was not set at startup."""
         os.environ.pop("BROWSER_RATE_LIMIT", None)
-        # The module-level app was built without the env var → no limiter
-        assert not hasattr(api_server.app.state, "limiter") or \
-               api_server.app.state.limiter is None or \
-               not os.environ.get("BROWSER_RATE_LIMIT")
+        # The module-level app was initialised without BROWSER_RATE_LIMIT set,
+        # so no limiter should be registered on its state.
+        assert not hasattr(api_server.app.state, "limiter")
 
 
 # ---------------------------------------------------------------------------
@@ -190,11 +189,15 @@ class TestRateLimitEnvParsing:
             assert val == s
 
     def test_slowapi_available_flag(self) -> None:
-        """_SLOWAPI_AVAILABLE is True when slowapi is installed."""
-        assert api_server._SLOWAPI_AVAILABLE is True
+        """_SLOWAPI_AVAILABLE reflects whether slowapi is importable."""
+        try:
+            import slowapi  # noqa: F401
+            slowapi_importable = True
+        except ImportError:
+            slowapi_importable = False
+        assert api_server._SLOWAPI_AVAILABLE is slowapi_importable
 
     def test_rate_limit_str_read_from_env(self) -> None:
-        """The module reads BROWSER_RATE_LIMIT at startup time."""
-        # Verify the variable name is defined in api_server
-        assert hasattr(api_server, "_rate_limit_str") or \
-               hasattr(api_server, "_SLOWAPI_AVAILABLE")
+        """Both _SLOWAPI_AVAILABLE and _rate_limit_str are defined in api_server."""
+        assert hasattr(api_server, "_SLOWAPI_AVAILABLE")
+        assert hasattr(api_server, "_rate_limit_str")
