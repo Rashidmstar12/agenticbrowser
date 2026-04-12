@@ -1194,19 +1194,16 @@ class BrowserAgent:
         """
         import os as _os
         # Validate that save_path stays within the workspace (cwd) to prevent
-        # path traversal attacks.  After validation, rebuild the path from the
-        # trusted workspace_root so that subsequent file-system calls operate
-        # only on the trusted component — this breaks the taint chain from the
-        # original user-supplied value.
+        # path traversal attacks.
         workspace_root = _os.path.realpath(_os.getcwd())
         resolved_path  = _os.path.realpath(save_path)
         if not (resolved_path.startswith(workspace_root + _os.sep) or resolved_path == workspace_root):
             raise ValueError(
                 f"save_path must be inside the workspace directory ({workspace_root!r})."
             )
-        # Rebuild from the trusted base to avoid tainted-path propagation.
-        rel = _os.path.relpath(resolved_path, workspace_root)
-        safe_path = _os.path.join(workspace_root, rel)
+        # Rebuild from the trusted base component to ensure no tainted data
+        # flows into subsequent file-system calls.
+        safe_path = _os.path.join(workspace_root, _os.path.relpath(resolved_path, workspace_root))
         logger.info("Downloading '%s' → '%s'", url, safe_path)
         with self.page.expect_download() as dl_info:
             self.page.evaluate(
@@ -1214,8 +1211,11 @@ class BrowserAgent:
                 [url],
             )
         download = dl_info.value
+        # Capture file size from Playwright's temporary download path (not
+        # user-supplied) before moving the file to the requested location.
+        _tmp = download.path()
+        size = _os.path.getsize(_tmp) if (_tmp and _os.path.isfile(_tmp)) else 0
         download.save_as(safe_path)
-        size = _os.path.getsize(safe_path) if _os.path.exists(safe_path) else 0
         return {"url": url, "save_path": safe_path, "size_bytes": size}
 
     def emulate_device(self, device_name: str) -> dict[str, Any]:

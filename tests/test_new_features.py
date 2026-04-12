@@ -928,12 +928,14 @@ class TestPhase2BrowserAgentMethods:
         monkeypatch.setattr(_os, "getcwd", lambda: str(tmp_path))
 
         save_path = str(tmp_path / "output.pdf")
-        # Create a fake file so getsize works
-        (tmp_path / "output.pdf").write_bytes(b"PDF content")
+        # Create a fake file at the Playwright temp path so size can be read
+        tmp_dl_file = tmp_path / "_dl_tmp.pdf"
+        tmp_dl_file.write_bytes(b"PDF content")
 
         # Simulate expect_download context manager
         mock_dl = MagicMock()
         mock_dl.save_as = MagicMock()
+        mock_dl.path.return_value = str(tmp_dl_file)
         download_cm = MagicMock()
         download_cm.__enter__ = MagicMock(return_value=download_cm)
         download_cm.__exit__  = MagicMock(return_value=False)
@@ -942,17 +944,16 @@ class TestPhase2BrowserAgentMethods:
 
         result = ba.download_file("https://example.com/file.pdf", save_path)
         page.evaluate.assert_called_once()
-        import os as _os
         workspace = _os.path.realpath(str(tmp_path))
         resolved  = _os.path.realpath(save_path)
         expected_safe = _os.path.join(workspace, _os.path.relpath(resolved, workspace))
         mock_dl.save_as.assert_called_once_with(expected_safe)
         assert result["url"] == "https://example.com/file.pdf"
         assert result["save_path"] == expected_safe
-        # size comes from the real file we created
+        # size read from the Playwright temp file
         assert result["size_bytes"] == 11
 
-    def test_download_file_zero_size_when_file_absent(self, tmp_path, monkeypatch) -> None:
+    def test_download_file_zero_size_when_tmp_absent(self, tmp_path, monkeypatch) -> None:
         ba, page, ctx, pw = self._make_ba()
         import os as _os
         monkeypatch.setattr(_os, "getcwd", lambda: str(tmp_path))
@@ -960,6 +961,7 @@ class TestPhase2BrowserAgentMethods:
         save_path = str(tmp_path / "ghost.bin")
 
         mock_dl = MagicMock()
+        mock_dl.path.return_value = None   # Playwright returns None → size = 0
         download_cm = MagicMock()
         download_cm.__enter__ = MagicMock(return_value=download_cm)
         download_cm.__exit__  = MagicMock(return_value=False)
