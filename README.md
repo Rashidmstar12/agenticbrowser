@@ -1,7 +1,16 @@
-# Agentic Browser
+<div align="center">
+  <img src="assets/logo.svg" alt="Agentic Browser logo" width="120" height="120"/>
+  <h1>Agentic Browser</h1>
+  <p>A Chromium-based browser automation agent built on <a href="https://playwright.dev/python/">Playwright</a>.<br/>
+  Ships with a <strong>local interactive terminal</strong> and a <strong>REST API server</strong>, and solves the biggest practical problem with existing browser agents: <strong>hallucination in workflow planning</strong>.</p>
 
-A Chromium-based browser automation agent built on [Playwright](https://playwright.dev/python/).  
-It ships with two ways to use it — a **local interactive terminal** and a **REST API server** — and solves the biggest practical problem with existing browser agents: **hallucination in workflow planning**.
+  <!-- Badges -->
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white" alt="Python 3.9+"/></a>
+  <a href="https://playwright.dev/python/"><img src="https://img.shields.io/badge/playwright-chromium-orange?logo=playwright&logoColor=white" alt="Playwright"/></a>
+  <a href="https://fastapi.tiangolo.com/"><img src="https://img.shields.io/badge/FastAPI-REST%20server-009688?logo=fastapi&logoColor=white" alt="FastAPI"/></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"/></a>
+  <a href="https://github.com/Rashidmstar12/agenticbrowser/actions"><img src="https://img.shields.io/github/actions/workflow/status/Rashidmstar12/agenticbrowser/ci.yml?label=CI&logo=github" alt="CI status"/></a>
+</div>
 
 ---
 
@@ -60,29 +69,13 @@ It ships with two ways to use it — a **local interactive terminal** and a **RE
 
 ## 2. Architecture overview
 
-```
-┌─────────────────────────────────────────────────────┐
-│                   Your code / CLI                   │
-└────────────────────┬────────────────────────────────┘
-                     │
-         ┌───────────▼───────────┐
-         │      TaskPlanner      │  intent → validated steps → execution
-         │  (task_planner.py)    │
-         └──────┬──────────┬─────┘
-                │          │
-    ┌───────────▼──┐   ┌───▼──────────┐
-    │ BrowserAgent │   │ SystemTools  │
-    │(browser_agent│   │(system_tools │
-    │    .py)      │   │    .py)      │
-    │  Playwright/ │   │ File I/O,    │
-    │  Chromium    │   │ Python exec, │
-    └──────────────┘   │ Shell exec   │
-                       └──────────────┘
+<div align="center">
+  <img src="assets/architecture.svg" alt="Architecture diagram" width="780"/>
+</div>
 
 Two entry points:
-  local_runner.py  →  interactive REPL + JSON task file runner
-  api_server.py    →  FastAPI REST server (port 8000)
-```
+- **`local_runner.py`** → interactive REPL + JSON task file runner
+- **`api_server.py`** → FastAPI REST server (port 8000)
 
 ---
 
@@ -387,18 +380,9 @@ curl -s -X POST http://localhost:8000/task/run \
 
 The planner converts a natural-language intent into a **minimal, validated, deterministic sequence of steps** and executes them.
 
-```
-intent  ──►  template match?  ──yes──►  hardcoded steps  ──►  validate  ──►  execute
-                │ no
-                ▼
-           LLM call (constrained prompt, JSON-only output)
-                │
-                ▼
-           validate against STEP_SCHEMA
-                │
-                ▼
-              execute
-```
+<div align="center">
+  <img src="assets/workflow.svg" alt="Task planner flow" width="820"/>
+</div>
 
 ### Built-in workflow templates
 
