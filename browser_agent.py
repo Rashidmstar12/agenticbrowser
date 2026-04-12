@@ -853,3 +853,258 @@ class BrowserAgent:
             except Exception:
                 tabs.append({"index": i, "url": "unknown", "title": "unknown", "active": page is self._page})
         return {"tabs": tabs, "count": len(tabs)}
+
+    # ------------------------------------------------------------------
+    # High-priority advanced interactions
+    # ------------------------------------------------------------------
+
+    def upload_file(self, selector: str, path: str) -> dict[str, Any]:
+        """
+        Set file(s) on a file ``<input type="file">`` element.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector targeting the file input element.
+        path:
+            Absolute path to the file to upload.  Multiple files can be
+            supplied as a pipe-separated string (``"a.txt|b.txt"``).
+
+        Returns
+        -------
+        dict
+            ``{"selector": ..., "uploaded": ..., "ok": True}``
+        """
+        files: Any = path.split("|") if "|" in path else path
+        self.page.locator(selector).set_input_files(files)
+        return {"selector": selector, "uploaded": path, "ok": True}
+
+    def download_file(self, url: str, save_path: str) -> dict[str, Any]:
+        """
+        Navigate to *url* and save the triggered download to *save_path*.
+
+        This relies on the server responding with a ``Content-Disposition:
+        attachment`` header (or an equivalent download-triggering mechanism).
+        The browser navigates to *url* inside a ``expect_download`` context so
+        that the file is captured before the page changes.
+
+        Parameters
+        ----------
+        url:
+            Direct download URL.
+        save_path:
+            Absolute path where the downloaded file will be saved.
+
+        Returns
+        -------
+        dict
+            ``{"saved_to": ..., "filename": ..., "ok": True}``
+        """
+        with self.page.expect_download() as download_info:
+            self.page.goto(url, wait_until="domcontentloaded")
+        download = download_info.value
+        download.save_as(save_path)
+        return {"saved_to": save_path, "filename": download.suggested_filename, "ok": True}
+
+    def drag_and_drop(self, source_selector: str, target_selector: str) -> dict[str, Any]:
+        """
+        Drag the element matching *source_selector* and drop it on
+        *target_selector*.
+
+        Parameters
+        ----------
+        source_selector:
+            CSS selector of the element to drag.
+        target_selector:
+            CSS selector of the drop target.
+
+        Returns
+        -------
+        dict
+            ``{"source": ..., "target": ..., "ok": True}``
+        """
+        self.page.drag_and_drop(source_selector, target_selector)
+        return {"source": source_selector, "target": target_selector, "ok": True}
+
+    def right_click(self, selector: str) -> dict[str, Any]:
+        """
+        Right-click (secondary/context-menu click) on the element matching
+        *selector*.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector of the target element.
+
+        Returns
+        -------
+        dict
+            ``{"selector": ..., "ok": True}``
+        """
+        self.page.click(selector, button="right")
+        return {"selector": selector, "ok": True}
+
+    def double_click(self, selector: str) -> dict[str, Any]:
+        """
+        Double-click on the element matching *selector*.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector of the target element.
+
+        Returns
+        -------
+        dict
+            ``{"selector": ..., "ok": True}``
+        """
+        self.page.dblclick(selector)
+        return {"selector": selector, "ok": True}
+
+    def get_element_rect(self, selector: str) -> dict[str, Any]:
+        """
+        Return the bounding-box (position + dimensions) of the first element
+        matching *selector*.
+
+        Parameters
+        ----------
+        selector:
+            CSS selector of the target element.
+
+        Returns
+        -------
+        dict
+            ``{"x": ..., "y": ..., "width": ..., "height": ..., "selector": ...}``
+
+        Raises
+        ------
+        RuntimeError
+            If the element is not found or not currently visible.
+        """
+        box = self.page.locator(selector).first.bounding_box()
+        if box is None:
+            raise RuntimeError(
+                f"Element not found or not visible: {selector!r}. "
+                "Ensure the element is in the viewport."
+            )
+        return {
+            "x":        box["x"],
+            "y":        box["y"],
+            "width":    box["width"],
+            "height":   box["height"],
+            "selector": selector,
+        }
+
+    def set_network_intercept(self, url_pattern: str, action: str = "abort") -> dict[str, Any]:
+        """
+        Intercept all future requests whose URL matches *url_pattern*.
+
+        Parameters
+        ----------
+        url_pattern:
+            Glob pattern (e.g. ``"**/*.png"``), URL substring, or full URL.
+            Playwright glob syntax: ``*`` matches any characters except ``/``;
+            ``**`` matches any characters including ``/``.
+        action:
+            What to do with matching requests:
+            - ``"abort"`` — block the request entirely (default).
+            - ``"continue"`` — let the request through unchanged (useful to
+              remove a previously set abort rule while leaving routing active).
+
+        Returns
+        -------
+        dict
+            ``{"url_pattern": ..., "action": ..., "ok": True}``
+        """
+        if action not in ("abort", "continue"):
+            raise ValueError(f"action must be 'abort' or 'continue', got {action!r}")
+
+        if action == "abort":
+            def _abort_handler(route: Any) -> None:
+                route.abort()
+            self.page.route(url_pattern, _abort_handler)
+        else:
+            def _continue_handler(route: Any) -> None:
+                route.continue_()
+            self.page.route(url_pattern, _continue_handler)
+
+        if not hasattr(self, "_intercept_patterns"):
+            self._intercept_patterns: list[str] = []
+        self._intercept_patterns.append(url_pattern)
+        return {"url_pattern": url_pattern, "action": action, "ok": True}
+
+    def clear_network_intercepts(self) -> dict[str, Any]:
+        """
+        Remove all network intercept routes previously set via
+        :meth:`set_network_intercept`.
+
+        Returns
+        -------
+        dict
+            ``{"cleared": N, "ok": True}``
+        """
+        count = len(getattr(self, "_intercept_patterns", []))
+        try:
+            self.page.unroute_all()
+        except AttributeError:
+            # Playwright < 1.32 does not have unroute_all(); fall back to
+            # unrouting each pattern individually.
+            for pattern in getattr(self, "_intercept_patterns", []):
+                try:
+                    self.page.unroute(pattern)
+                except Exception:
+                    pass
+        if hasattr(self, "_intercept_patterns"):
+            self._intercept_patterns.clear()
+        return {"cleared": count, "ok": True}
+
+    def set_viewport(self, width: int, height: int) -> dict[str, Any]:
+        """
+        Resize the browser viewport.
+
+        Parameters
+        ----------
+        width:
+            New viewport width in pixels.
+        height:
+            New viewport height in pixels.
+
+        Returns
+        -------
+        dict
+            ``{"width": ..., "height": ..., "ok": True}``
+        """
+        self.page.set_viewport_size({"width": width, "height": height})
+        return {"width": width, "height": height, "ok": True}
+
+    def set_geolocation(self, latitude: float, longitude: float, accuracy: float = 10.0) -> dict[str, Any]:
+        """
+        Override the browser's geolocation with *latitude* / *longitude*.
+
+        The geolocation permission is automatically granted for the current
+        origin so that ``navigator.geolocation.getCurrentPosition()`` returns
+        the spoofed coordinates immediately.
+
+        Parameters
+        ----------
+        latitude:
+            Latitude in decimal degrees (``-90`` to ``90``).
+        longitude:
+            Longitude in decimal degrees (``-180`` to ``180``).
+        accuracy:
+            Accuracy radius in metres (default ``10``).
+
+        Returns
+        -------
+        dict
+            ``{"latitude": ..., "longitude": ..., "accuracy": ..., "ok": True}``
+        """
+        if not -90 <= latitude <= 90:
+            raise ValueError(f"latitude must be in [-90, 90], got {latitude}")
+        if not -180 <= longitude <= 180:
+            raise ValueError(f"longitude must be in [-180, 180], got {longitude}")
+        if self._context is None:
+            raise RuntimeError("Browser is not started. Call start() first.")
+        self._context.set_geolocation({"latitude": latitude, "longitude": longitude, "accuracy": accuracy})
+        self._context.grant_permissions(["geolocation"])
+        return {"latitude": latitude, "longitude": longitude, "accuracy": accuracy, "ok": True}

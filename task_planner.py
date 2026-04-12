@@ -201,6 +201,57 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
         "optional": {},
         "description": "Return info about all open tabs (index, url, title, active).",
     },
+    # ---- High-priority advanced interactions ----
+    "upload_file": {
+        "required": ["selector", "path"],
+        "optional": {},
+        "description": "Set file(s) on a <input type='file'> element. path is workspace-relative. Separate multiple files with '|'.",
+    },
+    "download_file": {
+        "required": ["url", "path"],
+        "optional": {},
+        "description": "Navigate to url and save the triggered download to a workspace-relative path.",
+    },
+    "drag_drop": {
+        "required": ["source", "target"],
+        "optional": {},
+        "description": "Drag the element matching source selector and drop it onto the target selector.",
+    },
+    "right_click": {
+        "required": ["selector"],
+        "optional": {},
+        "description": "Right-click (context-menu click) on the element matching selector.",
+    },
+    "double_click": {
+        "required": ["selector"],
+        "optional": {},
+        "description": "Double-click on the element matching selector.",
+    },
+    "get_rect": {
+        "required": ["selector"],
+        "optional": {},
+        "description": "Return the bounding box (x, y, width, height) of the first element matching selector.",
+    },
+    "set_network_intercept": {
+        "required": ["url_pattern"],
+        "optional": {"action": "abort"},
+        "description": "Intercept requests matching url_pattern. action: 'abort' (block) or 'continue' (pass through).",
+    },
+    "clear_network_intercepts": {
+        "required": [],
+        "optional": {},
+        "description": "Remove all network intercept routes set by set_network_intercept.",
+    },
+    "set_viewport": {
+        "required": ["width", "height"],
+        "optional": {},
+        "description": "Resize the browser viewport to width x height pixels.",
+    },
+    "set_geolocation": {
+        "required": ["latitude", "longitude"],
+        "optional": {"accuracy": 10.0},
+        "description": "Override the browser geolocation. latitude/longitude in decimal degrees.",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -1003,6 +1054,49 @@ class TaskPlanner:
 
         if action == "list_tabs":
             return agent.list_tabs()
+
+        # ---- High-priority advanced interactions ----
+
+        if action == "upload_file":
+            st = self._get_system_tools()
+            file_path = str(st.workspace / step["path"])
+            return agent.upload_file(step["selector"], file_path)
+
+        if action == "download_file":
+            st = self._get_system_tools()
+            save_path = str(st.workspace / step["path"])
+            return agent.download_file(step["url"], save_path)
+
+        if action == "drag_drop":
+            return agent.drag_and_drop(step["source"], step["target"])
+
+        if action == "right_click":
+            return agent.right_click(step["selector"])
+
+        if action == "double_click":
+            return agent.double_click(step["selector"])
+
+        if action == "get_rect":
+            return agent.get_element_rect(step["selector"])
+
+        if action == "set_network_intercept":
+            return agent.set_network_intercept(
+                step["url_pattern"],
+                action=step.get("action", "abort"),
+            )
+
+        if action == "clear_network_intercepts":
+            return agent.clear_network_intercepts()
+
+        if action == "set_viewport":
+            return agent.set_viewport(int(step["width"]), int(step["height"]))
+
+        if action == "set_geolocation":
+            return agent.set_geolocation(
+                float(step["latitude"]),
+                float(step["longitude"]),
+                accuracy=float(step.get("accuracy", 10.0)),
+            )
 
         # ---- System actions (file I/O + code execution) ----
 

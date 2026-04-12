@@ -165,6 +165,17 @@ COMMANDS: dict[str, str] = {
     "switch_tab":         "switch_tab <index>",
     "close_tab":          "close_tab [index]",
     "list_tabs":          "list_tabs",
+    # High-priority advanced interactions
+    "upload_file":        "upload_file <selector> <path>",
+    "download_file":      "download_file <url> <path>",
+    "drag_drop":          "drag_drop <source_selector> <target_selector>",
+    "right_click":        "right_click <selector>",
+    "double_click":       "double_click <selector>",
+    "get_rect":           "get_rect <selector>",
+    "set_network_intercept":   "set_network_intercept <url_pattern> [abort|continue]",
+    "clear_network_intercepts": "clear_network_intercepts",
+    "set_viewport":       "set_viewport <width> <height>",
+    "set_geolocation":    "set_geolocation <latitude> <longitude> [accuracy=10]",
     # Task planner commands
     "task":               "task <intent>  — plan + execute a natural-language task",
     "task_plan":          "task_plan <intent>  — preview the plan without executing",
@@ -385,6 +396,72 @@ def _dispatch(
             for tab in result["tabs"]:
                 marker = " ← active" if tab["active"] else ""
                 print(f"  [{tab['index']}] {tab['url']!r:50s}  {tab['title']!r}{marker}")
+            return result
+
+        # ---- High-priority advanced interactions ----
+
+        elif cmd == "upload_file":
+            selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            path     = parts[2] if len(parts) > 2 else input("  File path: ").strip()
+            if tools is not None:
+                path = str(tools.workspace / path)
+            result = agent.upload_file(selector, path)
+            print(f"  Uploaded: {path}")
+            return result
+
+        elif cmd == "download_file":
+            url      = parts[1] if len(parts) > 1 else input("  URL: ").strip()
+            path     = parts[2] if len(parts) > 2 else input("  Save path: ").strip()
+            if tools is not None:
+                path = str(tools.workspace / path)
+            result = agent.download_file(url, path)
+            print(f"  Saved to: {result['saved_to']}  ({result['filename']})")
+            return result
+
+        elif cmd == "drag_drop":
+            source = parts[1] if len(parts) > 1 else input("  Source selector: ").strip()
+            target = parts[2] if len(parts) > 2 else input("  Target selector: ").strip()
+            return agent.drag_and_drop(source, target)
+
+        elif cmd == "right_click":
+            selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            return agent.right_click(selector)
+
+        elif cmd == "double_click":
+            selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            return agent.double_click(selector)
+
+        elif cmd == "get_rect":
+            selector = parts[1] if len(parts) > 1 else input("  Selector: ").strip()
+            result = agent.get_element_rect(selector)
+            print(f"  x={result['x']}  y={result['y']}  width={result['width']}  height={result['height']}")
+            return result
+
+        elif cmd == "set_network_intercept":
+            url_pattern = parts[1] if len(parts) > 1 else input("  URL pattern: ").strip()
+            action      = parts[2] if len(parts) > 2 else "abort"
+            result = agent.set_network_intercept(url_pattern, action=action)
+            print(f"  Intercept set: {url_pattern!r}  action={action}")
+            return result
+
+        elif cmd == "clear_network_intercepts":
+            result = agent.clear_network_intercepts()
+            print(f"  Cleared {result['cleared']} intercept(s)")
+            return result
+
+        elif cmd == "set_viewport":
+            width  = int(parts[1]) if len(parts) > 1 else int(input("  Width: ").strip())
+            height = int(parts[2]) if len(parts) > 2 else int(input("  Height: ").strip())
+            result = agent.set_viewport(width, height)
+            print(f"  Viewport set to {width}x{height}")
+            return result
+
+        elif cmd == "set_geolocation":
+            latitude  = float(parts[1]) if len(parts) > 1 else float(input("  Latitude: ").strip())
+            longitude = float(parts[2]) if len(parts) > 2 else float(input("  Longitude: ").strip())
+            accuracy  = float(parts[3]) if len(parts) > 3 else 10.0
+            result = agent.set_geolocation(latitude, longitude, accuracy=accuracy)
+            print(f"  Geolocation set: lat={latitude}  lng={longitude}  acc={accuracy}m")
             return result
 
         # ---- Task planner ----
