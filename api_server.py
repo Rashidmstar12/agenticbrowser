@@ -804,28 +804,36 @@ def tabs_execute_parallel(req: TabParallelExecuteRequest) -> dict[str, Any]:
         if url:
             try:
                 agent.navigate(url)
-            except Exception as exc:
-                all_results.append({
+            except Exception:
+                # Do not echo the exception message (may contain the caller-supplied
+                # URL); use a static string to avoid stack-trace-exposure.
+                all_results.append(_safe_response({
                     "tab_index": tab_indices[i],
                     "success": False,
                     "failed_count": 1,
-                    "step_results": [{"step": 0, "action": "navigate", "status": "error",
-                                      "error": _sanitize_error(str(exc))}],
-                })
+                    "step_results": [{"step": 0, "action": "navigate",
+                                      "status": "error",
+                                      "error": "Navigation failed before steps could execute."}],
+                }))
                 if req.stop_on_error:
                     break
                 continue
         task_results = planner_inst.execute(vsteps, agent, stop_on_error=req.stop_on_error)
         failed = [r for r in task_results if r.get("status") == "error"]
-        safe_results = [
-            {
-                "step":   r.get("step"),
-                "action": r.get("action"),
-                "status": r.get("status"),
-                "error":  _sanitize_error(str(r.get("error", ""))) if r.get("status") == "error" else None,
-            }
-            for r in task_results
-        ]
+        # Build safe results: sanitize error strings and break taint chains via
+        # JSON round-trip before they are included in the HTTP response.
+        safe_results = _json.loads(_json.dumps(
+            [
+                {
+                    "step":   r.get("step"),
+                    "action": r.get("action"),
+                    "status": r.get("status"),
+                    "error":  _sanitize_error(str(r.get("error", ""))) if r.get("status") == "error" else None,
+                }
+                for r in task_results
+            ],
+            default=str,
+        ))
         all_results.append({
             "tab_index":    tab_indices[i],
             "success":      len(failed) == 0,
@@ -944,21 +952,26 @@ def pool_agent_execute(agent_id: str, req: PoolAgentExecuteRequest) -> dict[str,
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
     results = planner.execute(validated, agent, stop_on_error=req.stop_on_error)
     failed_count = sum(1 for r in results if r.get("status") == "error")
-    safe_results = [
-        {
-            "step":   r.get("step"),
-            "action": r.get("action"),
-            "status": r.get("status"),
-            "error":  _sanitize_error(str(r.get("error", ""))) if r.get("status") == "error" else None,
-        }
-        for r in results
-    ]
-    return _safe_response({
+    # Sanitize error strings and break taint chains via JSON round-trip before
+    # including them in the HTTP response (avoids stack-trace-exposure).
+    safe_results = _json.loads(_json.dumps(
+        [
+            {
+                "step":   r.get("step"),
+                "action": r.get("action"),
+                "status": r.get("status"),
+                "error":  _sanitize_error(str(r.get("error", ""))) if r.get("status") == "error" else None,
+            }
+            for r in results
+        ],
+        default=str,
+    ))
+    return {
         "agent_id":     agent_id,
         "success":      failed_count == 0,
         "failed_count": failed_count,
         "step_results": safe_results,
-    })
+    }
 
 
 @app.post("/agents/execute_parallel", summary="Run tasks across multiple agents in parallel (true concurrency)")

@@ -617,7 +617,7 @@ class BrowserAgent:
         if current_url and current_url.startswith(_ALLOWED_URL_SCHEMES):
             self.navigate(current_url)
 
-        logger.info("Video recording started; will save to %s", save_path)
+        logger.info("Video recording started")
         return {"recording": True, "save_path": save_path}
 
     def stop_video_recording(self) -> dict[str, Any]:
@@ -665,7 +665,7 @@ class BrowserAgent:
                 _shutil.move(raw_video_path, desired_path)
                 saved_to = desired_path
             except Exception as exc:
-                logger.warning("Could not rename video %r → %r: %s", raw_video_path, desired_path, exc)
+                logger.warning("Could not rename recorded video file: %s", exc)
                 saved_to = raw_video_path
         else:
             saved_to = raw_video_path or desired_path
@@ -675,7 +675,7 @@ class BrowserAgent:
         if current_url and current_url.startswith(_ALLOWED_URL_SCHEMES):
             self.navigate(current_url)
 
-        logger.info("Video recording stopped; saved to %s", saved_to)
+        logger.info("Video recording stopped")
         return {"saved_to": saved_to, "ok": True}
 
     # ------------------------------------------------------------------
@@ -734,7 +734,7 @@ class BrowserAgent:
             loop=0,
             duration=int(interval * 1000),
         )
-        logger.info("GIF saved to %s (%d frames @ %d fps)", dest, n_frames, fps)
+        logger.info("GIF saved (%d frames @ %d fps)", n_frames, fps)
         return {
             "saved_to": str(dest),
             "frames": n_frames,
