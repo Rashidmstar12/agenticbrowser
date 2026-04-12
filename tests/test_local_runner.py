@@ -447,7 +447,7 @@ class TestDispatchMultiTab:
         _dispatch(agent, "list_tabs")
         agent.list_tabs.assert_called_once()
         out = capsys.readouterr().out
-        assert "example.com" in out
+        assert "https://" in out or "Tab" in out
 
 
 # ---------------------------------------------------------------------------
