@@ -942,10 +942,13 @@ class TestPhase2BrowserAgentMethods:
 
         result = ba.download_file("https://example.com/file.pdf", save_path)
         page.evaluate.assert_called_once()
-        resolved = _os.path.realpath(save_path)
-        mock_dl.save_as.assert_called_once_with(resolved)
+        import os as _os
+        workspace = _os.path.realpath(str(tmp_path))
+        resolved  = _os.path.realpath(save_path)
+        expected_safe = _os.path.join(workspace, _os.path.relpath(resolved, workspace))
+        mock_dl.save_as.assert_called_once_with(expected_safe)
         assert result["url"] == "https://example.com/file.pdf"
-        assert result["save_path"] == resolved
+        assert result["save_path"] == expected_safe
         # size comes from the real file we created
         assert result["size_bytes"] == 11
 
