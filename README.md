@@ -524,6 +524,7 @@ export OPENAI_MODEL=gpt-4o-mini   # optional, default: gpt-4o-mini
 | `BROWSER_WORKSPACE` | `./workspace` | Root directory for all file operations |
 | `BROWSER_API_KEY` | — | When set, all API server requests must include `X-API-Key: <value>` header (or `?api_key=<value>` for WebSocket connections). Omit to run without authentication (local/trusted-network use only). |
 | `BROWSER_CORS_ORIGINS` | — | Comma-separated list of allowed CORS origins, e.g. `https://app.example.com,https://dev.example.com`. Use `*` for development only. When unset, no CORS headers are added (safest default). |
+| `BROWSER_RATE_LIMIT` | — | Per-IP request rate limit using `slowapi` format, e.g. `100/minute`, `10/second`, `1000/hour`. Clients exceeding the limit receive **429 Too Many Requests**. When unset, no rate limiting is applied. |
 
 ---
 

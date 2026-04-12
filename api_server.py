@@ -24,6 +24,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.middleware import SlowAPIMiddleware
+    from slowapi.util import get_remote_address
+    _SLOWAPI_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _SLOWAPI_AVAILABLE = False
+
 from browser_agent import BrowserAgent
 from doctor import run_checks
 from skills import SkillLoadError, get_default_registry
@@ -170,6 +179,26 @@ if _cors_origins:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+# ---------------------------------------------------------------------------
+# Rate limiting — configured via BROWSER_RATE_LIMIT env var.
+#
+# Set BROWSER_RATE_LIMIT to a limit string, e.g.:
+#   BROWSER_RATE_LIMIT=100/minute
+#   BROWSER_RATE_LIMIT=10/second
+#   BROWSER_RATE_LIMIT=1000/hour
+#
+# Limits are applied per client IP address (X-Forwarded-For aware).
+# When the variable is unset no rate limiting is applied.
+# Requires the `slowapi` package (included in requirements.txt).
+# Clients that exceed the limit receive HTTP 429 Too Many Requests.
+# ---------------------------------------------------------------------------
+_rate_limit_str = os.environ.get("BROWSER_RATE_LIMIT", "").strip()
+if _rate_limit_str and _SLOWAPI_AVAILABLE:
+    _limiter = Limiter(key_func=get_remote_address, default_limits=[_rate_limit_str])
+    app.state.limiter = _limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
 
 # ---------------------------------------------------------------------------
 # Request / Response models — session
