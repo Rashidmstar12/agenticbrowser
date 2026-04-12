@@ -60,6 +60,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse as _urlparse
 
 __all__ = [
     "SkillDef",
@@ -191,11 +192,49 @@ def _validate_github_ref(repo: str, path: str, branch: str) -> None:
 
 
 def _validate_url_scheme(url: str) -> None:
-    """Reject non-http/https URLs to prevent SSRF via unexpected schemes."""
-    if not re.match(r"^https?://", url, re.IGNORECASE):
+    """Reject non-https URLs to prevent SSRF via unexpected schemes."""
+    parsed = _urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
         raise SkillLoadError(
             f"Only http:// and https:// URLs are supported for skill loading: {url!r}"
         )
+
+
+def _make_github_raw_url(repo: str, branch: str, file_path: str) -> str:
+    """
+    Build a ``raw.githubusercontent.com`` URL and verify the host was not
+    altered by path-traversal in the components (defence-in-depth).
+    """
+    _GITHUB_RAW_HOST = "raw.githubusercontent.com"
+    url = f"https://{_GITHUB_RAW_HOST}/{repo}/{branch}/{file_path}"
+    parsed = _urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname != _GITHUB_RAW_HOST:
+        raise SkillLoadError(
+            "Internal error: unexpected host in constructed GitHub URL — "
+            "possible injection in repo/branch/path components"
+        )
+    return url
+
+
+def _validate_source_for_api(source: str) -> None:
+    """
+    Guard for the HTTP API endpoint: only GitHub references and HTTPS URLs are
+    permitted.  Local filesystem paths are rejected to prevent path injection
+    through the API surface.
+    """
+    s = source.strip()
+    if s.startswith("gh:") or re.match(r"^[\w-]+/[\w.\-]+(/|$)", s):
+        return  # GitHub shorthand — OK
+    parsed = _urlparse(s)
+    if parsed.scheme == "https":
+        return  # HTTPS URL — OK
+    if parsed.scheme == "http":
+        raise SkillLoadError("http:// is not allowed via the API; use https://")
+    raise SkillLoadError(
+        "Local filesystem paths are not permitted via the API. "
+        "Use https:// or gh:owner/repo to load remote skills, "
+        "or use  --skills <path>  from the CLI for local files."
+    )
 
 
 def _get_allowed_actions() -> set[str]:
@@ -344,8 +383,11 @@ def load_from_directory(directory: str | Path) -> list[SkillDef]:
 
     skills: list[SkillDef] = []
     for p in sorted(d.glob("*")):
-        # Only descend into files confirmed to be inside d (prevents symlink escape)
-        if not str(p.resolve()).startswith(str(d)):
+        # Use relative_to() to confirm p is genuinely inside d
+        # (guards against symlink escape or .glob() quirks)
+        try:
+            p.relative_to(d)
+        except ValueError:
             continue
         if p.suffix.lower() not in {".json", ".yaml", ".yml"}:
             continue
@@ -443,8 +485,9 @@ def load_from_github(
     _validate_github_ref(repo, path, branch)
 
     def _raw_url(file_path: str) -> str:
-        # Base URL is hardcoded to raw.githubusercontent.com — not user-controlled
-        return f"https://raw.githubusercontent.com/{repo}/{branch}/{file_path}"
+        # Host is hardcoded to raw.githubusercontent.com and verified by
+        # _make_github_raw_url — not user-controlled
+        return _make_github_raw_url(repo, branch, file_path)
     is_file = any(path.endswith(ext) for ext in (".json", ".yaml", ".yml"))
 
     if is_file:

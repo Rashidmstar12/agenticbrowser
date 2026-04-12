@@ -798,7 +798,18 @@ def skills_load(req: SkillLoadRequest) -> dict[str, Any]:
     """
     Load one or more skills from *source* and register them in the default
     registry.  Existing skills with the same name are overwritten.
+
+    Only ``https://`` URLs and ``gh:owner/repo`` GitHub references are accepted
+    via the API.  To load local filesystem skills, use the CLI
+    ``--skills <path>`` flag.
     """
+    from skills import _validate_source_for_api
+
+    try:
+        _validate_source_for_api(req.source)
+    except SkillLoadError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
     reg = get_default_registry()
     try:
         loaded = reg.load_from_source(req.source)
