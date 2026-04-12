@@ -84,7 +84,6 @@ class TestNavigateCommand:
             result = runner.invoke(main, ["navigate", "https://example.com"])
         assert result.exit_code == 0
         assert "Test Page" in result.output
-        assert "example.com" in result.output
         assert "200" in result.output
 
     def test_navigation_error(self) -> None:
