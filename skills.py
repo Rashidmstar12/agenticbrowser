@@ -415,8 +415,18 @@ def load_from_url(url: str, *, timeout: int = 15) -> list[SkillDef]:
     list[SkillDef]
     """
     _validate_url_scheme(url)
+    # Guard against common SSRF targets: reject raw IPv4/IPv6 addresses as hosts.
+    # Legitimate skill registries always use domain names.
+    _parsed_host = _urlparse(url)
+    if not _parsed_host.hostname or re.fullmatch(
+        r"(\d{1,3}\.){3}\d{1,3}|\[?[0-9a-fA-F:]+]?",
+        _parsed_host.hostname,
+    ):
+        raise SkillLoadError(
+            f"Skill URL host must be a domain name, not a raw IP address: {url!r}"
+        )
     try:
-        req = urllib.request.Request(  # lgtm[py/full-ssrf]
+        req = urllib.request.Request(
             url,
             headers={"User-Agent": "agenticbrowser-skills/1.0"},
         )
