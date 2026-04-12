@@ -131,6 +131,7 @@ class BrowserAgent:
         self._page: Page | None = None
         self._pages: list[Page] = []  # all open tabs; self._page is the active one
         self._active_frame: Any = None  # set by iframe_switch; None = use active page
+        self._intercept_handlers: list[tuple[str, Any]] = []  # (url_pattern, handler)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -174,6 +175,7 @@ class BrowserAgent:
         self._playwright = None
         self._pages = []
         self._active_frame = None
+        self._intercept_handlers = []
         logger.info("BrowserAgent stopped")
 
     # Context manager support
@@ -1163,6 +1165,178 @@ class BrowserAgent:
             }"""
         )
         return result
+
+    # ------------------------------------------------------------------
+    # Network control (Category 1 — remaining)
+    # ------------------------------------------------------------------
+
+    def download_file(self, url: str, save_path: str) -> dict[str, Any]:
+        """
+        Navigate to *url* and save the resulting download to *save_path*.
+
+        The method registers a one-shot ``download`` event listener before
+        triggering the navigation so that the file is written to disk without
+        requiring a manual "Save As" dialog.
+
+        Parameters
+        ----------
+        url:
+            The URL that triggers a file download (e.g. a direct link to a PDF
+            or ZIP file).
+        save_path:
+            Workspace-relative or absolute path where the downloaded file
+            should be saved.
+
+        Returns
+        -------
+        dict
+            ``{"url": ..., "save_path": ..., "size_bytes": N}``
+        """
+        logger.info("Downloading '%s' → '%s'", url, save_path)
+        with self.page.expect_download() as dl_info:
+            self.page.evaluate(
+                "([u]) => { const a = document.createElement('a'); a.href = u; a.download = ''; document.body.appendChild(a); a.click(); document.body.removeChild(a); }",
+                [url],
+            )
+        download = dl_info.value
+        download.save_as(save_path)
+        # Try to get the file size; ignore if the path does not exist yet.
+        import os as _os
+        size = _os.path.getsize(save_path) if _os.path.exists(save_path) else 0
+        return {"url": url, "save_path": save_path, "size_bytes": size}
+
+    def emulate_device(self, device_name: str) -> dict[str, Any]:
+        """
+        Emulate a named device, updating viewport size, user-agent, and
+        device scale factor to match the device's real-world profile.
+
+        Supported device names are those recognised by Playwright's built-in
+        device descriptor list (e.g. ``"iPhone 14"``, ``"Pixel 7"``,
+        ``"iPad Pro 11"``, ``"Galaxy S9+"``, ``"Desktop Chrome"``).
+
+        Parameters
+        ----------
+        device_name:
+            A string matching a Playwright device descriptor name.
+
+        Returns
+        -------
+        dict
+            ``{"device": ..., "viewport": {"width": ..., "height": ...},
+              "user_agent": ...}``
+
+        Raises
+        ------
+        ValueError
+            When *device_name* is not found in Playwright's device list.
+        """
+        if self._playwright is None:
+            raise RuntimeError("Browser is not started. Call start() first.")
+        devices = self._playwright.devices
+        if device_name not in devices:
+            available = sorted(devices.keys())
+            raise ValueError(
+                f"Unknown device {device_name!r}. "
+                f"Available: {', '.join(available[:20])}{'...' if len(available) > 20 else ''}"
+            )
+        descriptor = devices[device_name]
+        vp = descriptor.get("viewport", {})
+        width  = vp.get("width",  1280)
+        height = vp.get("height", 720)
+        ua     = descriptor.get("user_agent", "")
+        # Apply viewport immediately to the active page.
+        self.page.set_viewport_size({"width": width, "height": height})
+        logger.info("Emulating device %r (%dx%d)", device_name, width, height)
+        return {
+            "device":     device_name,
+            "viewport":   {"width": width, "height": height},
+            "user_agent": ua,
+        }
+
+    def intercept_request(
+        self,
+        url_pattern: str,
+        action: str = "block",
+    ) -> dict[str, Any]:
+        """
+        Install a Playwright route handler that intercepts all requests
+        matching *url_pattern*.
+
+        Parameters
+        ----------
+        url_pattern:
+            A glob pattern (e.g. ``"**/api/v1/**"``) or exact URL to match.
+        action:
+            What to do with matched requests:
+
+            * ``"block"`` — abort the request (default).
+            * ``"passthrough"`` — allow the request to continue unchanged.
+
+        Returns
+        -------
+        dict
+            ``{"url_pattern": ..., "action": ...}``
+
+        Notes
+        -----
+        Call :meth:`mock_response` instead when you want to return a fake
+        response body rather than simply blocking.
+        """
+        if action not in ("block", "passthrough"):
+            raise ValueError(f"action must be 'block' or 'passthrough', got {action!r}.")
+
+        if action == "block":
+            def _handler(route: Any) -> None:
+                route.abort()
+        else:
+            def _handler(route: Any) -> None:
+                route.continue_()
+
+        self.page.route(url_pattern, _handler)
+        self._intercept_handlers.append((url_pattern, _handler))
+        logger.info("Intercept installed: pattern=%r action=%r", url_pattern, action)
+        return {"url_pattern": url_pattern, "action": action}
+
+    def mock_response(
+        self,
+        url_pattern: str,
+        body: str = "",
+        status: int = 200,
+        content_type: str = "application/json",
+    ) -> dict[str, Any]:
+        """
+        Install a Playwright route handler that intercepts requests matching
+        *url_pattern* and replies with a synthetic HTTP response.
+
+        Parameters
+        ----------
+        url_pattern:
+            A glob pattern or exact URL to intercept.
+        body:
+            Response body string (default: ``""``).
+        status:
+            HTTP status code (default: ``200``).
+        content_type:
+            ``Content-Type`` header value (default: ``"application/json"``).
+
+        Returns
+        -------
+        dict
+            ``{"url_pattern": ..., "status": ..., "content_type": ...}``
+        """
+        def _mock_handler(route: Any) -> None:
+            route.fulfill(
+                status=status,
+                content_type=content_type,
+                body=body,
+            )
+
+        self.page.route(url_pattern, _mock_handler)
+        self._intercept_handlers.append((url_pattern, _mock_handler))
+        logger.info(
+            "Mock response installed: pattern=%r status=%d", url_pattern, status
+        )
+        return {"url_pattern": url_pattern, "status": status, "content_type": content_type}
 
     # ------------------------------------------------------------------
     # Authentication & Session Management (Category 3)

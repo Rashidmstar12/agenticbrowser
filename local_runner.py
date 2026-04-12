@@ -160,6 +160,10 @@ COMMANDS: dict[str, str] = {
     "block_resource":     "block_resource [image,stylesheet,font]",
     "iframe_switch":      "iframe_switch <selector>",
     "iframe_exit":        "iframe_exit",
+    "download_file":      "download_file <url> <save_path>",
+    "emulate_device":     "emulate_device <device_name>  (e.g. 'iPhone 14', 'Pixel 7')",
+    "intercept_request":  "intercept_request <url_pattern> [block|passthrough]",
+    "mock_response":      "mock_response <url_pattern> [body={}] [status=200]",
     # Smart extraction / assertion / wait_text
     "extract_links":      "extract_links [selector=a] [limit=100]",
     "extract_table":      "extract_table [selector=table] [table_index=0]",
@@ -370,6 +374,36 @@ def _dispatch(
         elif cmd == "iframe_exit":
             result = agent.iframe_exit()
             print(f"  Exited iframe; now on: {result['frame_url']}")
+            return result
+
+        elif cmd == "download_file":
+            url       = parts[1] if len(parts) > 1 else input("  URL: ").strip()
+            save_path = parts[2] if len(parts) > 2 else input("  Save path: ").strip()
+            result    = agent.download_file(url, save_path)
+            print(f"  Downloaded {result['size_bytes']} bytes → {result['save_path']}")
+            return result
+
+        elif cmd == "emulate_device":
+            device_name = " ".join(parts[1:]) if len(parts) > 1 else input("  Device name: ").strip()
+            result      = agent.emulate_device(device_name)
+            vp = result["viewport"]
+            print(f"  Emulating {result['device']!r} ({vp['width']}x{vp['height']})")
+            return result
+
+        elif cmd == "intercept_request":
+            url_pattern = parts[1] if len(parts) > 1 else input("  URL pattern: ").strip()
+            action      = parts[2] if len(parts) > 2 else "block"
+            result      = agent.intercept_request(url_pattern, action=action)
+            print(f"  Intercept installed: {result['url_pattern']!r} → {result['action']}")
+            return result
+
+        elif cmd == "mock_response":
+            url_pattern  = parts[1] if len(parts) > 1 else input("  URL pattern: ").strip()
+            body         = parts[2] if len(parts) > 2 else input("  Body (JSON string): ").strip()
+            status       = int(parts[3]) if len(parts) > 3 else 200
+            content_type = parts[4] if len(parts) > 4 else "application/json"
+            result       = agent.mock_response(url_pattern, body=body, status=status, content_type=content_type)
+            print(f"  Mock installed: {result['url_pattern']!r} → HTTP {result['status']}")
             return result
 
         # ---- Smart extraction / assertion / wait_text ----

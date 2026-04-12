@@ -304,6 +304,27 @@ class IframeSwitchRequest(BaseModel):
     selector: str = Field(..., description="CSS selector of the <iframe> element to switch into")
 
 
+class DownloadFileRequest(BaseModel):
+    url: str = Field(..., description="URL that triggers the file download")
+    save_path: str = Field(..., description="Workspace-relative or absolute path to save the file")
+
+
+class EmulateDeviceRequest(BaseModel):
+    device_name: str = Field(..., description="Playwright device name, e.g. 'iPhone 14', 'Pixel 7'")
+
+
+class InterceptRequestRequest(BaseModel):
+    url_pattern: str = Field(..., description="Glob URL pattern to intercept, e.g. '**/api/**'")
+    action: str = Field("block", description="What to do with matched requests: 'block' or 'passthrough'")
+
+
+class MockResponseRequest(BaseModel):
+    url_pattern: str = Field(..., description="Glob URL pattern to intercept")
+    body: str = Field("", description="Synthetic response body string")
+    status: int = Field(200, description="HTTP status code for the synthetic response")
+    content_type: str = Field("application/json", description="Content-Type header for the response")
+
+
 # ---------------------------------------------------------------------------
 # Request models — data extraction (Category 2)
 # ---------------------------------------------------------------------------
@@ -728,6 +749,24 @@ def block_resource(req: BlockResourceRequest) -> dict[str, Any]:
     return get_agent().block_resource(types=req.types)
 
 
+@app.post("/intercept_request", summary="Intercept network requests matching a URL pattern")
+def intercept_request(req: InterceptRequestRequest) -> dict[str, Any]:
+    try:
+        return get_agent().intercept_request(req.url_pattern, action=req.action)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+
+@app.post("/mock_response", summary="Stub a URL pattern with a synthetic HTTP response")
+def mock_response(req: MockResponseRequest) -> dict[str, Any]:
+    return get_agent().mock_response(
+        req.url_pattern,
+        body=req.body,
+        status=req.status,
+        content_type=req.content_type,
+    )
+
+
 @app.post("/iframe/switch", summary="Switch interaction context to an iframe")
 def iframe_switch(req: IframeSwitchRequest) -> dict[str, Any]:
     return get_agent().iframe_switch(req.selector)
@@ -736,6 +775,19 @@ def iframe_switch(req: IframeSwitchRequest) -> dict[str, Any]:
 @app.post("/iframe/exit", summary="Exit the iframe context and return to the top-level page")
 def iframe_exit() -> dict[str, Any]:
     return get_agent().iframe_exit()
+
+
+@app.post("/download_file", summary="Trigger a browser download and save to workspace")
+def download_file(req: DownloadFileRequest) -> dict[str, Any]:
+    return get_agent().download_file(req.url, req.save_path)
+
+
+@app.post("/emulate_device", summary="Emulate a named device (viewport, user-agent, DPR)")
+def emulate_device(req: EmulateDeviceRequest) -> dict[str, Any]:
+    try:
+        return get_agent().emulate_device(req.device_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
 
 
 # ---------------------------------------------------------------------------

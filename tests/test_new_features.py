@@ -805,3 +805,264 @@ class TestFrameProperty:
         ba._page         = mock_page
         ba._active_frame = mock_frame
         assert ba._frame is mock_frame
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: download_file, emulate_device, intercept_request, mock_response
+# ---------------------------------------------------------------------------
+
+class TestPhase2StepSchema:
+    """All 4 new actions present in STEP_SCHEMA with correct required keys."""
+
+    def test_download_file_schema(self) -> None:
+        assert "download_file" in STEP_SCHEMA
+        assert "url" in STEP_SCHEMA["download_file"]["required"]
+        assert "save_path" in STEP_SCHEMA["download_file"]["required"]
+
+    def test_emulate_device_schema(self) -> None:
+        assert "emulate_device" in STEP_SCHEMA
+        assert "device_name" in STEP_SCHEMA["emulate_device"]["required"]
+
+    def test_intercept_request_schema(self) -> None:
+        assert "intercept_request" in STEP_SCHEMA
+        assert "url_pattern" in STEP_SCHEMA["intercept_request"]["required"]
+        assert "intercept_action" in STEP_SCHEMA["intercept_request"]["optional"]
+
+    def test_mock_response_schema(self) -> None:
+        assert "mock_response" in STEP_SCHEMA
+        assert "url_pattern" in STEP_SCHEMA["mock_response"]["required"]
+        assert "status" in STEP_SCHEMA["mock_response"]["optional"]
+
+
+class TestPhase2ValidateSteps:
+    """validate_steps accepts all new actions with their required keys."""
+
+    def test_download_file_valid(self) -> None:
+        out = validate_steps([{"action": "download_file", "url": "https://example.com/f.pdf", "save_path": "/tmp/f.pdf"}])
+        assert out[0]["action"] == "download_file"
+        assert out[0]["url"] == "https://example.com/f.pdf"
+
+    def test_emulate_device_valid(self) -> None:
+        out = validate_steps([{"action": "emulate_device", "device_name": "iPhone 14"}])
+        assert out[0]["device_name"] == "iPhone 14"
+
+    def test_intercept_request_default_action(self) -> None:
+        out = validate_steps([{"action": "intercept_request", "url_pattern": "**/api/**"}])
+        assert out[0]["action"] == "intercept_request"
+        assert out[0]["url_pattern"] == "**/api/**"
+        assert out[0]["intercept_action"] == "block"
+
+    def test_intercept_request_passthrough(self) -> None:
+        out = validate_steps([{"action": "intercept_request", "url_pattern": "**/cdn/**", "intercept_action": "passthrough"}])
+        assert out[0]["url_pattern"] == "**/cdn/**"
+        assert out[0]["intercept_action"] == "passthrough"
+
+    def test_mock_response_defaults(self) -> None:
+        out = validate_steps([{"action": "mock_response", "url_pattern": "**/api/users"}])
+        assert out[0]["status"] == 200
+        assert out[0]["body"] == ""
+        assert out[0]["content_type"] == "application/json"
+
+    def test_mock_response_custom(self) -> None:
+        out = validate_steps([{"action": "mock_response", "url_pattern": "**/api/users", "body": '{"ok":true}', "status": 201}])
+        assert out[0]["status"] == 201
+
+
+class TestPhase2ExecuteStep:
+    """_execute_step dispatches to the correct BrowserAgent methods."""
+
+    def _run(self, step: dict, agent: MagicMock) -> None:
+        planner = _planner_no_llm()
+        validated = validate_steps([step])
+        planner._execute_step(agent, validated[0])
+
+    def test_download_file_dispatches(self) -> None:
+        agent = _make_agent()
+        agent.download_file.return_value = {"url": "https://ex.com/f.pdf", "save_path": "/tmp/f.pdf", "size_bytes": 100}
+        self._run({"action": "download_file", "url": "https://ex.com/f.pdf", "save_path": "/tmp/f.pdf"}, agent)
+        agent.download_file.assert_called_once_with("https://ex.com/f.pdf", "/tmp/f.pdf")
+
+    def test_emulate_device_dispatches(self) -> None:
+        agent = _make_agent()
+        agent.emulate_device.return_value = {"device": "Pixel 7", "viewport": {"width": 412, "height": 915}, "user_agent": "..."}
+        self._run({"action": "emulate_device", "device_name": "Pixel 7"}, agent)
+        agent.emulate_device.assert_called_once_with("Pixel 7")
+
+    def test_intercept_request_dispatches(self) -> None:
+        agent = _make_agent()
+        agent.intercept_request.return_value = {"url_pattern": "**/api/**", "action": "block"}
+        self._run({"action": "intercept_request", "url_pattern": "**/api/**"}, agent)
+        agent.intercept_request.assert_called_once_with("**/api/**", action="block")
+    def test_mock_response_dispatches(self) -> None:
+        agent = _make_agent()
+        agent.mock_response.return_value = {"url_pattern": "**/api/**", "status": 200, "content_type": "application/json"}
+        self._run({"action": "mock_response", "url_pattern": "**/api/**"}, agent)
+        agent.mock_response.assert_called_once_with(
+            "**/api/**", body="", status=200, content_type="application/json"
+        )
+
+
+class TestPhase2BrowserAgentMethods:
+    """Unit tests for the 4 new BrowserAgent methods (mock page, no Playwright)."""
+
+    def _make_ba(self) -> tuple:
+        from browser_agent import BrowserAgent
+        ba = BrowserAgent()
+        mock_page    = MagicMock()
+        mock_context = MagicMock()
+        mock_playwright = MagicMock()
+        ba._page       = mock_page
+        ba._context    = mock_context
+        ba._playwright = mock_playwright
+        ba._pages      = [mock_page]
+        return ba, mock_page, mock_context, mock_playwright
+
+    # ------------------------------------------------------------------
+    # download_file
+    # ------------------------------------------------------------------
+
+    def test_download_file_saves_and_returns_size(self, tmp_path) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        save_path = str(tmp_path / "output.pdf")
+        # Create a fake file so getsize works
+        (tmp_path / "output.pdf").write_bytes(b"PDF content")
+
+        # Simulate expect_download context manager
+        mock_dl = MagicMock()
+        mock_dl.save_as = MagicMock()
+        download_cm = MagicMock()
+        download_cm.__enter__ = MagicMock(return_value=download_cm)
+        download_cm.__exit__  = MagicMock(return_value=False)
+        download_cm.value     = mock_dl
+        page.expect_download.return_value = download_cm
+
+        result = ba.download_file("https://example.com/file.pdf", save_path)
+        page.evaluate.assert_called_once()
+        mock_dl.save_as.assert_called_once_with(save_path)
+        assert result["url"] == "https://example.com/file.pdf"
+        assert result["save_path"] == save_path
+        # size comes from the real file we created
+        assert result["size_bytes"] == 11
+
+    def test_download_file_zero_size_when_file_absent(self, tmp_path) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        save_path = str(tmp_path / "ghost.bin")
+
+        mock_dl = MagicMock()
+        download_cm = MagicMock()
+        download_cm.__enter__ = MagicMock(return_value=download_cm)
+        download_cm.__exit__  = MagicMock(return_value=False)
+        download_cm.value     = mock_dl
+        page.expect_download.return_value = download_cm
+
+        result = ba.download_file("https://example.com/ghost.bin", save_path)
+        assert result["size_bytes"] == 0
+
+    # ------------------------------------------------------------------
+    # emulate_device
+    # ------------------------------------------------------------------
+
+    def test_emulate_device_known_device(self) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        pw.devices = {
+            "iPhone 14": {
+                "viewport": {"width": 390, "height": 844},
+                "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X)...",
+            }
+        }
+        result = ba.emulate_device("iPhone 14")
+        page.set_viewport_size.assert_called_once_with({"width": 390, "height": 844})
+        assert result["device"] == "iPhone 14"
+        assert result["viewport"] == {"width": 390, "height": 844}
+
+    def test_emulate_device_unknown_raises(self) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        pw.devices = {"iPhone 14": {}}
+        with pytest.raises(ValueError, match="Unknown device"):
+            ba.emulate_device("Space Phone X")
+
+    def test_emulate_device_not_started_raises(self) -> None:
+        from browser_agent import BrowserAgent
+        ba = BrowserAgent()
+        with pytest.raises(RuntimeError, match="not started"):
+            ba.emulate_device("iPhone 14")
+
+    # ------------------------------------------------------------------
+    # intercept_request
+    # ------------------------------------------------------------------
+
+    def test_intercept_request_block(self) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        result = ba.intercept_request("**/api/**", action="block")
+        page.route.assert_called_once()
+        assert result["url_pattern"] == "**/api/**"
+        assert result["action"] == "block"
+        # handler is stored
+        assert len(ba._intercept_handlers) == 1
+
+    def test_intercept_request_passthrough(self) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        result = ba.intercept_request("**/cdn/**", action="passthrough")
+        assert result["action"] == "passthrough"
+        page.route.assert_called_once()
+
+    def test_intercept_request_invalid_action(self) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        with pytest.raises(ValueError, match="action must be"):
+            ba.intercept_request("**/*", action="intercept")
+
+    def test_intercept_block_handler_aborts_route(self) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        ba.intercept_request("**/api/**", action="block")
+        # Retrieve the handler installed via page.route
+        handler = page.route.call_args[0][1]
+        mock_route = MagicMock()
+        handler(mock_route)
+        mock_route.abort.assert_called_once()
+
+    def test_intercept_passthrough_handler_continues_route(self) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        ba.intercept_request("**/cdn/**", action="passthrough")
+        handler = page.route.call_args[0][1]
+        mock_route = MagicMock()
+        handler(mock_route)
+        mock_route.continue_.assert_called_once()
+
+    # ------------------------------------------------------------------
+    # mock_response
+    # ------------------------------------------------------------------
+
+    def test_mock_response_installs_route(self) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        result = ba.mock_response("**/api/users", body='{"users":[]}', status=200)
+        page.route.assert_called_once()
+        assert result["url_pattern"] == "**/api/users"
+        assert result["status"] == 200
+        assert len(ba._intercept_handlers) == 1
+
+    def test_mock_response_handler_fulfills_route(self) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        ba.mock_response("**/api/items", body='{"items":[]}', status=200, content_type="application/json")
+        handler = page.route.call_args[0][1]
+        mock_route = MagicMock()
+        handler(mock_route)
+        mock_route.fulfill.assert_called_once_with(
+            status=200,
+            content_type="application/json",
+            body='{"items":[]}',
+        )
+
+    def test_mock_response_custom_status(self) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        result = ba.mock_response("**/api/new", body="created", status=201, content_type="text/plain")
+        assert result["status"] == 201
+        assert result["content_type"] == "text/plain"
+
+    def test_intercept_handlers_reset_on_stop(self) -> None:
+        ba, page, ctx, pw = self._make_ba()
+        ba._intercept_handlers = [("**/*", lambda r: r.abort())]
+        # Simulate stop() resetting state
+        ba._playwright = MagicMock()
+        ba._browser = MagicMock()
+        ba.stop()
+        assert ba._intercept_handlers == []

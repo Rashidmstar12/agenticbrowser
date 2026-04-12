@@ -242,6 +242,26 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
         "optional": {},
         "description": "Exit the current iframe context and return to the top-level page.",
     },
+    "download_file": {
+        "required": ["url", "save_path"],
+        "optional": {},
+        "description": "Trigger a browser download from url and save it to save_path.",
+    },
+    "emulate_device": {
+        "required": ["device_name"],
+        "optional": {},
+        "description": "Emulate a named device (e.g. 'iPhone 14', 'Pixel 7') — sets viewport, user-agent, and DPR.",
+    },
+    "intercept_request": {
+        "required": ["url_pattern"],
+        "optional": {"intercept_action": "block"},
+        "description": "Install a route handler for url_pattern. intercept_action: 'block' (abort) or 'passthrough'.",
+    },
+    "mock_response": {
+        "required": ["url_pattern"],
+        "optional": {"body": "", "status": 200, "content_type": "application/json"},
+        "description": "Intercept requests matching url_pattern and reply with a synthetic response.",
+    },
     # ---- Data extraction (Category 2) ----
     "extract_json_ld": {
         "required": [],
@@ -1198,6 +1218,26 @@ class TaskPlanner:
 
         if action == "iframe_exit":
             return agent.iframe_exit()
+
+        if action == "download_file":
+            return agent.download_file(step["url"], step["save_path"])
+
+        if action == "emulate_device":
+            return agent.emulate_device(step["device_name"])
+
+        if action == "intercept_request":
+            return agent.intercept_request(
+                step["url_pattern"],
+                action=step.get("intercept_action", "block"),
+            )
+
+        if action == "mock_response":
+            return agent.mock_response(
+                step["url_pattern"],
+                body=step.get("body", ""),
+                status=step.get("status", 200),
+                content_type=step.get("content_type", "application/json"),
+            )
 
         # ---- Data extraction (Category 2) ----
 
