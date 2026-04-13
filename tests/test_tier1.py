@@ -547,16 +547,24 @@ class TestCallVisionAnthropic:
 # ---------------------------------------------------------------------------
 
 class TestCallVisionGemini:
-    def _run(self, response_text: str, intent: str = "open example.com", b64: str = "AAAA"):
+    def _make_mock_genai(self, response_text: str):
         fake_response = MagicMock()
         fake_response.text = response_text
         mock_model_instance = MagicMock()
         mock_model_instance.generate_content.return_value = fake_response
+        mock_genai = MagicMock()
+        mock_genai.GenerativeModel.return_value = mock_model_instance
+        mock_google = MagicMock()
+        mock_google.generativeai = mock_genai
+        return mock_genai, mock_model_instance, {"google": mock_google, "google.generativeai": mock_genai}
 
+    def _run(self, response_text: str, intent: str = "open example.com", b64: str = "AAAA"):
+        import sys
+
+        mock_genai, mock_model_instance, modules = self._make_mock_genai(response_text)
         with patch.dict("os.environ", {"GOOGLE_API_KEY": "goog-test"}):
-            with patch("google.generativeai.configure"):
-                with patch("google.generativeai.GenerativeModel", return_value=mock_model_instance):
-                    result = _call_vision_gemini(intent, b64)
+            with patch.dict(sys.modules, modules):
+                result = _call_vision_gemini(intent, b64)
         return result, mock_model_instance
 
     def test_returns_steps_from_valid_json_array(self):
@@ -569,29 +577,23 @@ class TestCallVisionGemini:
         assert len(steps) == 1
 
     def test_raises_on_no_json_array(self):
-        fake_response = MagicMock()
-        fake_response.text = "I cannot help."
-        mock_model_instance = MagicMock()
-        mock_model_instance.generate_content.return_value = fake_response
+        import sys
 
+        mock_genai, _, modules = self._make_mock_genai("I cannot help.")
         with patch.dict("os.environ", {"GOOGLE_API_KEY": "goog-test"}):
-            with patch("google.generativeai.configure"):
-                with patch("google.generativeai.GenerativeModel", return_value=mock_model_instance):
-                    with pytest.raises(StepValidationError, match="no JSON array"):
-                        _call_vision_gemini("do something", "AAAA")
+            with patch.dict(sys.modules, modules):
+                with pytest.raises(StepValidationError, match="no JSON array"):
+                    _call_vision_gemini("do something", "AAAA")
 
     def test_uses_custom_model_env(self):
-        fake_response = MagicMock()
-        fake_response.text = '[{"action": "navigate", "url": "https://example.com"}]'
-        mock_model_instance = MagicMock()
-        mock_model_instance.generate_content.return_value = fake_response
+        import sys
 
+        mock_genai, _, modules = self._make_mock_genai('[{"action": "navigate", "url": "https://example.com"}]')
         with patch.dict("os.environ", {"GOOGLE_API_KEY": "goog-test", "GEMINI_VISION_MODEL": "gemini-1.5-flash"}):
-            with patch("google.generativeai.configure"):
-                with patch("google.generativeai.GenerativeModel", return_value=mock_model_instance) as mock_gm:
-                    _call_vision_gemini("open example.com", "AAAA")
+            with patch.dict(sys.modules, modules):
+                _call_vision_gemini("open example.com", "AAAA")
 
-        call_kwargs = mock_gm.call_args
+        call_kwargs = mock_genai.GenerativeModel.call_args
         assert call_kwargs.kwargs.get("model_name") == "gemini-1.5-flash"
 
 
