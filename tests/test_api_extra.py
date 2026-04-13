@@ -699,8 +699,9 @@ class TestDownloadFileUrlScheme:
         import sys
         from pathlib import Path as _P
         sys.path.insert(0, str(_P(__file__).parent.parent))
-        from browser_agent import BrowserAgent
         from unittest.mock import MagicMock
+
+        from browser_agent import BrowserAgent
         agent = BrowserAgent.__new__(BrowserAgent)
         agent._page = MagicMock()
         return agent

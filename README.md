@@ -505,6 +505,8 @@ export OPENAI_MODEL=gpt-4o-mini   # optional, default: gpt-4o-mini
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
 | `OLLAMA_MODEL` | `llama3` | Ollama model to use |
 | `BROWSER_WORKSPACE` | `./workspace` | Root directory for all file operations |
+| `BROWSER_API_KEY` | — | When set, every API request must include `X-API-Key: <value>`. Docs/health paths are exempt. |
+| `BROWSER_ALLOW_CODE_EXEC` | `false` | Set to `true` to enable `/system/run_python` and `/system/run_shell`. Disabled by default to prevent remote code execution. |
 
 ---
 
