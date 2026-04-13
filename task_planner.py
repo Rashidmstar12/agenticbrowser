@@ -543,6 +543,29 @@ Output:
 Now output ONLY the JSON array for the task below. Nothing else.
 """
 
+# Vision-capable system prompt — identical in spirit but notes that a
+# screenshot is available so the model should ground selectors in what it sees.
+_VISION_SYSTEM_PROMPT = """You are a browser automation planner with access to a SCREENSHOT of the current page.
+Your job is to convert a natural-language browser task into a minimal JSON step array.
+Use the screenshot to understand the current page state and generate accurate selectors.
+Prefer semantic selectors (text=, label=, placeholder=, role=) that are grounded in the
+visible content of the screenshot, rather than brittle CSS class names.
+
+RULES (MUST follow all):
+1. Output ONLY a valid JSON array. No prose, no markdown, no explanation.
+2. Each element must have an "action" key matching one of the allowed actions below.
+3. Use the fewest steps possible. Never add unnecessary steps.
+4. Maximum 20 steps. If you cannot do the task in 20 steps, return an error step.
+5. After navigate always add close_popups.
+6. Never add steps to "verify" or "confirm" — just do the task.
+7. Prefer text=, label=, placeholder=, role= selectors over CSS when possible.
+
+ALLOWED ACTIONS (schema):
+""" + json.dumps(STEP_SCHEMA, indent=2) + """
+
+Now output ONLY the JSON array for the task below. Nothing else.
+"""
+
 
 # ---------------------------------------------------------------------------
 # Step validation
@@ -681,9 +704,71 @@ def _call_ollama(intent: str) -> list[dict[str, Any]]:
     return validate_steps(steps)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+def _call_vision_openai(intent: str, screenshot_b64: str) -> list[dict[str, Any]]:
+    """Call GPT-4V (OpenAI vision) with a screenshot + intent and return validated steps.
+
+    The screenshot is sent as an inline base-64 PNG.  The model is asked to
+    ground its selector choices in the visible page content.
+
+    Parameters
+    ----------
+    intent:
+        Natural-language task description.
+    screenshot_b64:
+        Base-64 encoded PNG screenshot of the current browser page.
+
+    Returns
+    -------
+    list[dict]
+        Validated step list.
+
+    Raises
+    ------
+    StepValidationError
+        When the response cannot be parsed or validated.
+    """
+    import openai  # type: ignore[import]
+
+    model = os.environ.get("OPENAI_VISION_MODEL", "gpt-4o")
+    client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": _VISION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": intent},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{screenshot_b64}",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            },
+        ],
+        temperature=0.0,
+        max_tokens=1024,
+    )
+
+    raw = response.choices[0].message.content or ""
+    logger.debug("GPT-4V raw response: %s", raw)
+
+    # Strip markdown code fences if present
+    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+
+    # Extract the first JSON array from the response
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        raise StepValidationError(f"GPT-4V response contains no JSON array: {raw[:300]}")
+
+    parsed = json.loads(match.group())
+    if isinstance(parsed, list):
+        return validate_steps(parsed)
+    raise StepValidationError(f"GPT-4V returned unexpected JSON shape: {type(parsed)}")
 
 def _interpolate_last(step: dict[str, Any], last: str) -> dict[str, Any]:
     """
@@ -801,6 +886,56 @@ class TaskPlanner:
             "  • search <query> on bing / duckduckgo / youtube / wikipedia\n"
             "  • open / go to / navigate to <url>"
         )
+
+    def vision_plan(self, intent: str, agent: Any) -> list[dict[str, Any]]:
+        """Convert *intent* to a validated step list using a live screenshot.
+
+        Takes a screenshot of the current browser page, sends it together with
+        the intent to GPT-4V so the model can ground its selector choices in
+        the actual visible content.
+
+        Falls back to :meth:`plan` (text-only) when ``OPENAI_API_KEY`` is not
+        set or when the vision LLM call fails.
+
+        Parameters
+        ----------
+        intent:
+            Natural-language description of the task to perform on the page.
+        agent:
+            A ``BrowserAgent`` instance used to capture the screenshot.
+
+        Returns
+        -------
+        list[dict]
+            Validated step list.
+        """
+        intent = intent.strip()
+        logger.info("Vision planning intent: %r", intent)
+
+        if not os.environ.get("OPENAI_API_KEY"):
+            logger.info("No OPENAI_API_KEY set; falling back to text-only planning")
+            return self.plan(intent)
+
+        try:
+            screenshot_result = agent.screenshot(as_base64=True)
+            screenshot_b64: str = screenshot_result.get("base64", "")
+        except Exception as exc:
+            logger.warning(
+                "Screenshot failed during vision_plan (%s); falling back to text-only", exc
+            )
+            return self.plan(intent)
+
+        if not screenshot_b64:
+            logger.warning("Empty screenshot in vision_plan; falling back to text-only")
+            return self.plan(intent)
+
+        try:
+            return _call_vision_openai(intent, screenshot_b64)
+        except Exception as exc:
+            logger.warning(
+                "Vision LLM call failed (%s); falling back to text-only planning", exc
+            )
+            return self.plan(intent)
 
     def execute(
         self,
