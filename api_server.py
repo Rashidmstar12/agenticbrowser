@@ -22,7 +22,7 @@ from pathlib import Path as _Path
 from typing import Any, AsyncIterator
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -143,6 +143,40 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+# ---------------------------------------------------------------------------
+# Security: code-execution gate
+# ---------------------------------------------------------------------------
+
+_CODE_EXEC_ALLOWED: bool = os.environ.get("BROWSER_ALLOW_CODE_EXEC", "false").lower() in (
+    "1", "true", "yes"
+)
+
+# ---------------------------------------------------------------------------
+# Security: API key authentication middleware
+# ---------------------------------------------------------------------------
+
+_API_KEY: str | None = os.environ.get("BROWSER_API_KEY")
+
+_AUTH_EXEMPT_PATHS = frozenset({"/", "/docs", "/redoc", "/openapi.json", "/ui", "/doctor"})
+
+
+@app.middleware("http")
+async def _api_key_middleware(request: Request, call_next):  # type: ignore[type-arg]
+    if _API_KEY:
+        # Allow un-authenticated access to health/docs paths
+        # Normalize path: strip trailing slash for comparison (except root "/")
+        path = request.url.path.rstrip("/") or "/"
+        if path not in _AUTH_EXEMPT_PATHS:
+            provided = request.headers.get("X-API-Key", "")
+            if provided != _API_KEY:
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid or missing API key. Set X-API-Key header."},
+                )
+    return await call_next(request)
+
 
 # ---------------------------------------------------------------------------
 # Request / Response models — session
@@ -1202,11 +1236,21 @@ def system_info() -> dict[str, Any]:
 
 @app.post("/system/run_python", summary="Execute a Python snippet in the workspace")
 def run_python(req: RunPythonRequest) -> dict[str, Any]:
+    if not _CODE_EXEC_ALLOWED:
+        raise HTTPException(
+            status_code=403,
+            detail="Code execution is disabled. Set BROWSER_ALLOW_CODE_EXEC=true to enable.",
+        )
     return get_tools().run_python(req.code, timeout=req.timeout)
 
 
 @app.post("/system/run_shell", summary="Execute a shell command in the workspace")
 def run_shell(req: RunShellRequest) -> dict[str, Any]:
+    if not _CODE_EXEC_ALLOWED:
+        raise HTTPException(
+            status_code=403,
+            detail="Code execution is disabled. Set BROWSER_ALLOW_CODE_EXEC=true to enable.",
+        )
     return get_tools().run_shell(req.command, timeout=req.timeout)
 
 

@@ -640,6 +640,8 @@ class TestGetPlannerError:
 
 
 # ---------------------------------------------------------------------------
+# Security fixes: path traversal, URL scheme bypass, code-exec gate, API key
+# ---------------------------------------------------------------------------
 # Upload/Download file — path traversal protection
 # ---------------------------------------------------------------------------
 
@@ -1197,3 +1199,88 @@ class TestAgentsExecuteParallel:
                 mock_inst.stop.assert_not_called()
                 with _srv._pool_lock:
                     assert "existing" in _srv._agent_pool
+class TestCodeExecGate:
+    def test_run_python_disabled_returns_403(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._CODE_EXEC_ALLOWED
+        _srv._CODE_EXEC_ALLOWED = False
+        try:
+            r = c.post("/system/run_python", json={"code": "1+1"})
+        finally:
+            _srv._CODE_EXEC_ALLOWED = orig
+        assert r.status_code == 403
+        assert "BROWSER_ALLOW_CODE_EXEC" in r.json()["detail"]
+
+    def test_run_shell_disabled_returns_403(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._CODE_EXEC_ALLOWED
+        _srv._CODE_EXEC_ALLOWED = False
+        try:
+            r = c.post("/system/run_shell", json={"command": "echo hi"})
+        finally:
+            _srv._CODE_EXEC_ALLOWED = orig
+        assert r.status_code == 403
+        assert "BROWSER_ALLOW_CODE_EXEC" in r.json()["detail"]
+
+
+class TestApiKeyMiddleware:
+    def test_request_without_key_rejected_when_key_configured(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._API_KEY
+        _srv._API_KEY = "secret123"
+        try:
+            r = c.get("/session/status")
+        finally:
+            _srv._API_KEY = orig
+        assert r.status_code == 401
+        assert "X-API-Key" in r.json()["detail"]
+
+    def test_request_with_wrong_key_rejected(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._API_KEY
+        _srv._API_KEY = "secret123"
+        try:
+            r = c.get("/session/status", headers={"X-API-Key": "wrong"})
+        finally:
+            _srv._API_KEY = orig
+        assert r.status_code == 401
+
+    def test_request_with_correct_key_accepted(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._API_KEY
+        _srv._API_KEY = "secret123"
+        try:
+            r = c.get("/session/status", headers={"X-API-Key": "secret123"})
+        finally:
+            _srv._API_KEY = orig
+        assert r.status_code == 200
+
+    def test_no_key_configured_allows_all(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._API_KEY
+        _srv._API_KEY = None
+        try:
+            r = c.get("/session/status")
+        finally:
+            _srv._API_KEY = orig
+        assert r.status_code == 200
+
+    def test_exempt_paths_always_accessible(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._API_KEY
+        _srv._API_KEY = "secret123"
+        try:
+            r_root = c.get("/", follow_redirects=False)
+            r_docs = c.get("/docs", follow_redirects=False)
+        finally:
+            _srv._API_KEY = orig
+        # root may redirect (3xx) or return 200 — either is fine; must not be 401
+        assert r_root.status_code != 401
+        assert r_docs.status_code != 401

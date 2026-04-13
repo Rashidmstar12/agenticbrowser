@@ -351,17 +351,51 @@ class TestSystemToolsRoutes:
 
     def test_run_python(self, client) -> None:
         c, _ = client
-        r = c.post("/system/run_python", json={"code": "print('hi')"})
+        import api_server as _srv
+        orig = _srv._CODE_EXEC_ALLOWED
+        _srv._CODE_EXEC_ALLOWED = True
+        try:
+            r = c.post("/system/run_python", json={"code": "print('hi')"})
+        finally:
+            _srv._CODE_EXEC_ALLOWED = orig
         assert r.status_code == 200
         body = r.json()
         assert body["success"] is True
         assert "hi" in body["stdout"]
 
+    def test_run_python_disabled(self, client) -> None:
+        c, _ = client
+        import api_server as _srv
+        orig = _srv._CODE_EXEC_ALLOWED
+        _srv._CODE_EXEC_ALLOWED = False
+        try:
+            r = c.post("/system/run_python", json={"code": "print('hi')"})
+        finally:
+            _srv._CODE_EXEC_ALLOWED = orig
+        assert r.status_code == 403
+
     def test_run_shell(self, client) -> None:
         c, _ = client
-        r = c.post("/system/run_shell", json={"command": "echo hello"})
+        import api_server as _srv
+        orig = _srv._CODE_EXEC_ALLOWED
+        _srv._CODE_EXEC_ALLOWED = True
+        try:
+            r = c.post("/system/run_shell", json={"command": "echo hello"})
+        finally:
+            _srv._CODE_EXEC_ALLOWED = orig
         assert r.status_code == 200
         assert r.json()["success"] is True
+
+    def test_run_shell_disabled(self, client) -> None:
+        c, _ = client
+        import api_server as _srv
+        orig = _srv._CODE_EXEC_ALLOWED
+        _srv._CODE_EXEC_ALLOWED = False
+        try:
+            r = c.post("/system/run_shell", json={"command": "echo hello"})
+        finally:
+            _srv._CODE_EXEC_ALLOWED = orig
+        assert r.status_code == 403
 
     def test_traversal_write_returns_500(self, client) -> None:
         c, _ = client
