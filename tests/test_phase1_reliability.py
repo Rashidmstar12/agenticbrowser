@@ -13,21 +13,20 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from browser_agent import BrowserAgent, _POPUP_SELECTORS, _run_popup_scan
+from browser_agent import _POPUP_SELECTORS, BrowserAgent, _run_popup_scan
 from task_planner import (
-    STEP_SCHEMA,
-    TaskPlanner,
     _SYSTEM_PROMPT,
     _VISION_SYSTEM_PROMPT,
+    STEP_SCHEMA,
+    TaskPlanner,
     validate_steps,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

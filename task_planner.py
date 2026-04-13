@@ -163,13 +163,13 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
     # ---- Smart extraction actions ----
     "extract_links": {
         "required": [],
-        "optional": {"selector": "a", "limit": 100},
-        "description": "Extract all hyperlinks from the page. Returns list of {text, href}. Stored as {{last}} (JSON).",
+        "optional": {"selector": "a", "limit": 100, "wait_for_ready": True, "timeout": 5000},
+        "description": "Extract all hyperlinks from the page. Returns list of {text, href}. Stored as {{last}} (JSON). When selector is not the default 'a', waits for the selector to be present before extracting (wait_for_ready: true by default).",
     },
     "extract_table": {
         "required": [],
-        "optional": {"selector": "table", "table_index": 0},
-        "description": "Extract an HTML table as a list of row dicts keyed by header text.",
+        "optional": {"selector": "table", "table_index": 0, "wait_for_ready": True, "timeout": 5000},
+        "description": "Extract an HTML table as a list of row dicts keyed by header text. When selector is not the default 'table', waits for the selector to be present before extracting (wait_for_ready: true by default).",
     },
     # ---- Assertion actions ----
     "assert_text": {
@@ -329,6 +329,8 @@ def _google_search_steps(query: str) -> list[dict[str, Any]]:
         {"action": "fill",          "selector": sels["search_input"], "value": query},
         {"action": "press",         "key": "Enter"},
         {"action": "wait_state",    "state": "networkidle"},
+        {"action": "wait_selector", "selector": sels["results"]},
+        {"action": "assert_text",   "text": query, "selector": sels["results"]},
     ]
 
 
@@ -341,6 +343,8 @@ def _bing_search_steps(query: str) -> list[dict[str, Any]]:
         {"action": "fill",          "selector": sels["search_input"], "value": query},
         {"action": "press",         "key": "Enter"},
         {"action": "wait_state",    "state": "networkidle"},
+        {"action": "wait_selector", "selector": sels["results"]},
+        {"action": "assert_text",   "text": query, "selector": sels["results"]},
     ]
 
 
@@ -352,6 +356,8 @@ def _ddg_search_steps(query: str) -> list[dict[str, Any]]:
         {"action": "fill",          "selector": sels["search_input"], "value": query},
         {"action": "press",         "key": "Enter"},
         {"action": "wait_state",    "state": "networkidle"},
+        {"action": "wait_selector", "selector": sels["results"]},
+        {"action": "assert_text",   "text": query, "selector": sels["results"]},
     ]
 
 
@@ -364,6 +370,8 @@ def _youtube_search_steps(query: str) -> list[dict[str, Any]]:
         {"action": "fill",          "selector": sels["search_input"], "value": query},
         {"action": "press",         "key": "Enter"},
         {"action": "wait_state",    "state": "networkidle"},
+        {"action": "wait_selector", "selector": sels["results"]},
+        {"action": "assert_text",   "text": query, "selector": sels["results"]},
     ]
 
 
@@ -375,16 +383,21 @@ def _wikipedia_search_steps(query: str) -> list[dict[str, Any]]:
         {"action": "fill",          "selector": sels["search_input"], "value": query},
         {"action": "press",         "key": "Enter"},
         {"action": "wait_state",    "state": "networkidle"},
+        {"action": "wait_selector", "selector": sels["results"]},
+        {"action": "assert_text",   "text": query, "selector": sels["results"]},
     ]
 
 
 def _navigate_steps(url: str) -> list[dict[str, Any]]:
+    import urllib.parse as _urlparse
     if not re.match(r"https?://", url):
         url = "https://" + url
+    domain = _urlparse.urlparse(url).netloc
     return [
-        {"action": "navigate",   "url": url, "wait_until": "domcontentloaded"},
+        {"action": "navigate",    "url": url, "wait_until": "domcontentloaded"},
         {"action": "close_popups"},
-        {"action": "wait_state", "state": "networkidle"},
+        {"action": "wait_state",  "state": "networkidle"},
+        {"action": "assert_url",  "pattern": domain},
     ]
 
 
@@ -1348,7 +1361,22 @@ class TaskPlanner:
         """
         Plan *intent* and execute the resulting steps against *agent*.
 
-        Returns a summary dict with ``steps``, ``results``, and ``success`` flag.
+        Returns a summary dict with the following keys:
+
+        ``success``
+            ``True`` when no step raised an exception (unchanged semantics).
+        ``verified``
+            ``True`` when the last ``assert_text`` or ``assert_url`` step
+            confirmed the expected outcome (``found``/``matched`` == True).
+            ``False`` when an assertion step ran but the check failed.
+            ``None`` when no assertion steps exist in the plan — meaning
+            verification was not attempted; ``success`` is still meaningful.
+        ``steps``
+            The planned step list.
+        ``results``
+            Per-step result records.
+        ``failed_count``
+            Number of steps with status ``"error"``.
 
         Parameters
         ----------
@@ -1365,8 +1393,23 @@ class TaskPlanner:
 
         results = self.execute(steps, agent, stop_on_error=stop_on_error)
         failed  = [r for r in results if r["status"] == "error"]
+
+        # Compute verified: True/False when an assertion step ran, None when none did.
+        assertion_results = [
+            r for r in results
+            if r.get("action") in ("assert_text", "assert_url") and r.get("status") == "ok"
+        ]
+        if not assertion_results:
+            verified: bool | None = None
+        else:
+            last_assert_result = assertion_results[-1].get("result") or {}
+            verified = bool(
+                last_assert_result.get("found") or last_assert_result.get("matched")
+            )
+
         summary = {
             "success":      len(failed) == 0,
+            "verified":     verified,
             "intent":       intent,
             "steps":        steps,
             "results":      results,
@@ -1505,15 +1548,29 @@ class TaskPlanner:
 
         # ---- Smart extraction ----
 
+        # ---- Smart extraction ----
+
         if action == "extract_links":
+            sel = step.get("selector", "a")
+            if step.get("wait_for_ready", True) and sel != "a":
+                try:
+                    agent.wait_for_selector(sel, timeout=step.get("timeout", 5_000))
+                except Exception:
+                    pass  # proceed — extraction may still succeed
             return agent.extract_links(
-                selector=step.get("selector", "a"),
+                selector=sel,
                 limit=step.get("limit", 100),
             )
 
         if action == "extract_table":
+            sel = step.get("selector", "table")
+            if step.get("wait_for_ready", True) and sel != "table":
+                try:
+                    agent.wait_for_selector(sel, timeout=step.get("timeout", 5_000))
+                except Exception:
+                    pass  # proceed — extraction may still succeed
             return agent.extract_table(
-                selector=step.get("selector", "table"),
+                selector=sel,
                 table_index=step.get("table_index", 0),
             )
 
