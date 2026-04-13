@@ -18,7 +18,6 @@ Tests verify:
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -352,11 +351,13 @@ class TestSystemToolsRoutes:
 
     def test_run_python(self, client) -> None:
         c, _ = client
-        with patch.dict(os.environ, {"BROWSER_ALLOW_CODE_EXEC": "true"}):
-            import api_server as _srv
-            _srv._CODE_EXEC_ALLOWED = True
+        import api_server as _srv
+        orig = _srv._CODE_EXEC_ALLOWED
+        _srv._CODE_EXEC_ALLOWED = True
+        try:
             r = c.post("/system/run_python", json={"code": "print('hi')"})
-            _srv._CODE_EXEC_ALLOWED = False
+        finally:
+            _srv._CODE_EXEC_ALLOWED = orig
         assert r.status_code == 200
         body = r.json()
         assert body["success"] is True
@@ -376,9 +377,12 @@ class TestSystemToolsRoutes:
     def test_run_shell(self, client) -> None:
         c, _ = client
         import api_server as _srv
+        orig = _srv._CODE_EXEC_ALLOWED
         _srv._CODE_EXEC_ALLOWED = True
-        r = c.post("/system/run_shell", json={"command": "echo hello"})
-        _srv._CODE_EXEC_ALLOWED = False
+        try:
+            r = c.post("/system/run_shell", json={"command": "echo hello"})
+        finally:
+            _srv._CODE_EXEC_ALLOWED = orig
         assert r.status_code == 200
         assert r.json()["success"] is True
 

@@ -135,7 +135,9 @@ _AUTH_EXEMPT_PATHS = frozenset({"/", "/docs", "/redoc", "/openapi.json", "/ui", 
 async def _api_key_middleware(request: Request, call_next):  # type: ignore[type-arg]
     if _API_KEY:
         # Allow un-authenticated access to health/docs paths
-        if request.url.path not in _AUTH_EXEMPT_PATHS:
+        # Normalize path: strip trailing slash for comparison (except root "/")
+        path = request.url.path.rstrip("/") or "/"
+        if path not in _AUTH_EXEMPT_PATHS:
             provided = request.headers.get("X-API-Key", "")
             if provided != _API_KEY:
                 from fastapi.responses import JSONResponse
