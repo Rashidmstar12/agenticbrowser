@@ -98,10 +98,23 @@ class TestExecuteBrowserActions:
         agent.click.assert_called_once_with("button", timeout=None)
 
     def test_fill_step(self, tmp_path):
+        # fill now routes through type_text by default (framework_safe=True)
         planner = _make_planner(tmp_path)
         agent = _make_agent()
         planner.execute(validate_steps([{"action": "fill", "selector": "input", "value": "hello"}]), agent)
+        agent.type_text.assert_called_once_with("input", "hello", clear_first=True)
+        agent.fill.assert_not_called()
+
+    def test_fill_step_raw_when_framework_safe_false(self, tmp_path):
+        # framework_safe=False opts out of type_text routing → raw Playwright fill
+        planner = _make_planner(tmp_path)
+        agent = _make_agent()
+        planner.execute(
+            validate_steps([{"action": "fill", "selector": "input", "value": "hello", "framework_safe": False}]),
+            agent,
+        )
         agent.fill.assert_called_once_with("input", "hello")
+        agent.type_text.assert_not_called()
 
     def test_type_step(self, tmp_path):
         planner = _make_planner(tmp_path)

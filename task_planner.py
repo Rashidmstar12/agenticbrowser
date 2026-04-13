@@ -47,8 +47,12 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
     },
     "fill": {
         "required": ["selector", "value"],
-        "optional": {},
-        "description": "Fill an input field with a value (fast, no key events).",
+        "optional": {"framework_safe": True},
+        "description": (
+            "Fill an input field. By default fires key events via type_text "
+            "(safe for React/Vue/Angular). Set framework_safe: false to use raw "
+            "Playwright fill for plain server-rendered HTML forms."
+        ),
     },
     "type": {
         "required": ["selector", "text"],
@@ -545,7 +549,22 @@ PLANNING RULES (MUST follow all):
 5. For well-known sites (Google, Bing, YouTube, Wikipedia, DuckDuckGo) use the
    exact selectors listed below — never invent selectors.
 6. After navigate always add close_popups.
-7. Never add steps to "verify" or "confirm" — just do the task.
+7. MANDATORY VERIFICATION: Any plan that performs a form submission, login,
+   checkout, or navigation to an authenticated page MUST end with an assert_text
+   or assert_url step confirming the expected outcome.
+   - assert_text: check for a confirmation heading, success message, or next-step
+     indicator that would only be present on successful completion.
+   - assert_url: check for a URL path fragment expected after the action
+     (e.g. "/dashboard", "/search?q=").
+   - If you cannot identify a specific success indicator, use assert_url with the
+     most specific URL fragment you can determine from the task description.
+   - Never omit this step when the task has a verifiable outcome.
+8. FORM INPUT: Use "type" instead of "fill" for all form inputs. The "fill" action
+   sets the field value directly without firing JavaScript onChange/onInput events,
+   which leaves React, Vue, and Angular forms in an invalid state (submit button
+   stays disabled, field may clear on blur). Use "fill" only when you are certain
+   the target is a plain server-rendered HTML form and you explicitly set
+   framework_safe to false.
 
 ALLOWED ACTIONS (schema):
 """ + json.dumps(STEP_SCHEMA, indent=2) + """
@@ -561,9 +580,10 @@ Output:
   {"action": "navigate", "url": "https://www.google.com", "wait_until": "domcontentloaded"},
   {"action": "close_popups"},
   {"action": "wait_selector", "selector": "textarea[name='q']"},
-  {"action": "fill", "selector": "textarea[name='q']", "value": "python tutorials"},
+  {"action": "type", "selector": "textarea[name='q']", "text": "python tutorials"},
   {"action": "press", "key": "Enter"},
-  {"action": "wait_state", "state": "networkidle"}
+  {"action": "wait_selector", "selector": "#search"},
+  {"action": "assert_text", "text": "python", "selector": "#search"}
 ]
 
 Task: "open https://news.ycombinator.com"
@@ -580,9 +600,10 @@ Output:
   {"action": "navigate", "url": "https://www.youtube.com", "wait_until": "domcontentloaded"},
   {"action": "close_popups"},
   {"action": "wait_selector", "selector": "input#search"},
-  {"action": "fill", "selector": "input#search", "value": "machine learning"},
+  {"action": "type", "selector": "input#search", "text": "machine learning"},
   {"action": "press", "key": "Enter"},
-  {"action": "wait_state", "state": "networkidle"}
+  {"action": "wait_selector", "selector": "ytd-video-renderer"},
+  {"action": "assert_text", "text": "machine learning", "selector": "body"}
 ]
 
 Now output ONLY the JSON array for the task below. Nothing else.
@@ -607,8 +628,17 @@ PLANNING RULES (MUST follow all):
 3. Use the fewest steps possible. Never add unnecessary steps.
 4. Maximum 20 steps. If you cannot do the task in 20 steps, return an error step.
 5. After navigate always add close_popups.
-6. Never add steps to "verify" or "confirm" — just do the task.
-7. Prefer text=, label=, placeholder=, role= selectors over CSS when possible.
+6. MANDATORY VERIFICATION: Any plan that performs a form submission, login,
+   checkout, or navigation to an authenticated page MUST end with an assert_text
+   or assert_url step confirming the expected outcome.
+   - assert_text: check for a confirmation heading, success message, or next-step
+     indicator present only on successful completion.
+   - assert_url: check for a URL path fragment expected after the action.
+   - Never omit this step when the task has a verifiable outcome.
+7. FORM INPUT: Use "type" instead of "fill" for all form inputs. The "fill" action
+   bypasses JavaScript onChange/onInput events, leaving React/Vue/Angular forms
+   in an invalid state. Use "fill" only for plain server-rendered HTML forms.
+8. Prefer text=, label=, placeholder=, role= selectors over CSS when possible.
 
 ALLOWED ACTIONS (schema):
 """ + json.dumps(STEP_SCHEMA, indent=2) + """
@@ -1379,12 +1409,41 @@ class TaskPlanner:
         action = step["action"]
 
         if action == "navigate":
-            return agent.navigate(step["url"], wait_until=step.get("wait_until", "domcontentloaded"))
+            result = agent.navigate(step["url"], wait_until=step.get("wait_until", "domcontentloaded"))
+            # Login-wall detection: if we intended to navigate to a non-auth URL
+            # but the browser landed on an auth/login URL, execution must stop.
+            # Continuing would silently run all subsequent steps against the
+            # wrong page (the login form), producing misleading results.
+            _AUTH_TOKENS = (
+                "login", "signin", "sign-in", "auth", "sso",
+                "oauth", "session/new", "account/login",
+            )
+            target = step["url"].lower()
+            actual = agent.page.url.lower()
+            _target_is_auth = any(t in target for t in _AUTH_TOKENS)
+            _actual_is_auth = any(t in actual for t in _AUTH_TOKENS)
+            if not _target_is_auth and _actual_is_auth:
+                raise ValueError(
+                    f"Login wall detected: navigating to {step['url']!r} redirected to "
+                    f"{agent.page.url!r}. Task cannot proceed without authentication."
+                )
+            return result
 
         if action == "click":
             return agent.click(step["selector"], timeout=step.get("timeout"))
 
         if action == "fill":
+            # framework_safe=True (default): route through type_text so that
+            # JavaScript onChange/onInput events fire and React/Vue/Angular
+            # component state stays in sync with the field value.
+            # framework_safe=False: use raw Playwright fill (no key events) —
+            # faster, but only correct for plain server-rendered HTML forms.
+            if step.get("framework_safe", True):
+                return agent.type_text(
+                    step["selector"],
+                    step["value"],
+                    clear_first=True,
+                )
             return agent.fill(step["selector"], step["value"])
 
         if action == "type":
