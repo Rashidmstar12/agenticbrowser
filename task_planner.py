@@ -90,6 +90,21 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
         "optional": {"path": None, "full_page": False},
         "description": "Capture a screenshot.",
     },
+    "start_recording": {
+        "required": ["path"],
+        "optional": {},
+        "description": "Start recording the browser session as a WebM video. path is the workspace-relative output file (e.g. 'recording.webm').",
+    },
+    "stop_recording": {
+        "required": [],
+        "optional": {},
+        "description": "Stop the video recording started by start_recording and save the file.",
+    },
+    "record_gif": {
+        "required": ["path"],
+        "optional": {"duration": 3.0, "fps": 2},
+        "description": "Capture an animated GIF of the current page. path is workspace-relative. duration: seconds to record (default 3.0). fps: frames per second (default 2).",
+    },
     "hover": {
         "required": ["selector"],
         "optional": {},
@@ -234,8 +249,8 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
     },
     "set_network_intercept": {
         "required": ["url_pattern"],
-        "optional": {"action": "abort"},
-        "description": "Intercept requests matching url_pattern. action: 'abort' (block) or 'continue' (pass through).",
+        "optional": {"intercept_action": "abort"},
+        "description": "Intercept requests matching url_pattern. intercept_action: 'abort' (block) or 'continue' (pass through).",
     },
     "clear_network_intercepts": {
         "required": [],
@@ -481,7 +496,7 @@ RULES (MUST follow all):
 1. Output ONLY a valid JSON array. No prose, no markdown, no explanation.
 2. Each element must have an "action" key matching one of the allowed actions below.
 3. Use the fewest steps possible. Never add unnecessary steps.
-4. Maximum 12 steps. If you cannot do the task in 12 steps, return an error step.
+4. Maximum 20 steps. If you cannot do the task in 20 steps, return an error step.
 5. For well-known sites (Google, Bing, YouTube, Wikipedia, DuckDuckGo) use the
    exact selectors listed below — never invent selectors.
 6. After navigate always add close_popups.
@@ -994,6 +1009,19 @@ class TaskPlanner:
                 as_base64=step.get("path") is None,
             )
 
+        if action == "start_recording":
+            return agent.start_video_recording(step["path"])
+
+        if action == "stop_recording":
+            return agent.stop_video_recording()
+
+        if action == "record_gif":
+            return agent.record_gif(
+                path=step["path"],
+                duration=float(step.get("duration", 3.0)),
+                fps=int(step.get("fps", 2)),
+            )
+
         if action == "hover":
             return agent.hover(step["selector"])
 
@@ -1082,7 +1110,7 @@ class TaskPlanner:
         if action == "set_network_intercept":
             return agent.set_network_intercept(
                 step["url_pattern"],
-                action=step.get("action", "abort"),
+                action=step.get("intercept_action", "abort"),
             )
 
         if action == "clear_network_intercepts":

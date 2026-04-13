@@ -14,6 +14,9 @@ import asyncio
 import json as _json
 import logging
 import os
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path as _Path
 from typing import Any, AsyncIterator
@@ -67,6 +70,13 @@ _agent:   BrowserAgent | None = None
 _planner: TaskPlanner  | None = None
 _tools:   SystemTools  | None = None
 
+# ---------------------------------------------------------------------------
+# Agent pool — named agents that run alongside the default session
+# ---------------------------------------------------------------------------
+_agent_pool:   dict[str, BrowserAgent]   = {}
+_planner_pool: dict[str, TaskPlanner]    = {}
+_pool_lock:    threading.Lock            = threading.Lock()
+
 
 def _workspace() -> str:
     return os.environ.get("BROWSER_WORKSPACE", "workspace")
@@ -91,6 +101,17 @@ def get_tools() -> SystemTools:
     return _tools
 
 
+def get_pooled_agent(agent_id: str) -> BrowserAgent:
+    """Return the pooled agent identified by *agent_id*, or raise 404/400."""
+    with _pool_lock:
+        agent = _agent_pool.get(agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent {agent_id!r} not found in pool.")
+    if agent._page is None:
+        raise HTTPException(status_code=400, detail=f"Agent {agent_id!r} has no active page.")
+    return agent
+
+
 # ---------------------------------------------------------------------------
 # App lifecycle
 # ---------------------------------------------------------------------------
@@ -101,6 +122,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
     if _agent is not None:
         _agent.stop()
+    # Stop all pooled agents on shutdown.
+    with _pool_lock:
+        for _pooled in list(_agent_pool.values()):
+            try:
+                _pooled.stop()
+            except Exception:
+                pass
+        _agent_pool.clear()
+        _planner_pool.clear()
     logger.info("Agentic Browser API server shut down")
 
 app = FastAPI(
@@ -337,8 +367,8 @@ class SetNetworkInterceptRequest(BaseModel):
 
 
 class SetViewportRequest(BaseModel):
-    width: int = Field(..., description="Viewport width in pixels")
-    height: int = Field(..., description="Viewport height in pixels")
+    width: int = Field(..., ge=1, description="Viewport width in pixels")
+    height: int = Field(..., ge=1, description="Viewport height in pixels")
 
 
 class SetGeolocationRequest(BaseModel):
@@ -405,6 +435,70 @@ class TaskPlanRequest(BaseModel):
 class TaskExecuteRequest(BaseModel):
     steps: list[dict] = Field(..., description="Pre-validated list of step objects to execute")
     stop_on_error: bool = Field(True, description="Stop execution on the first failed step")
+
+
+# ---------------------------------------------------------------------------
+# Request models — video / GIF recording
+# ---------------------------------------------------------------------------
+
+class StartRecordingRequest(BaseModel):
+    path: str = Field(..., description="Workspace-relative path for the output .webm video file")
+
+
+class RecordGifRequest(BaseModel):
+    path: str = Field(..., description="Workspace-relative path for the output .gif file")
+    duration: float = Field(3.0, ge=0.1, description="Duration to record in seconds")
+    fps: int = Field(2, ge=1, le=30, description="Frames per second for the GIF")
+
+
+# ---------------------------------------------------------------------------
+# Request models — agent pool + parallel execution
+# ---------------------------------------------------------------------------
+
+class PoolAgentStartRequest(BaseModel):
+    agent_id: str | None = Field(None, description="Agent identifier; auto-generated UUID if omitted")
+    headless: bool = Field(True, description="Run agent without a visible window")
+    slow_mo: int = Field(0, description="Slow down Playwright operations by this many ms")
+    auto_close_popups: bool = Field(True, description="Auto-dismiss common popups on page load")
+    default_timeout: int = Field(30_000, description="Default timeout in milliseconds")
+
+
+class PoolAgentExecuteRequest(BaseModel):
+    steps: list[dict] = Field(..., description="Pre-built step list to execute on this agent")
+    stop_on_error: bool = Field(True, description="Stop execution on the first failed step")
+
+
+class TabTask(BaseModel):
+    steps: list[dict] = Field(..., description="Steps to execute on this tab")
+    url: str | None = Field(None, description="Navigate to this URL before running steps")
+
+
+class TabParallelExecuteRequest(BaseModel):
+    tasks: list[TabTask] = Field(..., min_length=2, max_length=20, description="One entry per tab; at least 2 required")
+    stop_on_error: bool = Field(True, description="Stop each tab's task on its first step error")
+
+
+class ParallelAgentTask(BaseModel):
+    steps: list[dict] = Field(..., description="Steps to execute on this agent")
+    agent_id: str | None = Field(None, description="Existing pooled agent ID; None = spawn a fresh agent")
+
+
+class ExecuteParallelRequest(BaseModel):
+    tasks: list[ParallelAgentTask] | None = Field(
+        None,
+        description="Explicit per-agent tasks. Provide either this or (agent_count + steps).",
+    )
+    agent_count: int | None = Field(
+        None, ge=1, le=20,
+        description="Broadcast mode: spawn N agents and run the same 'steps' on each.",
+    )
+    steps: list[dict] | None = Field(
+        None,
+        description="Steps used for every agent when agent_count is set.",
+    )
+    headless: bool = Field(True, description="Headless mode for auto-spawned agents")
+    auto_stop: bool = Field(True, description="Stop auto-spawned agents after execution completes")
+    stop_on_error: bool = Field(True, description="Stop each agent's task on its first step error")
 
 
 # ---------------------------------------------------------------------------
@@ -558,13 +652,50 @@ def evaluate(req: EvaluateRequest) -> dict[str, Any]:
 
 @app.post("/screenshot", summary="Take a screenshot")
 def screenshot(req: ScreenshotRequest) -> dict[str, Any]:
-    safe: str | None = None
+    safe_screenshot_path: str | None = None
     if req.path is not None:
+        tools = get_tools()
         try:
-            safe = str(safe_path(get_tools().workspace, req.path))
+            safe_screenshot_path = str(safe_path(tools.workspace, req.path))
         except PathTraversalError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-    return get_agent().screenshot(path=safe, full_page=req.full_page, as_base64=req.as_base64)
+            raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+    return get_agent().screenshot(path=safe_screenshot_path, full_page=req.full_page, as_base64=req.as_base64)
+
+
+# ---------------------------------------------------------------------------
+# Routes: video / GIF recording
+# ---------------------------------------------------------------------------
+
+@app.post("/recording/start", summary="Start recording the browser session as a WebM video")
+def recording_start(req: StartRecordingRequest) -> dict[str, Any]:
+    tools = get_tools()
+    try:
+        save_path = str(safe_path(tools.workspace, req.path))
+    except PathTraversalError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+    agent = get_agent()
+    try:
+        return agent.start_video_recording(save_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=_sanitize_error(str(exc)))
+
+
+@app.post("/recording/stop", summary="Stop video recording and save the WebM file")
+def recording_stop() -> dict[str, Any]:
+    try:
+        return get_agent().stop_video_recording()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=_sanitize_error(str(exc)))
+
+
+@app.post("/recording/gif", summary="Capture an animated GIF of the current page")
+def recording_gif(req: RecordGifRequest) -> dict[str, Any]:
+    tools = get_tools()
+    try:
+        save_path = str(safe_path(tools.workspace, req.path))
+    except PathTraversalError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+    return get_agent().record_gif(save_path, duration=req.duration, fps=req.fps)
 
 
 # ---------------------------------------------------------------------------
@@ -669,28 +800,354 @@ def list_tabs() -> dict[str, Any]:
     return get_agent().list_tabs()
 
 
+@app.post("/tabs/execute_parallel", summary="Open N tabs in the current session and run a step sequence on each (sequential per-tab)")
+def tabs_execute_parallel(req: TabParallelExecuteRequest) -> dict[str, Any]:
+    """
+    Open one tab per task in the **current** browser session (shared cookies /
+    storage) and execute each task's steps on its own tab.
+
+    Execution is sequential per-tab (switch → run steps → switch → …), which
+    keeps the shared Playwright context thread-safe.  Use
+    ``/agents/execute_parallel`` when you need true concurrency.
+
+    The first task reuses tab 0 (the existing active tab); subsequent tasks
+    each open a new tab.  All tabs remain open after the call — use
+    ``/tabs/close`` to clean them up.
+    """
+    agent = get_agent()
+    planner_inst = get_planner()
+
+    # Validate all step lists up-front so we fail early.
+    validated: list[tuple[list[dict], str | None]] = []
+    for task in req.tasks:
+        try:
+            vsteps = validate_steps(task.steps)
+        except StepValidationError as exc:
+            raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+        validated.append((vsteps, task.url))
+
+    # Open a new tab for every task beyond the first (reuse tab 0 for task 0).
+    tab_indices: list[int] = [0]
+    for _ in range(1, len(validated)):
+        result = agent.new_tab()
+        tab_indices.append(result["tab_index"])
+
+    all_results: list[dict[str, Any]] = []
+    for i, (vsteps, url) in enumerate(validated):
+        agent.switch_tab(tab_indices[i])
+        if url:
+            try:
+                agent.navigate(url)
+            except Exception:
+                # Do not echo the exception message (may contain the caller-supplied
+                # URL); use a static string to avoid stack-trace-exposure.
+                all_results.append(_safe_response({
+                    "tab_index": tab_indices[i],
+                    "success": False,
+                    "failed_count": 1,
+                    "step_results": [{"step": 0, "action": "navigate",
+                                      "status": "error",
+                                      "error": "Navigation failed before steps could execute."}],
+                }))
+                if req.stop_on_error:
+                    break
+                continue
+        task_results = planner_inst.execute(vsteps, agent, stop_on_error=req.stop_on_error)
+        failed_count_tab = sum(1 for r in task_results if r.get("status") == "error")
+        # Build safe_results using the untainted validated step list for step index
+        # and action name — only the error string comes from execution results.
+        safe_results = []
+        for j, (vstep, r) in enumerate(zip(vsteps, task_results)):
+            is_err = r.get("status") == "error"
+            if is_err:
+                failed_count_tab += 0   # already counted above
+            safe_results.append({
+                "step":   j,                                      # untainted counter
+                "action": vstep["action"],                        # from untainted validated list
+                "status": "error" if is_err else "ok",            # literal string
+                "error":  _sanitize_error(str(r.get("error", ""))) if is_err else None,
+            })
+        all_results.append({
+            "tab_index":    tab_indices[i],
+            "success":      failed_count_tab == 0,
+            "failed_count": failed_count_tab,
+            "step_results": safe_results,
+        })
+
+    # Return focus to tab 0.
+    try:
+        agent.switch_tab(0)
+    except Exception:
+        pass
+
+    return _safe_response({
+        "results":      all_results,
+        "total_tabs":   len(all_results),
+        "all_succeeded": all(r["success"] for r in all_results),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Routes: agent pool
+# ---------------------------------------------------------------------------
+
+@app.post("/agents/pool/start", summary="Start a new named agent in the pool")
+def pool_agent_start(req: PoolAgentStartRequest) -> dict[str, Any]:
+    """
+    Spawn a new ``BrowserAgent`` with its own browser process and add it to
+    the named pool.  Use the returned ``agent_id`` to target subsequent
+    requests at this specific agent (e.g. ``/agents/pool/{agent_id}/task/execute``).
+    """
+    global _agent_pool, _planner_pool
+    aid = req.agent_id or f"agent-{uuid.uuid4().hex[:8]}"
+    with _pool_lock:
+        if aid in _agent_pool:
+            raise HTTPException(status_code=409, detail=f"Agent {aid!r} already exists in pool.")
+    agent = BrowserAgent(
+        headless=req.headless,
+        slow_mo=req.slow_mo,
+        auto_close_popups=req.auto_close_popups,
+        default_timeout=req.default_timeout,
+    )
+    agent.start()
+    planner = TaskPlanner()
+    planner._system_tools = get_tools()
+    with _pool_lock:
+        _agent_pool[aid]   = agent
+        _planner_pool[aid] = planner
+    logger.info("Pooled agent %r started", aid)
+    return {"agent_id": aid, "status": "started", "headless": req.headless}
+
+
+@app.get("/agents/pool", summary="List all pooled agents and their status")
+def pool_agents_list() -> dict[str, Any]:
+    with _pool_lock:
+        snapshot = list(_agent_pool.items())
+    agents: list[dict[str, Any]] = []
+    for aid, agent in snapshot:
+        try:
+            info: dict[str, Any] = {"agent_id": aid, "active": agent._page is not None}
+            if agent._page is not None:
+                info["url"]       = agent._page.url
+                info["tab_count"] = len(agent._pages)
+                info["recording"] = agent._recording
+        except Exception:
+            info = {"agent_id": aid, "active": False}
+        agents.append(info)
+    return {"agents": agents, "count": len(agents)}
+
+
+@app.get("/agents/pool/{agent_id}", summary="Get status of a specific pooled agent")
+def pool_agent_status(agent_id: str) -> dict[str, Any]:
+    agent = get_pooled_agent(agent_id)
+    try:
+        tabs = agent.list_tabs()
+    except Exception:
+        tabs = {"tabs": [], "count": 0}
+    return {
+        "agent_id":  agent_id,
+        "active":    True,
+        "url":       agent._page.url if agent._page else None,
+        "tab_count": len(agent._pages),
+        "recording": agent._recording,
+        "tabs":      tabs.get("tabs", []),
+    }
+
+
+@app.delete("/agents/pool/{agent_id}", summary="Stop and remove a pooled agent")
+def pool_agent_stop(agent_id: str) -> dict[str, Any]:
+    with _pool_lock:
+        agent   = _agent_pool.pop(agent_id, None)
+        _planner_pool.pop(agent_id, None)
+    if agent is None:
+        raise HTTPException(status_code=404, detail=f"Agent {agent_id!r} not found in pool.")
+    try:
+        agent.stop()
+    except Exception as exc:
+        logger.warning("Error stopping pooled agent %r: %s", agent_id, exc)
+    logger.info("Pooled agent %r stopped and removed", agent_id)
+    return {"agent_id": agent_id, "status": "stopped"}
+
+
+@app.post("/agents/pool/{agent_id}/task/execute", summary="Execute a step list on a specific pooled agent")
+def pool_agent_execute(agent_id: str, req: PoolAgentExecuteRequest) -> dict[str, Any]:
+    agent = get_pooled_agent(agent_id)
+    with _pool_lock:
+        planner = _planner_pool.get(agent_id)
+    if planner is None:
+        planner = TaskPlanner()
+        planner._system_tools = get_tools()
+        with _pool_lock:
+            _planner_pool[agent_id] = planner
+    try:
+        validated = validate_steps(req.steps)
+    except StepValidationError as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+    results = planner.execute(validated, agent, stop_on_error=req.stop_on_error)
+    failed_count = 0
+    # Build safe_results using the untainted validated step list for step index
+    # and action name — only the error string comes from execution results.
+    safe_results = []
+    for j, (vstep, r) in enumerate(zip(validated, results)):
+        is_err = r.get("status") == "error"
+        if is_err:
+            failed_count += 1
+        safe_results.append({
+            "step":   j,                                      # untainted counter
+            "action": vstep["action"],                        # from untainted validated list
+            "status": "error" if is_err else "ok",            # literal string
+            "error":  _sanitize_error(str(r.get("error", ""))) if is_err else None,
+        })
+    return _safe_response({
+        "agent_id":     agent_id,
+        "success":      failed_count == 0,
+        "failed_count": failed_count,
+        "step_results": safe_results,
+    })
+
+
+@app.post("/agents/execute_parallel", summary="Run tasks across multiple agents in parallel (true concurrency)")
+def agents_execute_parallel(req: ExecuteParallelRequest) -> dict[str, Any]:
+    """
+    Execute step lists across **multiple independent agents** in parallel using
+    a thread pool.  Each agent runs in its own browser process, so tasks are
+    truly concurrent.
+
+    **Two modes:**
+
+    * **Explicit** (``tasks`` list): each item may reference an existing
+      ``agent_id`` (from the pool) or leave it ``null`` to auto-spawn a fresh
+      agent.
+    * **Broadcast** (``agent_count`` + ``steps``): spawn *N* fresh agents and
+      run the same step list on every one of them simultaneously.
+
+    Auto-spawned agents are removed from the pool and stopped automatically
+    when ``auto_stop=true`` (default).
+    """
+    # -- Build the task list -------------------------------------------------
+    if req.tasks is not None:
+        raw_tasks = req.tasks
+    elif req.agent_count is not None and req.steps is not None:
+        raw_tasks = [ParallelAgentTask(steps=req.steps) for _ in range(req.agent_count)]
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either 'tasks' or both 'agent_count' and 'steps'.",
+        )
+
+    if not raw_tasks:
+        raise HTTPException(status_code=422, detail="No tasks provided.")
+
+    # -- Validate all step lists up-front ------------------------------------
+    validated_tasks: list[tuple[str, BrowserAgent, list[dict], bool]] = []
+    spawned_ids: list[str] = []
+    tools = get_tools()
+
+    for task in raw_tasks:
+        try:
+            vsteps = validate_steps(task.steps)
+        except StepValidationError as exc:
+            raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+        if task.agent_id is not None:
+            agent = get_pooled_agent(task.agent_id)
+            validated_tasks.append((task.agent_id, agent, vsteps, False))
+        else:
+            aid = f"agent-{uuid.uuid4().hex[:8]}"
+            agent = BrowserAgent(headless=req.headless)
+            agent.start()
+            with _pool_lock:
+                _agent_pool[aid]   = agent
+                p = TaskPlanner()
+                p._system_tools    = tools
+                _planner_pool[aid] = p
+            spawned_ids.append(aid)
+            validated_tasks.append((aid, agent, vsteps, True))
+
+    # -- Execute in parallel -------------------------------------------------
+    results: list[dict[str, Any]] = [{}] * len(validated_tasks)
+
+    def _run(idx: int, aid: str, agent: BrowserAgent, vsteps: list[dict], spawned: bool) -> dict[str, Any]:
+        planner = TaskPlanner()
+        planner._system_tools = tools
+        task_results = planner.execute(vsteps, agent, stop_on_error=req.stop_on_error)
+        failed = [r for r in task_results if r.get("status") == "error"]
+        return {
+            "agent_id":     aid,
+            "spawned":      spawned,
+            "success":      len(failed) == 0,
+            "failed_count": len(failed),
+            "step_results": [
+                {
+                    "step":   r.get("step"),
+                    "action": r.get("action"),
+                    "status": r.get("status"),
+                    "error":  _sanitize_error(str(r.get("error", ""))) if r.get("status") == "error" else None,
+                }
+                for r in task_results
+            ],
+        }
+
+    with ThreadPoolExecutor(max_workers=len(validated_tasks)) as pool:
+        futures = {
+            pool.submit(_run, i, aid, agent, vsteps, spawned): i
+            for i, (aid, agent, vsteps, spawned) in enumerate(validated_tasks)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:
+                aid = validated_tasks[idx][0]
+                results[idx] = {
+                    "agent_id":     aid,
+                    "spawned":      aid in spawned_ids,
+                    "success":      False,
+                    "failed_count": -1,
+                    "error":        _sanitize_error(str(exc)),
+                    "step_results": [],
+                }
+
+    # -- Auto-stop spawned agents --------------------------------------------
+    if req.auto_stop:
+        for aid in spawned_ids:
+            with _pool_lock:
+                a = _agent_pool.pop(aid, None)
+                _planner_pool.pop(aid, None)
+            if a:
+                try:
+                    a.stop()
+                except Exception:
+                    pass
+
+    return _safe_response({
+        "results":       results,
+        "total_agents":  len(results),
+        "all_succeeded": all(r.get("success", False) for r in results),
+    })
+
+
 # ---------------------------------------------------------------------------
 # Routes: high-priority advanced interactions
 # ---------------------------------------------------------------------------
 
 @app.post("/upload_file", summary="Set file(s) on a file input element")
 def upload_file(req: UploadFileRequest) -> dict[str, Any]:
+    tools = get_tools()
     try:
-        file_path = "|".join(
-            str(safe_path(get_tools().workspace, p.strip()))
-            for p in req.path.split("|")
-        )
+        file_path = str(safe_path(tools.workspace, req.path))
     except PathTraversalError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
     return get_agent().upload_file(req.selector, file_path)
 
 
 @app.post("/download_file", summary="Navigate to a URL and save the triggered download")
 def download_file(req: DownloadFileRequest) -> dict[str, Any]:
+    tools = get_tools()
     try:
-        save_path = str(safe_path(get_tools().workspace, req.path))
+        save_path = str(safe_path(tools.workspace, req.path))
     except PathTraversalError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
     return get_agent().download_file(req.url, save_path)
 
 
