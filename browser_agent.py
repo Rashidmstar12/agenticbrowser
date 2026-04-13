@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,65 @@ _SELECTOR_FALLBACKS: list[tuple[str, list[str]]] = [
         ["input[name='search']", "[aria-label='Search Wikipedia']", "input[type='search']"],
     ),
 ]
+
+def _generate_dynamic_fallbacks(selector: str) -> list[str]:
+    """Derive Playwright semantic fallback selectors from a CSS selector string.
+
+    When all static fallbacks are exhausted, this function inspects common
+    attribute patterns in the selector (``aria-label``, ``placeholder``,
+    ``data-testid``, ``name``, ``title``) and generates equivalent semantic
+    selectors that survive DOM rewrites as long as the visible text / ARIA
+    attributes remain stable.  Class-based fallbacks using ``[class*=...]``
+    are appended last as a broad catch-all.
+
+    Parameters
+    ----------
+    selector:
+        The original CSS selector that failed to match.
+
+    Returns
+    -------
+    list[str]
+        Zero or more semantic selectors to try (in priority order).
+    """
+    candidates: list[str] = []
+
+    # [aria-label="X"] → label=X, text=X
+    m = re.search(r'\[aria-label=["\']([^"\']+)["\']', selector)
+    if m:
+        val = m.group(1)
+        candidates.append(f"label={val}")
+        candidates.append(f"text={val}")
+
+    # [placeholder="X"] → placeholder=X
+    m = re.search(r'\[placeholder=["\']([^"\']+)["\']', selector)
+    if m:
+        candidates.append(f"placeholder={m.group(1)}")
+
+    # input/textarea/select[name="X"] → label=X, placeholder=X
+    m = re.search(r'(?:input|textarea|select)\[name=["\']([^"\']+)["\']', selector)
+    if m:
+        val = m.group(1)
+        candidates.append(f"label={val}")
+        candidates.append(f"placeholder={val}")
+
+    # [data-testid="X"] → text=X
+    m = re.search(r'\[data-testid=["\']([^"\']+)["\']', selector)
+    if m:
+        candidates.append(f"text={m.group(1)}")
+
+    # [title="X"] → title=X
+    m = re.search(r'\[title=["\']([^"\']+)["\']', selector)
+    if m:
+        candidates.append(f"title={m.group(1)}")
+
+    # .some-class → [class*="some-class"] for the most specific (last) classes
+    classes = re.findall(r'\.([a-zA-Z][\w-]*)', selector)
+    for cls in classes[-2:]:  # at most 2 classes (most specific suffix)
+        candidates.append(f"[class*='{cls}']")
+
+    return candidates
+
 
 # CSS selectors that commonly represent popup / overlay elements to auto-dismiss.
 _POPUP_SELECTORS = [
@@ -413,7 +473,25 @@ class BrowserAgent:
                     )
                 return candidate
 
-        tried = ", ".join(repr(c) for c in candidates)
+        # --- Dynamic fallbacks generated from selector attribute hints ---
+        # When all static fallbacks are exhausted, derive semantic alternatives
+        # from the CSS selector's own attributes (aria-label, placeholder, …).
+        dynamic = _generate_dynamic_fallbacks(selector)
+        for candidate in dynamic:
+            try:
+                if candidate.startswith(_SEMANTIC_PREFIXES):
+                    if self.page.locator(candidate).count() > 0:
+                        logger.info("Selector not found; resolved via dynamic semantic fallback")
+                        return candidate
+                else:
+                    el = self.page.query_selector(candidate)
+                    if el is not None:
+                        logger.info("Selector not found; resolved via dynamic semantic fallback")
+                        return candidate
+            except Exception:
+                continue
+
+        tried = ", ".join(repr(c) for c in candidates + dynamic)
         raise ValueError(f"No element found on page. Tried selectors: {tried}")
 
     # ------------------------------------------------------------------

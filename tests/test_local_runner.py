@@ -774,3 +774,121 @@ class TestRunTaskFile:
         agent = _make_agent()
         run_task_file(agent, str(task_file), workspace=str(tmp_path))
         assert (tmp_path / "out.txt").read_text() == "data"
+
+
+# ---------------------------------------------------------------------------
+# Additional _dispatch coverage: upload_file, download_file, drag_drop,
+# right_click, double_click, get_rect, set_network_intercept,
+# clear_network_intercepts, set_viewport, set_geolocation
+# ---------------------------------------------------------------------------
+
+class TestDispatchAdvancedCommands:
+    """Tests for _dispatch() commands that were previously uncovered."""
+
+    def _agent(self) -> MagicMock:
+        return _make_agent()
+
+    def test_upload_file(self, tmp_path, capsys):
+        agent = self._agent()
+        agent.upload_file.return_value = {"selector": "input", "status": "ok"}
+        _dispatch(agent, "upload_file input /tmp/file.txt")
+        agent.upload_file.assert_called_once_with("input", "/tmp/file.txt")
+        out = capsys.readouterr().out
+        assert "Uploaded" in out
+
+    def test_upload_file_with_tools_workspace(self, tmp_path, capsys):
+        agent = self._agent()
+        agent.upload_file.return_value = {"selector": "input", "status": "ok"}
+        tools = MagicMock()
+        tools.workspace = tmp_path
+        _dispatch(agent, "upload_file input file.txt", tools=tools)
+        expected_path = str(tmp_path / "file.txt")
+        agent.upload_file.assert_called_once_with("input", expected_path)
+
+    def test_download_file(self, capsys):
+        agent = self._agent()
+        agent.download_file.return_value = {"saved_to": "/tmp/f.bin", "filename": "f.bin"}
+        _dispatch(agent, "download_file https://example.com/f.bin /tmp/f.bin")
+        agent.download_file.assert_called_once_with("https://example.com/f.bin", "/tmp/f.bin")
+        out = capsys.readouterr().out
+        assert "Saved to" in out
+
+    def test_download_file_with_tools_workspace(self, tmp_path, capsys):
+        agent = self._agent()
+        agent.download_file.return_value = {"saved_to": "/tmp/f.bin", "filename": "f.bin"}
+        tools = MagicMock()
+        tools.workspace = tmp_path
+        _dispatch(agent, "download_file https://example.com/f.bin out.bin", tools=tools)
+        expected_path = str(tmp_path / "out.bin")
+        agent.download_file.assert_called_once_with("https://example.com/f.bin", expected_path)
+
+    def test_drag_drop(self):
+        agent = self._agent()
+        agent.drag_and_drop.return_value = {"status": "ok"}
+        _dispatch(agent, "drag_drop #src #dst")
+        agent.drag_and_drop.assert_called_once_with("#src", "#dst")
+
+    def test_right_click(self):
+        agent = self._agent()
+        agent.right_click.return_value = {"status": "ok"}
+        _dispatch(agent, "right_click a.link")
+        agent.right_click.assert_called_once_with("a.link")
+
+    def test_double_click(self):
+        agent = self._agent()
+        agent.double_click.return_value = {"status": "ok"}
+        _dispatch(agent, "double_click button")
+        agent.double_click.assert_called_once_with("button")
+
+    def test_get_rect(self, capsys):
+        agent = self._agent()
+        agent.get_element_rect.return_value = {"x": 10, "y": 20, "width": 100, "height": 50}
+        _dispatch(agent, "get_rect div.box")
+        agent.get_element_rect.assert_called_once_with("div.box")
+        out = capsys.readouterr().out
+        assert "x=10" in out
+
+    def test_set_network_intercept(self, capsys):
+        agent = self._agent()
+        agent.set_network_intercept.return_value = {"url_pattern": "*.jpg", "action": "abort"}
+        _dispatch(agent, "set_network_intercept *.jpg abort")
+        agent.set_network_intercept.assert_called_once_with("*.jpg", action="abort")
+        out = capsys.readouterr().out
+        assert "Intercept set" in out
+
+    def test_set_network_intercept_default_action(self, capsys):
+        agent = self._agent()
+        agent.set_network_intercept.return_value = {"url_pattern": "*.css", "action": "abort"}
+        _dispatch(agent, "set_network_intercept *.css")
+        agent.set_network_intercept.assert_called_once_with("*.css", action="abort")
+
+    def test_clear_network_intercepts(self, capsys):
+        agent = self._agent()
+        agent.clear_network_intercepts.return_value = {"cleared": 3}
+        _dispatch(agent, "clear_network_intercepts")
+        agent.clear_network_intercepts.assert_called_once()
+        out = capsys.readouterr().out
+        assert "Cleared 3" in out
+
+    def test_set_viewport(self, capsys):
+        agent = self._agent()
+        agent.set_viewport.return_value = {"width": 1920, "height": 1080, "status": "ok"}
+        _dispatch(agent, "set_viewport 1920 1080")
+        agent.set_viewport.assert_called_once_with(1920, 1080)
+        out = capsys.readouterr().out
+        assert "1920x1080" in out
+
+    def test_set_geolocation(self, capsys):
+        agent = self._agent()
+        agent.set_geolocation.return_value = {"lat": 40.7, "lng": -74.0}
+        # split(None, 2) means parts[2] = "-74.0" with only 3 parts when accuracy omitted
+        _dispatch(agent, "set_geolocation 40.7 -74.0")
+        agent.set_geolocation.assert_called_once_with(40.7, -74.0, accuracy=10.0)
+        out = capsys.readouterr().out
+        assert "lat=40.7" in out
+
+    def test_set_geolocation_default_accuracy(self, capsys):
+        agent = self._agent()
+        agent.set_geolocation.return_value = {"lat": 51.5, "lng": 0.1}
+        _dispatch(agent, "set_geolocation 51.5 0.1")
+        agent.set_geolocation.assert_called_once_with(51.5, 0.1, accuracy=10.0)

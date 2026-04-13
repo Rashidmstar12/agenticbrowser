@@ -11,6 +11,7 @@ Or use the helper:
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json as _json
 import logging
 import os
@@ -77,18 +78,34 @@ _agent_pool:   dict[str, BrowserAgent]   = {}
 _planner_pool: dict[str, TaskPlanner]    = {}
 _pool_lock:    threading.Lock            = threading.Lock()
 
+# Per-request context variable — set by _agent_routing_middleware so that
+# get_agent() / get_planner() can transparently route to a pooled agent.
+_current_agent_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_agent_id", default=None
+)
+
 
 def _workspace() -> str:
     return os.environ.get("BROWSER_WORKSPACE", "workspace")
 
 
 def get_agent() -> BrowserAgent:
+    aid = _current_agent_id.get()
+    if aid:
+        return get_pooled_agent(aid)
     if _agent is None or _agent._page is None:
         raise HTTPException(status_code=400, detail="Browser session is not active. POST /session/start first.")
     return _agent
 
 
 def get_planner() -> TaskPlanner:
+    aid = _current_agent_id.get()
+    if aid:
+        with _pool_lock:
+            planner = _planner_pool.get(aid)
+        if planner is None:
+            raise HTTPException(status_code=404, detail=f"Agent {aid!r} not found in pool.")
+        return planner
     if _planner is None:
         raise HTTPException(status_code=400, detail="Browser session is not active. POST /session/start first.")
     return _planner
@@ -176,6 +193,24 @@ async def _api_key_middleware(request: Request, call_next):  # type: ignore[type
                     content={"detail": "Invalid or missing API key. Set X-API-Key header."},
                 )
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _agent_routing_middleware(request: Request, call_next):  # type: ignore[type-arg]
+    """Read ``X-Agent-Id`` header (or ``?agent_id=`` query param) and store the
+    value in a context variable so every route can transparently use a pooled
+    agent instead of the global singleton — without requiring any signature
+    changes to existing routes.
+    """
+    aid = (
+        request.headers.get("X-Agent-Id")
+        or request.query_params.get("agent_id")
+    ) or None
+    token = _current_agent_id.set(aid)
+    try:
+        return await call_next(request)
+    finally:
+        _current_agent_id.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +470,39 @@ class TaskPlanRequest(BaseModel):
 class TaskExecuteRequest(BaseModel):
     steps: list[dict] = Field(..., description="Pre-validated list of step objects to execute")
     stop_on_error: bool = Field(True, description="Stop execution on the first failed step")
+
+
+class VisionPlanRequest(BaseModel):
+    intent: str = Field(
+        ...,
+        description=(
+            "Natural-language task to perform on the current page. "
+            "A screenshot is taken automatically and sent to the vision LLM."
+        ),
+    )
+    provider: str | None = Field(
+        None,
+        description=(
+            "Vision provider to use: 'openai', 'anthropic', 'gemini', or 'ollama'. "
+            "When omitted the server auto-detects from available API keys."
+        ),
+    )
+
+
+class VisionRunRequest(BaseModel):
+    intent: str = Field(
+        ...,
+        description="Natural-language task to vision-plan and execute on the current page.",
+    )
+    stop_on_error: bool = Field(True, description="Stop execution on the first failed step")
+    log_path: str | None = Field(None, description="Workspace-relative path to save the execution log")
+    provider: str | None = Field(
+        None,
+        description=(
+            "Vision provider to use: 'openai', 'anthropic', 'gemini', or 'ollama'. "
+            "When omitted the server auto-detects from available API keys."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1366,6 +1434,93 @@ def task_execute(req: TaskExecuteRequest) -> dict[str, Any]:
 def task_schema() -> dict[str, Any]:
     """Return the full STEP_SCHEMA so clients know what actions are valid."""
     return {"schema": STEP_SCHEMA}
+
+
+@app.post("/task/vision_plan", summary="Plan a task using a screenshot of the current page")
+def task_vision_plan(req: VisionPlanRequest) -> dict[str, Any]:
+    """
+    Take a screenshot of the current page and send it together with *intent*
+    to a vision-capable LLM to generate a grounded step plan.
+
+    The vision provider is selected in priority order: ``OPENAI_API_KEY`` →
+    ``ANTHROPIC_API_KEY`` → ``GOOGLE_API_KEY`` → Ollama.  You may also specify
+    the *provider* field explicitly (``"openai"``, ``"anthropic"``, ``"gemini"``,
+    or ``"ollama"``).  Falls back to text-only planning when no provider is
+    available or the vision call fails.  An active browser session is required.
+    """
+    planner = get_planner()
+    agent = get_agent()
+    try:
+        steps = planner.vision_plan(req.intent, agent, provider=req.provider)
+        return {"intent": req.intent, "steps": steps, "count": len(steps), "vision": True}
+    except (ValueError, StepValidationError) as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+
+@app.post("/task/vision_run", summary="Plan with vision and execute a browser task")
+def task_vision_run(req: VisionRunRequest) -> dict[str, Any]:
+    """
+    Take a screenshot of the current page, generate a grounded step plan
+    using a vision-capable LLM, then execute the steps.
+
+    The provider is auto-detected from available API keys or can be set
+    explicitly via the *provider* field.  Falls back to text-only planning
+    when no vision provider is available.
+    """
+    planner = get_planner()
+    agent = get_agent()
+    try:
+        steps = planner.vision_plan(req.intent, agent, provider=req.provider)
+    except (ValueError, StepValidationError) as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
+    exec_results = planner.execute(steps, agent, stop_on_error=req.stop_on_error)
+
+    safe_step_results = []
+    failed_count = 0
+    for step, r in zip(steps, exec_results):
+        is_error = r.get("status") == "error"
+        if is_error:
+            failed_count += 1
+        safe_step_results.append({
+            "step":   len(safe_step_results),
+            "action": step["action"],
+            "status": "error" if is_error else "ok",
+            "error":  _sanitize_error(str(r.get("error", ""))) if is_error else None,
+        })
+
+    if req.log_path:
+        import json as _log_json
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+        _tools = get_tools()
+        log_entry = {
+            "intent":       req.intent,
+            "vision":       True,
+            "success":      failed_count == 0,
+            "timestamp":    _dt.now(_tz.utc).isoformat(),
+            "step_count":   len(steps),
+            "failed_count": failed_count,
+            "steps":        [{"action": s["action"]} for s in steps],
+            "results":      safe_step_results,
+        }
+        try:
+            _tools.write_file(req.log_path, _log_json.dumps(log_entry, indent=2))
+        except Exception as _exc:
+            logger.warning(
+                "Could not save vision_run log: %s", _sanitize_error(str(_exc))
+            )
+
+    safe_response: dict[str, Any] = {
+        "success":      failed_count == 0,
+        "intent":       req.intent,
+        "vision":       True,
+        "failed_count": failed_count,
+        "results":      safe_step_results,
+    }
+    if failed_count > 0:
+        raise HTTPException(status_code=422, detail=safe_response)
+    return safe_response
 
 
 # ---------------------------------------------------------------------------

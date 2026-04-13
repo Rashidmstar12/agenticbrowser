@@ -208,3 +208,114 @@ class _FakeBrowserBackend:
 
     def evaluate(self, script):
         return ActionResult(success=True)
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage for missing actions: back, forward, reload, hover,
+# select, find, find_buttons, find_inputs, screenshot_b64, evaluate,
+# get_html, wait_for, scroll_bottom, scroll_top
+# ---------------------------------------------------------------------------
+
+class TestAgentBrowserMissingActions:
+    def _make_agent(self):
+        from agenticbrowser.agent import AgentBrowser
+        agent = AgentBrowser()
+        agent._browser = _FakeBrowserBackend()
+        return agent
+
+    def test_back(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "back"})
+        assert result.success is True
+
+    def test_forward(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "forward"})
+        assert result.success is True
+
+    def test_reload(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "reload"})
+        assert result.success is True
+
+    def test_hover(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "hover", "selector": "a"})
+        assert result.success is True
+
+    def test_select(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "select", "selector": "select", "value": "opt1"})
+        assert result.success is True
+
+    def test_find(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "find", "selector": "div"})
+        assert result.success is True
+
+    def test_find_buttons(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "find_buttons"})
+        assert result.success is True
+
+    def test_find_inputs(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "find_inputs"})
+        assert result.success is True
+
+    def test_screenshot_b64(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "screenshot_b64"})
+        import base64
+        # Should be a valid base64 string
+        decoded = base64.b64decode(result)
+        assert len(decoded) > 0
+
+    def test_evaluate(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "evaluate", "script": "1 + 1"})
+        assert result.success is True
+
+    def test_get_html(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "get_html"})
+        assert result.success is True
+
+    def test_wait_for(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "wait_for", "selector": ".btn"})
+        assert result.success is True
+
+    def test_wait_for_custom_state(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "wait_for", "selector": ".btn", "state": "hidden"})
+        assert result.success is True
+
+    def test_scroll_bottom(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "scroll_bottom"})
+        assert result.success is True
+
+    def test_scroll_top(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "scroll_top"})
+        assert result.success is True
+
+    def test_navigate_with_wait_until(self):
+        agent = self._make_agent()
+        result = agent.run_action(
+            {"action": "navigate", "url": "https://example.com", "wait_until": "networkidle"}
+        )
+        assert result.success is True
+
+    def test_type_without_clear(self):
+        agent = self._make_agent()
+        result = agent.run_action(
+            {"action": "type", "selector": "input", "text": "hello", "clear": False}
+        )
+        assert result.success is True
+
+    def test_press_with_selector(self):
+        agent = self._make_agent()
+        result = agent.run_action({"action": "press", "key": "Tab", "selector": "input"})
+        assert result.success is True
