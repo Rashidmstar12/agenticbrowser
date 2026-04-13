@@ -1597,6 +1597,7 @@ class TaskPlanner:
         intent: str,
         agent: Any,
         *,
+        initial_steps: list[dict[str, Any]] | None = None,
         max_steps: int = 20,
         checkpoint_every: int = 3,
         stop_on_error: bool = True,
@@ -1618,6 +1619,12 @@ class TaskPlanner:
             Natural-language task description.
         agent:
             A ``BrowserAgent`` instance to execute steps against.
+        initial_steps:
+            Optional pre-validated step list.  When provided, ``plan()``
+            is skipped and these steps are used as the starting queue.
+            Callers that already hold a validated plan (e.g. the HTTP
+            route that called ``plan()`` to get an untainted step list)
+            should pass it here to avoid a redundant LLM call.
         max_steps:
             Hard ceiling on the total number of steps executed (including
             any injected corrective steps).  Hitting this limit stops the
@@ -1675,26 +1682,29 @@ class TaskPlanner:
         checkpoint_every = max(1, checkpoint_every)
 
         # 1. Build initial plan -----------------------------------------------
-        try:
-            initial_steps = self.plan(intent)
-        except (ValueError, StepValidationError) as exc:
-            # Sanitize the exception message at the source so it cannot carry
-            # stack-trace information into callers (e.g. the HTTP response layer).
-            _safe_err = str(exc).splitlines()[0][:500]
-            logger.warning("agentic_run plan failed: %s", _safe_err)
-            return {
-                "success":                  False,
-                "verified":                 None,
-                "intent":                   intent,
-                "stopped_reason":           "error",
-                "recovery_steps_injected":  0,
-                "steps":                    [],
-                "results":                  [],
-                "failed_count":             0,
-            }
+        if initial_steps is not None:
+            _plan = initial_steps
+        else:
+            try:
+                _plan = self.plan(intent)
+            except (ValueError, StepValidationError) as exc:
+                # Sanitize the exception message at the source so it cannot carry
+                # stack-trace information into callers (e.g. the HTTP response layer).
+                _safe_err = str(exc).splitlines()[0][:500]
+                logger.warning("agentic_run plan failed: %s", _safe_err)
+                return {
+                    "success":                  False,
+                    "verified":                 None,
+                    "intent":                   intent,
+                    "stopped_reason":           "error",
+                    "recovery_steps_injected":  0,
+                    "steps":                    [],
+                    "results":                  [],
+                    "failed_count":             0,
+                }
 
-        queue:      list[dict[str, Any]] = list(initial_steps)
-        all_steps:  list[dict[str, Any]] = list(initial_steps)  # grows when steps are injected
+        queue:      list[dict[str, Any]] = list(_plan)
+        all_steps:  list[dict[str, Any]] = list(_plan)  # grows when steps are injected
         executed:   list[dict[str, Any]] = []
         injected_count = 0
         total_executed = 0

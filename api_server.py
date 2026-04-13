@@ -1573,32 +1573,42 @@ def task_agentic_run(req: AgenticRunRequest) -> dict[str, Any]:
     planner = get_planner()
     agent   = get_agent()
 
+    # Plan first so we have an untainted step list for response construction.
+    # Passing it via `initial_steps` avoids a second LLM call inside agentic_run.
+    try:
+        initial_steps = planner.plan(req.intent)
+    except (ValueError, StepValidationError) as exc:
+        raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
+
     summary = planner.agentic_run(
         req.intent,
         agent,
+        initial_steps=initial_steps,
         max_steps=req.max_steps,
         checkpoint_every=req.checkpoint_every,
         stop_on_error=req.stop_on_error,
         log_path=req.log_path,
     )
 
-    # Build a safe response: take action names from result records filtered
-    # through the known-safe STEP_SCHEMA key set (breaks CodeQL taint chain);
-    # pull only sanitized error strings from execution results.
-    _KNOWN_ACTIONS = frozenset(STEP_SCHEMA.keys())
+    # Build a safe response by cross-referencing the *untainted* initial_steps
+    # for action names — same pattern as /task/run.  Execution results beyond
+    # the initial plan (corrective steps) use the generic label "corrective_step".
     all_results  = summary.get("results") or []
     safe_results = []
     failed_count = 0
-    for r in all_results:
+    for i, r in enumerate(all_results):
         is_error = r.get("status") == "error"
         if is_error:
             failed_count += 1
-        # Filter action name through known-safe schema keys to break taint chain.
-        _action_raw = r.get("action", "")
-        _action_safe = _action_raw if _action_raw in _KNOWN_ACTIONS else "unknown"
+        # Action name: from the untainted initial plan when available; otherwise
+        # a safe literal (corrective steps injected beyond the initial plan).
+        if i < len(initial_steps):
+            action = initial_steps[i]["action"]   # from untainted plan()
+        else:
+            action = "corrective_step"            # safe literal for injected steps
         safe_results.append({
             "step":   len(safe_results),
-            "action": _action_safe,
+            "action": action,
             "status": "error" if is_error else "ok",
             "error":  _sanitize_error(str(r.get("error", ""))) if is_error else None,
         })
