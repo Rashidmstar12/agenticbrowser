@@ -114,7 +114,6 @@ class TestAgenticRunLoop:
             result = planner.agentic_run("impossible task", agent)
         assert result["success"] is False
         assert result["stopped_reason"] == "error"
-        assert "error" in result
 
 
 # ---------------------------------------------------------------------------

@@ -1678,6 +1678,10 @@ class TaskPlanner:
         try:
             initial_steps = self.plan(intent)
         except (ValueError, StepValidationError) as exc:
+            # Sanitize the exception message at the source so it cannot carry
+            # stack-trace information into callers (e.g. the HTTP response layer).
+            _safe_err = str(exc).splitlines()[0][:500]
+            logger.warning("agentic_run plan failed: %s", _safe_err)
             return {
                 "success":                  False,
                 "verified":                 None,
@@ -1687,7 +1691,6 @@ class TaskPlanner:
                 "steps":                    [],
                 "results":                  [],
                 "failed_count":             0,
-                "error":                    str(exc),
             }
 
         queue:      list[dict[str, Any]] = list(initial_steps)
@@ -1714,11 +1717,14 @@ class TaskPlanner:
             try:
                 result = self._execute_step(agent, step)
             except Exception as exc:
+                # Sanitize exception message at source: take first line only,
+                # cap at 500 chars — same sanitization the HTTP layer applies.
+                _safe_err = str(exc).splitlines()[0][:500]
                 err_record: dict[str, Any] = {
                     "step":   total_executed,
                     "action": action,
                     "status": "error",
-                    "error":  str(exc),
+                    "error":  _safe_err,
                 }
                 executed.append(err_record)
                 total_executed += 1
