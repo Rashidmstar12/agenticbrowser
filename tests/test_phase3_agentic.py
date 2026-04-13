@@ -381,36 +381,49 @@ class TestAgenticRecovery:
 # ---------------------------------------------------------------------------
 
 
+def _make_openai_mock(content: str) -> tuple[MagicMock, MagicMock]:
+    """Return (mock_openai_module, mock_client) wired to return *content*."""
+    fake_response = MagicMock()
+    fake_response.choices[0].message.content = content
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value = fake_response
+    mock_openai = MagicMock()
+    mock_openai.OpenAI.return_value = mock_client
+    return mock_openai, mock_client
+
+
+def _make_openai_mock_error(exc: Exception) -> MagicMock:
+    """Return a mock openai module whose client raises *exc* on create()."""
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.side_effect = exc
+    mock_openai = MagicMock()
+    mock_openai.OpenAI.return_value = mock_client
+    return mock_openai
+
+
 class TestCallObserveDecide:
     def test_returns_done_on_openai(self):
-        mock_response = MagicMock()
-        mock_response.choices[0].message.content = '{"decision": "done"}'
-        with patch("openai.OpenAI") as mock_cls:
-            mock_cls.return_value.chat.completions.create.return_value = mock_response
+        import json as _json
+        mock_openai, _ = _make_openai_mock(_json.dumps({"decision": "done"}))
+        with patch.dict(sys.modules, {"openai": mock_openai}):
             with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
                 result = _call_observe_decide("task", "http://x.com", "text", [], "openai")
         assert result["decision"] == "done"
 
     def test_returns_abort_with_reason(self):
-        mock_response = MagicMock()
-        mock_response.choices[0].message.content = '{"decision": "abort", "reason": "captcha"}'
-        with patch("openai.OpenAI") as mock_cls:
-            mock_cls.return_value.chat.completions.create.return_value = mock_response
+        import json as _json
+        mock_openai, _ = _make_openai_mock(_json.dumps({"decision": "abort", "reason": "captcha"}))
+        with patch.dict(sys.modules, {"openai": mock_openai}):
             with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
                 result = _call_observe_decide("task", "http://x.com", "text", [], "openai")
         assert result["decision"] == "abort"
         assert "captcha" in result["reason"]
 
     def test_returns_continue_with_validated_steps(self):
+        import json as _json
         corrective = [{"action": "close_popups"}]
-        mock_response = MagicMock()
-        import json
-        mock_response.choices[0].message.content = json.dumps({
-            "decision": "continue",
-            "steps": corrective,
-        })
-        with patch("openai.OpenAI") as mock_cls:
-            mock_cls.return_value.chat.completions.create.return_value = mock_response
+        mock_openai, _ = _make_openai_mock(_json.dumps({"decision": "continue", "steps": corrective}))
+        with patch.dict(sys.modules, {"openai": mock_openai}):
             with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
                 result = _call_observe_decide("task", "http://x.com", "text", [], "openai")
         assert result["decision"] == "continue"
@@ -418,14 +431,11 @@ class TestCallObserveDecide:
         assert result["steps"][0]["action"] == "close_popups"
 
     def test_invalid_corrective_steps_are_dropped(self):
-        mock_response = MagicMock()
-        import json
-        mock_response.choices[0].message.content = json.dumps({
-            "decision": "continue",
-            "steps": [{"action": "INVALID"}],
-        })
-        with patch("openai.OpenAI") as mock_cls:
-            mock_cls.return_value.chat.completions.create.return_value = mock_response
+        import json as _json
+        mock_openai, _ = _make_openai_mock(
+            _json.dumps({"decision": "continue", "steps": [{"action": "INVALID"}]})
+        )
+        with patch.dict(sys.modules, {"openai": mock_openai}):
             with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
                 result = _call_observe_decide("task", "http://x.com", "text", [], "openai")
         assert result["decision"] == "continue"
@@ -437,42 +447,34 @@ class TestCallObserveDecide:
         assert result.get("steps", []) == []
 
     def test_llm_network_failure_returns_continue(self):
-        with patch("openai.OpenAI") as mock_cls:
-            mock_cls.return_value.chat.completions.create.side_effect = Exception("network")
+        mock_openai = _make_openai_mock_error(Exception("network"))
+        with patch.dict(sys.modules, {"openai": mock_openai}):
             with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
                 result = _call_observe_decide("task", "http://x.com", "text", [], "openai")
         assert result["decision"] == "continue"
         assert result.get("steps", []) == []
 
     def test_malformed_json_returns_continue(self):
-        mock_response = MagicMock()
-        mock_response.choices[0].message.content = "not valid json at all"
-        with patch("openai.OpenAI") as mock_cls:
-            mock_cls.return_value.chat.completions.create.return_value = mock_response
+        mock_openai, _ = _make_openai_mock("not valid json at all")
+        with patch.dict(sys.modules, {"openai": mock_openai}):
             with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
                 result = _call_observe_decide("task", "http://x.com", "text", [], "openai")
         assert result["decision"] == "continue"
 
     def test_unexpected_decision_value_defaults_to_continue(self):
-        mock_response = MagicMock()
-        mock_response.choices[0].message.content = '{"decision": "maybe"}'
-        with patch("openai.OpenAI") as mock_cls:
-            mock_cls.return_value.chat.completions.create.return_value = mock_response
+        import json as _json
+        mock_openai, _ = _make_openai_mock(_json.dumps({"decision": "maybe"}))
+        with patch.dict(sys.modules, {"openai": mock_openai}):
             with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
                 result = _call_observe_decide("task", "http://x.com", "text", [], "openai")
         assert result["decision"] == "continue"
 
     def test_corrective_steps_capped_at_3(self):
         """Even if the model returns 5 corrective steps, only 3 are accepted."""
+        import json as _json
         big_list = [{"action": "close_popups"} for _ in range(5)]
-        mock_response = MagicMock()
-        import json
-        mock_response.choices[0].message.content = json.dumps({
-            "decision": "continue",
-            "steps": big_list,
-        })
-        with patch("openai.OpenAI") as mock_cls:
-            mock_cls.return_value.chat.completions.create.return_value = mock_response
+        mock_openai, _ = _make_openai_mock(_json.dumps({"decision": "continue", "steps": big_list}))
+        with patch.dict(sys.modules, {"openai": mock_openai}):
             with patch.dict("os.environ", {"OPENAI_API_KEY": "test-key"}):
                 result = _call_observe_decide("task", "http://x.com", "text", [], "openai")
         assert len(result["steps"]) == 3
