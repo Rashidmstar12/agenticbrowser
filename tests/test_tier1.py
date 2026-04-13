@@ -23,7 +23,14 @@ from fastapi.testclient import TestClient
 import api_server
 from api_server import app
 from browser_agent import BrowserAgent, _generate_dynamic_fallbacks
-from task_planner import StepValidationError, TaskPlanner, _call_vision_openai
+from task_planner import (
+    StepValidationError,
+    TaskPlanner,
+    _call_vision_anthropic,
+    _call_vision_gemini,
+    _call_vision_ollama,
+    _call_vision_openai,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers shared across test sections
@@ -466,3 +473,327 @@ class TestVisionApiRoutes:
             resp = self.client.post("/task/vision_plan", json={"intent": "do something"})
 
         assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# T1-2  _call_vision_anthropic
+# ---------------------------------------------------------------------------
+
+class TestCallVisionAnthropic:
+    def _run(self, content: str, intent: str = "open example.com", b64: str = "base64=="):
+        import sys
+
+        fake_content = MagicMock()
+        fake_content.text = content
+        fake_message = MagicMock()
+        fake_message.content = [fake_content]
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = fake_message
+        mock_anthropic = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "ant-test"}):
+            with patch.dict(sys.modules, {"anthropic": mock_anthropic}):
+                return _call_vision_anthropic(intent, b64), mock_client
+
+    def test_returns_steps_from_valid_json_array(self):
+        steps, _ = self._run('[{"action": "navigate", "url": "https://example.com"}]')
+        assert steps[0]["action"] == "navigate"
+
+    def test_strips_markdown_fences(self):
+        content = '```json\n[{"action": "navigate", "url": "https://example.com"}]\n```'
+        steps, _ = self._run(content)
+        assert len(steps) == 1
+
+    def test_raises_on_no_json_array(self):
+        import sys
+
+        fake_content = MagicMock()
+        fake_content.text = "Sorry, I cannot help."
+        fake_message = MagicMock()
+        fake_message.content = [fake_content]
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = fake_message
+        mock_anthropic = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "ant-test"}):
+            with patch.dict(sys.modules, {"anthropic": mock_anthropic}):
+                with pytest.raises(StepValidationError, match="no JSON array"):
+                    _call_vision_anthropic("do something", "base64==")
+
+    def test_uses_custom_model_env(self):
+        import sys
+
+        fake_content = MagicMock()
+        fake_content.text = '[{"action": "navigate", "url": "https://example.com"}]'
+        fake_message = MagicMock()
+        fake_message.content = [fake_content]
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = fake_message
+        mock_anthropic = MagicMock()
+        mock_anthropic.Anthropic.return_value = mock_client
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "ant-test", "ANTHROPIC_VISION_MODEL": "claude-3-opus-20240229"}):
+            with patch.dict(sys.modules, {"anthropic": mock_anthropic}):
+                _call_vision_anthropic("open example.com", "b64")
+
+        call_kwargs = mock_client.messages.create.call_args
+        assert call_kwargs.kwargs["model"] == "claude-3-opus-20240229"
+
+
+# ---------------------------------------------------------------------------
+# T1-2  _call_vision_gemini
+# ---------------------------------------------------------------------------
+
+class TestCallVisionGemini:
+    def _run(self, response_text: str, intent: str = "open example.com", b64: str = "AAAA"):
+        fake_response = MagicMock()
+        fake_response.text = response_text
+        mock_model_instance = MagicMock()
+        mock_model_instance.generate_content.return_value = fake_response
+
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "goog-test"}):
+            with patch("google.generativeai.configure"):
+                with patch("google.generativeai.GenerativeModel", return_value=mock_model_instance):
+                    result = _call_vision_gemini(intent, b64)
+        return result, mock_model_instance
+
+    def test_returns_steps_from_valid_json_array(self):
+        steps, _ = self._run('[{"action": "navigate", "url": "https://example.com"}]')
+        assert steps[0]["action"] == "navigate"
+
+    def test_strips_markdown_fences(self):
+        content = '```json\n[{"action": "navigate", "url": "https://example.com"}]\n```'
+        steps, _ = self._run(content)
+        assert len(steps) == 1
+
+    def test_raises_on_no_json_array(self):
+        fake_response = MagicMock()
+        fake_response.text = "I cannot help."
+        mock_model_instance = MagicMock()
+        mock_model_instance.generate_content.return_value = fake_response
+
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "goog-test"}):
+            with patch("google.generativeai.configure"):
+                with patch("google.generativeai.GenerativeModel", return_value=mock_model_instance):
+                    with pytest.raises(StepValidationError, match="no JSON array"):
+                        _call_vision_gemini("do something", "AAAA")
+
+    def test_uses_custom_model_env(self):
+        fake_response = MagicMock()
+        fake_response.text = '[{"action": "navigate", "url": "https://example.com"}]'
+        mock_model_instance = MagicMock()
+        mock_model_instance.generate_content.return_value = fake_response
+
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "goog-test", "GEMINI_VISION_MODEL": "gemini-1.5-flash"}):
+            with patch("google.generativeai.configure"):
+                with patch("google.generativeai.GenerativeModel", return_value=mock_model_instance) as mock_gm:
+                    _call_vision_gemini("open example.com", "AAAA")
+
+        call_kwargs = mock_gm.call_args
+        assert call_kwargs.kwargs.get("model_name") == "gemini-1.5-flash"
+
+
+# ---------------------------------------------------------------------------
+# T1-2  _call_vision_ollama
+# ---------------------------------------------------------------------------
+
+class TestCallVisionOllama:
+    def _run(self, response_text: str, intent: str = "open example.com", b64: str = "base64=="):
+        import json as _json
+
+        body = _json.dumps({"response": response_text}).encode()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = body
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            with patch.dict("os.environ", {"OLLAMA_HOST": "http://localhost:11434"}):
+                return _call_vision_ollama(intent, b64)
+
+    def test_returns_steps_from_valid_json_array(self):
+        steps = self._run('[{"action": "navigate", "url": "https://example.com"}]')
+        assert steps[0]["action"] == "navigate"
+
+    def test_strips_markdown_fences(self):
+        content = '```json\n[{"action": "navigate", "url": "https://example.com"}]\n```'
+        steps = self._run(content)
+        assert len(steps) == 1
+
+    def test_raises_on_no_json_array(self):
+        body = b'{"response": "I cannot help."}'
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = body
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            with pytest.raises(StepValidationError, match="no JSON array"):
+                _call_vision_ollama("do something", "base64==")
+
+    def test_uses_custom_model_env(self):
+        import json as _json
+
+        body = _json.dumps({"response": '[{"action": "navigate", "url": "https://example.com"}]'}).encode()
+        mock_resp = MagicMock()
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_resp.read.return_value = body
+
+        captured = {}
+
+        def _fake_urlopen(req, timeout=None):
+            captured["payload"] = _json.loads(req.data)
+            return mock_resp
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            with patch.dict("os.environ", {"OLLAMA_HOST": "http://localhost:11434", "OLLAMA_VISION_MODEL": "bakllava"}):
+                _call_vision_ollama("open example.com", "b64")
+
+        assert captured["payload"]["model"] == "bakllava"
+
+
+# ---------------------------------------------------------------------------
+# T1-2  vision_plan provider dispatch
+# ---------------------------------------------------------------------------
+
+class TestVisionPlanProviderDispatch:
+    def test_uses_openai_when_key_set(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        planner = TaskPlanner()
+        agent = MagicMock()
+        agent.screenshot.return_value = {"base64": "abc123"}
+        expected = [{"action": "navigate", "url": "https://example.com", "wait_until": "domcontentloaded", "retry": 0, "retry_delay": 1.0}]
+        with patch("task_planner._call_vision_openai", return_value=expected) as mock_fn:
+            result = planner.vision_plan("go to example", agent)
+        mock_fn.assert_called_once_with("go to example", "abc123")
+        assert result == expected
+
+    def test_uses_anthropic_when_only_anthropic_key(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        planner = TaskPlanner()
+        agent = MagicMock()
+        agent.screenshot.return_value = {"base64": "abc123"}
+        expected = [{"action": "navigate", "url": "https://example.com", "wait_until": "domcontentloaded", "retry": 0, "retry_delay": 1.0}]
+        with patch("task_planner._call_vision_anthropic", return_value=expected) as mock_fn:
+            result = planner.vision_plan("go to example", agent)
+        mock_fn.assert_called_once_with("go to example", "abc123")
+        assert result == expected
+
+    def test_uses_gemini_when_only_google_key(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("GOOGLE_API_KEY", "goog-test")
+        planner = TaskPlanner()
+        agent = MagicMock()
+        agent.screenshot.return_value = {"base64": "abc123"}
+        expected = [{"action": "navigate", "url": "https://example.com", "wait_until": "domcontentloaded", "retry": 0, "retry_delay": 1.0}]
+        with patch("task_planner._call_vision_gemini", return_value=expected) as mock_fn:
+            result = planner.vision_plan("go to example", agent)
+        mock_fn.assert_called_once_with("go to example", "abc123")
+        assert result == expected
+
+    def test_explicit_provider_overrides_auto_detect(self, monkeypatch):
+        """Explicit provider= overrides even when OPENAI_API_KEY is present."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "ant-test")
+        planner = TaskPlanner()
+        agent = MagicMock()
+        agent.screenshot.return_value = {"base64": "abc123"}
+        expected = [{"action": "navigate", "url": "https://example.com", "wait_until": "domcontentloaded", "retry": 0, "retry_delay": 1.0}]
+        with patch("task_planner._call_vision_anthropic", return_value=expected) as mock_fn:
+            result = planner.vision_plan("go to example", agent, provider="anthropic")
+        mock_fn.assert_called_once_with("go to example", "abc123")
+        assert result == expected
+
+    def test_falls_back_to_plan_when_no_provider(self, monkeypatch):
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("OLLAMA_HOST", raising=False)
+        planner = TaskPlanner()
+        agent = MagicMock()
+        fallback = [{"action": "navigate", "url": "https://google.com", "wait_until": "domcontentloaded", "retry": 0, "retry_delay": 1.0}]
+        with patch.object(planner, "plan", return_value=fallback) as mock_plan:
+            with patch("task_planner._ollama_running", return_value=False):
+                result = planner.vision_plan("go to google", agent)
+        mock_plan.assert_called_once_with("go to google")
+        assert result == fallback
+
+    def test_unknown_provider_falls_back_to_plan(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        planner = TaskPlanner()
+        agent = MagicMock()
+        agent.screenshot.return_value = {"base64": "abc123"}
+        fallback = [{"action": "navigate", "url": "https://google.com", "wait_until": "domcontentloaded", "retry": 0, "retry_delay": 1.0}]
+        with patch.object(planner, "plan", return_value=fallback) as mock_plan:
+            result = planner.vision_plan("go to google", agent, provider="unknown_model")
+        mock_plan.assert_called_once_with("go to google")
+        assert result == fallback
+
+
+# ---------------------------------------------------------------------------
+# T1-4  Vision API routes — provider field
+# ---------------------------------------------------------------------------
+
+class TestVisionApiRoutesProvider:
+    def setup_method(self):
+        self.client = TestClient(app, raise_server_exceptions=False)
+
+    def test_vision_plan_passes_provider_to_planner(self):
+        mock_agent = _make_mock_agent()
+        mock_planner = MagicMock()
+        expected = [{"action": "navigate", "url": "https://example.com", "wait_until": "domcontentloaded", "retry": 0, "retry_delay": 1.0}]
+        mock_planner.vision_plan.return_value = expected
+
+        with patch.object(api_server, "_agent", mock_agent), \
+             patch.object(api_server, "_planner", mock_planner):
+            resp = self.client.post(
+                "/task/vision_plan",
+                json={"intent": "go to example", "provider": "anthropic"},
+            )
+
+        assert resp.status_code == 200
+        mock_planner.vision_plan.assert_called_once_with(
+            "go to example", mock_agent, provider="anthropic"
+        )
+
+    def test_vision_run_passes_provider_to_planner(self):
+        mock_agent = _make_mock_agent()
+        mock_planner = MagicMock()
+        steps = [{"action": "navigate", "url": "https://example.com", "wait_until": "domcontentloaded", "retry": 0, "retry_delay": 1.0}]
+        mock_planner.vision_plan.return_value = steps
+        mock_planner.execute.return_value = [{"step": 0, "action": "navigate", "status": "ok", "result": {}}]
+
+        with patch.object(api_server, "_agent", mock_agent), \
+             patch.object(api_server, "_planner", mock_planner):
+            resp = self.client.post(
+                "/task/vision_run",
+                json={"intent": "go to example", "provider": "gemini"},
+            )
+
+        assert resp.status_code == 200
+        mock_planner.vision_plan.assert_called_once_with(
+            "go to example", mock_agent, provider="gemini"
+        )
+
+    def test_vision_plan_no_provider_passes_none(self):
+        mock_agent = _make_mock_agent()
+        mock_planner = MagicMock()
+        mock_planner.vision_plan.return_value = [
+            {"action": "navigate", "url": "https://example.com", "wait_until": "domcontentloaded", "retry": 0, "retry_delay": 1.0}
+        ]
+
+        with patch.object(api_server, "_agent", mock_agent), \
+             patch.object(api_server, "_planner", mock_planner):
+            self.client.post("/task/vision_plan", json={"intent": "go to example"})
+
+        mock_planner.vision_plan.assert_called_once_with(
+            "go to example", mock_agent, provider=None
+        )

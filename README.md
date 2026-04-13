@@ -500,10 +500,16 @@ export OPENAI_MODEL=gpt-4o-mini   # optional, default: gpt-4o-mini
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | — | OpenAI API key (enables OpenAI planning) |
-| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model to use |
+| `OPENAI_API_KEY` | — | OpenAI API key (enables OpenAI planning and vision) |
+| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model to use for text planning |
+| `OPENAI_VISION_MODEL` | `gpt-4o` | OpenAI model to use for vision planning |
+| `ANTHROPIC_API_KEY` | — | Anthropic API key (enables Claude vision planning) |
+| `ANTHROPIC_VISION_MODEL` | `claude-3-5-sonnet-20241022` | Anthropic model to use for vision planning |
+| `GOOGLE_API_KEY` | — | Google API key (enables Gemini vision planning) |
+| `GEMINI_VISION_MODEL` | `gemini-1.5-pro` | Gemini model to use for vision planning |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | `llama3` | Ollama model to use |
+| `OLLAMA_MODEL` | `llama3` | Ollama model to use for text planning |
+| `OLLAMA_VISION_MODEL` | `llava` | Ollama multimodal model to use for vision planning |
 | `BROWSER_WORKSPACE` | `./workspace` | Root directory for all file operations |
 | `BROWSER_API_KEY` | — | When set, every API request must include `X-API-Key: <value>`. Docs/health paths are exempt. |
 | `BROWSER_ALLOW_CODE_EXEC` | `false` | Set to `true` to enable `/system/run_python` and `/system/run_shell`. Disabled by default to prevent remote code execution. |

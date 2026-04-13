@@ -489,10 +489,55 @@ _TEMPLATES: list[tuple[re.Pattern[str], Any]] = [
 # LLM prompt for unknown intents
 # ---------------------------------------------------------------------------
 
-_SYSTEM_PROMPT = """You are a browser automation planner. Your ONLY job is to convert a
-natural-language browser task into a minimal JSON step array.
+# Operating rules applied to every planning prompt.  Kept as a separate
+# constant so callers (e.g. the REPL, custom skills, voice pipelines) can
+# embed them in their own contexts without duplicating the text.
+_AGENT_OPERATING_RULES = """\
+You are a careful, goal-driven browser agent.
 
-RULES (MUST follow all):
+Your job is to complete web tasks accurately, safely, and efficiently.
+
+Operating rules:
+1. First identify the user's goal, required inputs, constraints, and completion criteria.
+2. Break the task into small verifiable steps.
+3. Before each important action, confirm that the current page matches your expectation.
+4. Prefer robust selectors, visible labels, stable text, and semantic page structure over fragile assumptions.
+5. If multiple similar elements exist, pause and disambiguate using nearby text, section headings, button labels, or form context.
+6. After every click, form submission, or navigation, verify the result before proceeding.
+7. Detect common blockers: popups, cookie banners, captchas, sign-in walls, permission dialogs, slow loads, hidden menus, expired sessions, and validation errors.
+8. If blocked, attempt safe recovery:
+   - close or dismiss overlays
+   - refresh once if needed
+   - navigate back if taken off task
+   - retry with an alternative path
+   - report clearly if user intervention is required
+9. Never submit the same form twice unless you confirm the first submission failed.
+10. Never perform destructive, financial, legal, or irreversible actions without explicit confirmation.
+11. Extract important information in structured form whenever useful.
+12. Keep track of completed steps and avoid repeating work.
+13. If the task cannot be completed, explain exactly where it failed, why, and what the user should provide next.
+14. When the task succeeds, provide a concise completion summary with relevant outputs.
+
+Behavior expectations:
+- Be precise, not fast-and-loose.
+- Do not assume; inspect.
+- Do not hallucinate missing page content.
+- Do not invent success.
+- Use recovery strategies before giving up.
+- Minimize unnecessary navigation.
+- Preserve context across tabs, page changes, and multi-step workflows.
+
+Completion standard:
+A task is complete only when the requested action is verified on the page or the requested information is extracted and checked for relevance.\
+"""
+
+_SYSTEM_PROMPT = _AGENT_OPERATING_RULES + """
+
+---
+
+Your ONLY output must be a valid JSON step array (no prose, no markdown, no explanation).
+
+PLANNING RULES (MUST follow all):
 1. Output ONLY a valid JSON array. No prose, no markdown, no explanation.
 2. Each element must have an "action" key matching one of the allowed actions below.
 3. Use the fewest steps possible. Never add unnecessary steps.
@@ -545,13 +590,18 @@ Now output ONLY the JSON array for the task below. Nothing else.
 
 # Vision-capable system prompt — identical in spirit but notes that a
 # screenshot is available so the model should ground selectors in what it sees.
-_VISION_SYSTEM_PROMPT = """You are a browser automation planner with access to a SCREENSHOT of the current page.
-Your job is to convert a natural-language browser task into a minimal JSON step array.
-Use the screenshot to understand the current page state and generate accurate selectors.
+_VISION_SYSTEM_PROMPT = _AGENT_OPERATING_RULES + """
+
+---
+
+You also have access to a SCREENSHOT of the current page.
+Use it to understand the current page state and generate accurate selectors.
 Prefer semantic selectors (text=, label=, placeholder=, role=) that are grounded in the
 visible content of the screenshot, rather than brittle CSS class names.
 
-RULES (MUST follow all):
+Your ONLY output must be a valid JSON step array (no prose, no markdown, no explanation).
+
+PLANNING RULES (MUST follow all):
 1. Output ONLY a valid JSON array. No prose, no markdown, no explanation.
 2. Each element must have an "action" key matching one of the allowed actions below.
 3. Use the fewest steps possible. Never add unnecessary steps.
@@ -770,6 +820,183 @@ def _call_vision_openai(intent: str, screenshot_b64: str) -> list[dict[str, Any]
         return validate_steps(parsed)
     raise StepValidationError(f"GPT-4V returned unexpected JSON shape: {type(parsed)}")
 
+
+def _call_vision_anthropic(intent: str, screenshot_b64: str) -> list[dict[str, Any]]:
+    """Call Anthropic Claude vision with a screenshot + intent and return validated steps.
+
+    Parameters
+    ----------
+    intent:
+        Natural-language task description.
+    screenshot_b64:
+        Base-64 encoded PNG screenshot of the current browser page.
+
+    Returns
+    -------
+    list[dict]
+        Validated step list.
+
+    Raises
+    ------
+    StepValidationError
+        When the response cannot be parsed or validated.
+    """
+    import anthropic  # type: ignore[import]
+
+    model = os.environ.get("ANTHROPIC_VISION_MODEL", "claude-3-5-sonnet-20241022")
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+    message = client.messages.create(
+        model=model,
+        max_tokens=1024,
+        system=_VISION_SYSTEM_PROMPT,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": screenshot_b64,
+                        },
+                    },
+                    {"type": "text", "text": intent},
+                ],
+            }
+        ],
+    )
+
+    raw = message.content[0].text if message.content else ""
+    logger.debug("Claude vision raw response: %s", raw)
+
+    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        raise StepValidationError(f"Claude vision response contains no JSON array: {raw[:300]}")
+
+    parsed = json.loads(match.group())
+    if isinstance(parsed, list):
+        return validate_steps(parsed)
+    raise StepValidationError(f"Claude vision returned unexpected JSON shape: {type(parsed)}")
+
+
+def _call_vision_gemini(intent: str, screenshot_b64: str) -> list[dict[str, Any]]:
+    """Call Google Gemini vision with a screenshot + intent and return validated steps.
+
+    Parameters
+    ----------
+    intent:
+        Natural-language task description.
+    screenshot_b64:
+        Base-64 encoded PNG screenshot of the current browser page.
+
+    Returns
+    -------
+    list[dict]
+        Validated step list.
+
+    Raises
+    ------
+    StepValidationError
+        When the response cannot be parsed or validated.
+    """
+    import base64 as _base64
+
+    import google.generativeai as genai  # type: ignore[import]
+
+    model_name = os.environ.get("GEMINI_VISION_MODEL", "gemini-1.5-pro")
+    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+    model = genai.GenerativeModel(
+        model_name=model_name,
+        system_instruction=_VISION_SYSTEM_PROMPT,
+    )
+
+    image_bytes = _base64.b64decode(screenshot_b64)
+    image_part = {"mime_type": "image/png", "data": image_bytes}
+
+    response = model.generate_content(
+        [image_part, intent],
+        generation_config={"temperature": 0.0, "max_output_tokens": 1024},
+    )
+
+    raw = response.text if hasattr(response, "text") else ""
+    logger.debug("Gemini vision raw response: %s", raw)
+
+    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        raise StepValidationError(f"Gemini vision response contains no JSON array: {raw[:300]}")
+
+    parsed = json.loads(match.group())
+    if isinstance(parsed, list):
+        return validate_steps(parsed)
+    raise StepValidationError(f"Gemini vision returned unexpected JSON shape: {type(parsed)}")
+
+
+def _call_vision_ollama(intent: str, screenshot_b64: str) -> list[dict[str, Any]]:
+    """Call a local Ollama multimodal model with a screenshot + intent and return validated steps.
+
+    Uses the ``/api/generate`` endpoint with the ``images`` field, which is
+    supported by Ollama multimodal models such as ``llava`` and ``bakllava``.
+
+    Parameters
+    ----------
+    intent:
+        Natural-language task description.
+    screenshot_b64:
+        Base-64 encoded PNG screenshot of the current browser page.
+
+    Returns
+    -------
+    list[dict]
+        Validated step list.
+
+    Raises
+    ------
+    StepValidationError
+        When the response cannot be parsed or validated.
+    """
+    import urllib.request
+
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    model = os.environ.get("OLLAMA_VISION_MODEL", "llava")
+
+    prompt = f"{_VISION_SYSTEM_PROMPT}\n\nTask: {intent}"
+
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "images": [screenshot_b64],
+        "stream": False,
+        "options": {"temperature": 0.0},
+    }).encode()
+
+    req = urllib.request.Request(
+        f"{host}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        body = json.loads(resp.read())
+
+    raw = body.get("response", "")
+    logger.debug("Ollama vision raw response: %s", raw)
+
+    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        raise StepValidationError(f"Ollama vision response contains no JSON array: {raw[:300]}")
+
+    steps = json.loads(match.group())
+    return validate_steps(steps)
+
+
 def _interpolate_last(step: dict[str, Any], last: str) -> dict[str, Any]:
     """
     Return a copy of *step* with the token ``{{last}}`` replaced by *last*
@@ -887,15 +1114,45 @@ class TaskPlanner:
             "  • open / go to / navigate to <url>"
         )
 
-    def vision_plan(self, intent: str, agent: Any) -> list[dict[str, Any]]:
+    @staticmethod
+    def _detect_vision_provider() -> str | None:
+        """Return the vision provider to use based on available environment variables.
+
+        Priority order:
+        1. ``OPENAI_API_KEY``   → ``"openai"``
+        2. ``ANTHROPIC_API_KEY`` → ``"anthropic"``
+        3. ``GOOGLE_API_KEY``   → ``"gemini"``
+        4. Ollama running       → ``"ollama"``
+        5. None (fall back to text-only)
+        """
+        if os.environ.get("OPENAI_API_KEY"):
+            return "openai"
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return "anthropic"
+        if os.environ.get("GOOGLE_API_KEY"):
+            return "gemini"
+        if os.environ.get("OLLAMA_HOST") or _ollama_running():
+            return "ollama"
+        return None
+
+    def vision_plan(
+        self, intent: str, agent: Any, *, provider: str | None = None
+    ) -> list[dict[str, Any]]:
         """Convert *intent* to a validated step list using a live screenshot.
 
-        Takes a screenshot of the current browser page, sends it together with
-        the intent to GPT-4V so the model can ground its selector choices in
-        the actual visible content.
+        Takes a screenshot of the current browser page and sends it together
+        with the intent to a vision-capable LLM so the model can ground its
+        selector choices in the actual visible content.
 
-        Falls back to :meth:`plan` (text-only) when ``OPENAI_API_KEY`` is not
-        set or when the vision LLM call fails.
+        The vision provider is selected in the following order:
+
+        1. The explicit *provider* argument when supplied (``"openai"``,
+           ``"anthropic"``, ``"gemini"``, or ``"ollama"``).
+        2. Auto-detection based on available environment variables
+           (``OPENAI_API_KEY`` → OpenAI, ``ANTHROPIC_API_KEY`` → Anthropic,
+           ``GOOGLE_API_KEY`` → Gemini, Ollama running → Ollama).
+        3. Falls back to text-only :meth:`plan` when no vision provider is
+           available or when the vision LLM call fails.
 
         Parameters
         ----------
@@ -903,6 +1160,10 @@ class TaskPlanner:
             Natural-language description of the task to perform on the page.
         agent:
             A ``BrowserAgent`` instance used to capture the screenshot.
+        provider:
+            Explicit vision provider override (``"openai"``, ``"anthropic"``,
+            ``"gemini"``, or ``"ollama"``).  When ``None`` the provider is
+            auto-detected from the environment.
 
         Returns
         -------
@@ -912,8 +1173,10 @@ class TaskPlanner:
         intent = intent.strip()
         logger.info("Vision planning intent: %r", intent)
 
-        if not os.environ.get("OPENAI_API_KEY"):
-            logger.info("No OPENAI_API_KEY set; falling back to text-only planning")
+        resolved_provider = provider or self._detect_vision_provider()
+
+        if not resolved_provider:
+            logger.info("No vision provider available; falling back to text-only planning")
             return self.plan(intent)
 
         try:
@@ -929,8 +1192,20 @@ class TaskPlanner:
             logger.warning("Empty screenshot in vision_plan; falling back to text-only")
             return self.plan(intent)
 
+        _vision_callers = {
+            "openai": _call_vision_openai,
+            "anthropic": _call_vision_anthropic,
+            "gemini": _call_vision_gemini,
+            "ollama": _call_vision_ollama,
+        }
+        vision_fn = _vision_callers.get(resolved_provider)
+        if vision_fn is None:
+            logger.warning("Unknown vision provider %r; falling back to text-only", resolved_provider)
+            return self.plan(intent)
+
+        logger.info("Using vision provider: %s", resolved_provider)
         try:
-            return _call_vision_openai(intent, screenshot_b64)
+            return vision_fn(intent, screenshot_b64)
         except Exception as exc:
             logger.warning(
                 "Vision LLM call failed (%s); falling back to text-only planning", exc

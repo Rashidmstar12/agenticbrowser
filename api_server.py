@@ -477,7 +477,14 @@ class VisionPlanRequest(BaseModel):
         ...,
         description=(
             "Natural-language task to perform on the current page. "
-            "A screenshot is taken automatically and sent to GPT-4V."
+            "A screenshot is taken automatically and sent to the vision LLM."
+        ),
+    )
+    provider: str | None = Field(
+        None,
+        description=(
+            "Vision provider to use: 'openai', 'anthropic', 'gemini', or 'ollama'. "
+            "When omitted the server auto-detects from available API keys."
         ),
     )
 
@@ -489,6 +496,13 @@ class VisionRunRequest(BaseModel):
     )
     stop_on_error: bool = Field(True, description="Stop execution on the first failed step")
     log_path: str | None = Field(None, description="Workspace-relative path to save the execution log")
+    provider: str | None = Field(
+        None,
+        description=(
+            "Vision provider to use: 'openai', 'anthropic', 'gemini', or 'ollama'. "
+            "When omitted the server auto-detects from available API keys."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1422,20 +1436,22 @@ def task_schema() -> dict[str, Any]:
     return {"schema": STEP_SCHEMA}
 
 
-@app.post("/task/vision_plan", summary="Plan a task using a screenshot of the current page (GPT-4V)")
+@app.post("/task/vision_plan", summary="Plan a task using a screenshot of the current page")
 def task_vision_plan(req: VisionPlanRequest) -> dict[str, Any]:
     """
     Take a screenshot of the current page and send it together with *intent*
-    to GPT-4V to generate a grounded step plan.
+    to a vision-capable LLM to generate a grounded step plan.
 
-    Requires ``OPENAI_API_KEY`` in the environment; falls back to text-only
-    planning (:func:`task_plan`) when the key is absent or the vision call
-    fails.  An active browser session is required.
+    The vision provider is selected in priority order: ``OPENAI_API_KEY`` →
+    ``ANTHROPIC_API_KEY`` → ``GOOGLE_API_KEY`` → Ollama.  You may also specify
+    the *provider* field explicitly (``"openai"``, ``"anthropic"``, ``"gemini"``,
+    or ``"ollama"``).  Falls back to text-only planning when no provider is
+    available or the vision call fails.  An active browser session is required.
     """
     planner = get_planner()
     agent = get_agent()
     try:
-        steps = planner.vision_plan(req.intent, agent)
+        steps = planner.vision_plan(req.intent, agent, provider=req.provider)
         return {"intent": req.intent, "steps": steps, "count": len(steps), "vision": True}
     except (ValueError, StepValidationError) as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
@@ -1445,14 +1461,16 @@ def task_vision_plan(req: VisionPlanRequest) -> dict[str, Any]:
 def task_vision_run(req: VisionRunRequest) -> dict[str, Any]:
     """
     Take a screenshot of the current page, generate a grounded step plan
-    using GPT-4V, then execute the steps.
+    using a vision-capable LLM, then execute the steps.
 
-    Falls back to text-only planning when ``OPENAI_API_KEY`` is not set.
+    The provider is auto-detected from available API keys or can be set
+    explicitly via the *provider* field.  Falls back to text-only planning
+    when no vision provider is available.
     """
     planner = get_planner()
     agent = get_agent()
     try:
-        steps = planner.vision_plan(req.intent, agent)
+        steps = planner.vision_plan(req.intent, agent, provider=req.provider)
     except (ValueError, StepValidationError) as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
 
