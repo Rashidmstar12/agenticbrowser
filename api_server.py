@@ -19,14 +19,14 @@ from pathlib import Path as _Path
 from typing import Any, AsyncIterator
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from browser_agent import BrowserAgent
 from doctor import run_checks
 from skills import SkillLoadError, get_default_registry
-from system_tools import SystemTools
+from system_tools import PathTraversalError, SystemTools, safe_path
 from task_planner import STEP_SCHEMA, StepValidationError, TaskPlanner, validate_steps
 
 # ---------------------------------------------------------------------------
@@ -113,6 +113,38 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
+
+# ---------------------------------------------------------------------------
+# Security: code-execution gate
+# ---------------------------------------------------------------------------
+
+_CODE_EXEC_ALLOWED: bool = os.environ.get("BROWSER_ALLOW_CODE_EXEC", "false").lower() in (
+    "1", "true", "yes"
+)
+
+# ---------------------------------------------------------------------------
+# Security: API key authentication middleware
+# ---------------------------------------------------------------------------
+
+_API_KEY: str | None = os.environ.get("BROWSER_API_KEY")
+
+_AUTH_EXEMPT_PATHS = frozenset({"/", "/docs", "/redoc", "/openapi.json", "/ui", "/doctor"})
+
+
+@app.middleware("http")
+async def _api_key_middleware(request: Request, call_next):  # type: ignore[type-arg]
+    if _API_KEY:
+        # Allow un-authenticated access to health/docs paths
+        if request.url.path not in _AUTH_EXEMPT_PATHS:
+            provided = request.headers.get("X-API-Key", "")
+            if provided != _API_KEY:
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid or missing API key. Set X-API-Key header."},
+                )
+    return await call_next(request)
+
 
 # ---------------------------------------------------------------------------
 # Request / Response models — session
@@ -524,7 +556,13 @@ def evaluate(req: EvaluateRequest) -> dict[str, Any]:
 
 @app.post("/screenshot", summary="Take a screenshot")
 def screenshot(req: ScreenshotRequest) -> dict[str, Any]:
-    return get_agent().screenshot(path=req.path, full_page=req.full_page, as_base64=req.as_base64)
+    safe: str | None = None
+    if req.path is not None:
+        try:
+            safe = str(safe_path(get_tools().workspace, req.path))
+        except PathTraversalError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    return get_agent().screenshot(path=safe, full_page=req.full_page, as_base64=req.as_base64)
 
 
 # ---------------------------------------------------------------------------
@@ -635,13 +673,22 @@ def list_tabs() -> dict[str, Any]:
 
 @app.post("/upload_file", summary="Set file(s) on a file input element")
 def upload_file(req: UploadFileRequest) -> dict[str, Any]:
-    file_path = str(get_tools().workspace / req.path)
+    try:
+        file_path = "|".join(
+            str(safe_path(get_tools().workspace, p.strip()))
+            for p in req.path.split("|")
+        )
+    except PathTraversalError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return get_agent().upload_file(req.selector, file_path)
 
 
 @app.post("/download_file", summary="Navigate to a URL and save the triggered download")
 def download_file(req: DownloadFileRequest) -> dict[str, Any]:
-    save_path = str(get_tools().workspace / req.path)
+    try:
+        save_path = str(safe_path(get_tools().workspace, req.path))
+    except PathTraversalError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     return get_agent().download_file(req.url, save_path)
 
 
@@ -730,11 +777,21 @@ def system_info() -> dict[str, Any]:
 
 @app.post("/system/run_python", summary="Execute a Python snippet in the workspace")
 def run_python(req: RunPythonRequest) -> dict[str, Any]:
+    if not _CODE_EXEC_ALLOWED:
+        raise HTTPException(
+            status_code=403,
+            detail="Code execution is disabled. Set BROWSER_ALLOW_CODE_EXEC=true to enable.",
+        )
     return get_tools().run_python(req.code, timeout=req.timeout)
 
 
 @app.post("/system/run_shell", summary="Execute a shell command in the workspace")
 def run_shell(req: RunShellRequest) -> dict[str, Any]:
+    if not _CODE_EXEC_ALLOWED:
+        raise HTTPException(
+            status_code=403,
+            detail="Code execution is disabled. Set BROWSER_ALLOW_CODE_EXEC=true to enable.",
+        )
     return get_tools().run_shell(req.command, timeout=req.timeout)
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 from playwright.sync_api import (
     Browser,
@@ -900,6 +901,11 @@ class BrowserAgent:
         dict
             ``{"saved_to": ..., "filename": ..., "ok": True}``
         """
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(
+                f"download_file: only http/https URLs are allowed, got scheme {parsed.scheme!r}"
+            )
         with self.page.expect_download() as download_info:
             self.page.goto(url, wait_until="domcontentloaded")
         download = download_info.value

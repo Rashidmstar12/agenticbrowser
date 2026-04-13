@@ -637,3 +637,184 @@ class TestGetPlannerError:
             json={"steps": [{"action": "navigate", "url": "https://example.com"}]},
         )
         assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Security fixes: path traversal, URL scheme bypass, code-exec gate, API key
+# ---------------------------------------------------------------------------
+
+class TestScreenshotPathTraversal:
+    def test_traversal_path_rejected_400(self, client_active):
+        c, *_ = client_active
+        r = c.post("/screenshot", json={"path": "../../etc/cron.d/evil.png"})
+        assert r.status_code == 400
+        assert "escapes" in r.json().get("detail", "").lower()
+
+    def test_valid_relative_path_ok(self, client_active):
+        c, agent, *_ = client_active
+        agent.screenshot.return_value = {"path": "shot.png", "base64": None}
+        r = c.post("/screenshot", json={"path": "shot.png"})
+        assert r.status_code == 200
+        # safe_path should have resolved to workspace/shot.png
+        _, kwargs = agent.screenshot.call_args
+        assert kwargs["path"].endswith("shot.png")
+        assert ".." not in kwargs["path"]
+
+
+class TestUploadFilePathTraversal:
+    def test_traversal_path_rejected_400(self, client_active):
+        c, *_ = client_active
+        r = c.post("/upload_file", json={"selector": "input", "path": "../../../etc/passwd"})
+        assert r.status_code == 400
+        assert "escapes" in r.json().get("detail", "").lower()
+
+    def test_pipe_traversal_rejected_400(self, client_active):
+        c, *_ = client_active
+        r = c.post("/upload_file", json={"selector": "input", "path": "ok.txt|../../etc/passwd"})
+        assert r.status_code == 400
+
+    def test_valid_path_forwarded(self, client_active, tmp_path):
+        c, agent, *_ = client_active
+        agent.upload_file.return_value = {"selector": "input", "uploaded": "file.txt", "ok": True}
+        r = c.post("/upload_file", json={"selector": "input", "path": "file.txt"})
+        assert r.status_code == 200
+        if agent.upload_file.call_args:
+            path_arg = agent.upload_file.call_args.args[1] if agent.upload_file.call_args.args else ""
+            assert ".." not in path_arg
+
+
+class TestDownloadFilePathTraversal:
+    def test_traversal_save_path_rejected_400(self, client_active):
+        c, *_ = client_active
+        r = c.post(
+            "/download_file",
+            json={"url": "https://example.com/file.zip", "path": "../../etc/cron.d/evil"},
+        )
+        assert r.status_code == 400
+        assert "escapes" in r.json().get("detail", "").lower()
+
+
+class TestDownloadFileUrlScheme:
+    def _make_agent_with_mock_page(self):
+        import sys
+        from pathlib import Path as _P
+        sys.path.insert(0, str(_P(__file__).parent.parent))
+        from browser_agent import BrowserAgent
+        from unittest.mock import MagicMock
+        agent = BrowserAgent.__new__(BrowserAgent)
+        agent._page = MagicMock()
+        return agent
+
+    def test_file_scheme_rejected(self):
+        agent = self._make_agent_with_mock_page()
+        with pytest.raises(ValueError, match="only http"):
+            agent.download_file("file:///etc/passwd", "/tmp/out")
+
+    def test_data_scheme_rejected(self):
+        agent = self._make_agent_with_mock_page()
+        with pytest.raises(ValueError, match="only http"):
+            agent.download_file("data:text/html,<script>alert(1)</script>", "/tmp/out")
+
+    def test_javascript_scheme_rejected(self):
+        agent = self._make_agent_with_mock_page()
+        with pytest.raises(ValueError, match="only http"):
+            agent.download_file("javascript:alert(1)", "/tmp/out")
+
+    def test_https_url_accepted(self):
+        from unittest.mock import MagicMock
+        agent = self._make_agent_with_mock_page()
+        dl = MagicMock()
+        dl.value.suggested_filename = "file.zip"
+        cm = MagicMock()
+        cm.__enter__ = MagicMock(return_value=dl)
+        cm.__exit__ = MagicMock(return_value=False)
+        agent._page.expect_download.return_value = cm
+        result = agent.download_file("https://example.com/file.zip", "/tmp/out.zip")
+        assert result["ok"] is True
+
+
+class TestCodeExecGate:
+    def test_run_python_disabled_returns_403(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._CODE_EXEC_ALLOWED
+        _srv._CODE_EXEC_ALLOWED = False
+        try:
+            r = c.post("/system/run_python", json={"code": "1+1"})
+        finally:
+            _srv._CODE_EXEC_ALLOWED = orig
+        assert r.status_code == 403
+        assert "BROWSER_ALLOW_CODE_EXEC" in r.json()["detail"]
+
+    def test_run_shell_disabled_returns_403(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._CODE_EXEC_ALLOWED
+        _srv._CODE_EXEC_ALLOWED = False
+        try:
+            r = c.post("/system/run_shell", json={"command": "echo hi"})
+        finally:
+            _srv._CODE_EXEC_ALLOWED = orig
+        assert r.status_code == 403
+        assert "BROWSER_ALLOW_CODE_EXEC" in r.json()["detail"]
+
+
+class TestApiKeyMiddleware:
+    def test_request_without_key_rejected_when_key_configured(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._API_KEY
+        _srv._API_KEY = "secret123"
+        try:
+            r = c.get("/session/status")
+        finally:
+            _srv._API_KEY = orig
+        assert r.status_code == 401
+        assert "X-API-Key" in r.json()["detail"]
+
+    def test_request_with_wrong_key_rejected(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._API_KEY
+        _srv._API_KEY = "secret123"
+        try:
+            r = c.get("/session/status", headers={"X-API-Key": "wrong"})
+        finally:
+            _srv._API_KEY = orig
+        assert r.status_code == 401
+
+    def test_request_with_correct_key_accepted(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._API_KEY
+        _srv._API_KEY = "secret123"
+        try:
+            r = c.get("/session/status", headers={"X-API-Key": "secret123"})
+        finally:
+            _srv._API_KEY = orig
+        assert r.status_code == 200
+
+    def test_no_key_configured_allows_all(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._API_KEY
+        _srv._API_KEY = None
+        try:
+            r = c.get("/session/status")
+        finally:
+            _srv._API_KEY = orig
+        assert r.status_code == 200
+
+    def test_exempt_paths_always_accessible(self, client_no_session):
+        c, _ = client_no_session
+        import api_server as _srv
+        orig = _srv._API_KEY
+        _srv._API_KEY = "secret123"
+        try:
+            r_root = c.get("/", follow_redirects=False)
+            r_docs = c.get("/docs", follow_redirects=False)
+        finally:
+            _srv._API_KEY = orig
+        # root may redirect (3xx) or return 200 — either is fine; must not be 401
+        assert r_root.status_code != 401
+        assert r_docs.status_code != 401
