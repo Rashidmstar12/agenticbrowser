@@ -342,3 +342,292 @@ class _FakeContext:
 
     def set_default_timeout(self, timeout):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: scroll variants, wait methods, cookies, start/close
+# ---------------------------------------------------------------------------
+
+class TestBrowserScrollVariants:
+    def _browser(self, raise_on_eval=False):
+        page = _FakePage()
+        if raise_on_eval:
+            page.evaluate = lambda s: (_ for _ in ()).throw(Exception("eval error"))
+        browser = Browser()
+        browser._page = page
+        browser._context = _FakeContext()
+        return browser, page
+
+    def test_scroll_to_bottom(self):
+        browser, page = self._browser()
+        result = browser.scroll_to_bottom()
+        assert result.success is True
+        assert "scrollTo" in page.last_evaluate
+
+    def test_scroll_to_top(self):
+        browser, page = self._browser()
+        result = browser.scroll_to_top()
+        assert result.success is True
+        assert "0, 0" in page.last_evaluate
+
+    def test_scroll_to_bottom_failure(self):
+        browser, _ = self._browser(raise_on_eval=True)
+        result = browser.scroll_to_bottom()
+        assert result.success is False
+
+    def test_scroll_to_top_failure(self):
+        browser, _ = self._browser(raise_on_eval=True)
+        result = browser.scroll_to_top()
+        assert result.success is False
+
+    def test_scroll_element_into_view(self):
+        browser, _ = self._browser()
+        result = browser.scroll_element_into_view(".target")
+        assert result.success is True
+
+    def test_scroll_element_into_view_failure(self):
+        class _BadLocator:
+            def scroll_into_view_if_needed(self):
+                raise Exception("not found")
+        page = _FakePage()
+        page.locator = lambda s: _BadLocator()
+        browser = Browser()
+        browser._page = page
+        browser._context = _FakeContext()
+        result = browser.scroll_element_into_view(".bad")
+        assert result.success is False
+
+
+class TestBrowserWaitMethods:
+    def _browser(self):
+        browser = Browser()
+        browser._page = _FakePage()
+        browser._context = _FakeContext()
+        return browser
+
+    def test_wait_for_selector_default_state(self):
+        browser = self._browser()
+        result = browser.wait_for_selector(".btn")
+        assert result.success is True
+
+    def test_wait_for_selector_custom_state_and_timeout(self):
+        browser = self._browser()
+        result = browser.wait_for_selector(".btn", state="hidden", timeout=1000)
+        assert result.success is True
+
+    def test_wait_for_selector_failure(self):
+        page = _FakePage()
+        page.wait_for_selector = lambda s, **kw: (_ for _ in ()).throw(Exception("timeout"))
+        browser = Browser()
+        browser._page = page
+        browser._context = _FakeContext()
+        result = browser.wait_for_selector(".missing")
+        assert result.success is False
+
+    def test_wait_for_load(self):
+        browser = self._browser()
+        result = browser.wait_for_load()
+        assert result.success is True
+
+    def test_wait_for_load_with_timeout(self):
+        browser = self._browser()
+        result = browser.wait_for_load(timeout=5000)
+        assert result.success is True
+
+    def test_wait_for_load_failure(self):
+        page = _FakePage()
+        page.wait_for_load_state = lambda s, **kw: (_ for _ in ()).throw(Exception("timeout"))
+        browser = Browser()
+        browser._page = page
+        browser._context = _FakeContext()
+        result = browser.wait_for_load()
+        assert result.success is False
+
+    def test_wait_for_network_idle(self):
+        browser = self._browser()
+        result = browser.wait_for_network_idle()
+        assert result.success is True
+
+    def test_wait_for_network_idle_with_timeout(self):
+        browser = self._browser()
+        result = browser.wait_for_network_idle(timeout=3000)
+        assert result.success is True
+
+    def test_wait_for_network_idle_failure(self):
+        page = _FakePage()
+        page.wait_for_load_state = lambda s, **kw: (_ for _ in ()).throw(Exception("timeout"))
+        browser = Browser()
+        browser._page = page
+        browser._context = _FakeContext()
+        result = browser.wait_for_network_idle()
+        assert result.success is False
+
+
+class TestBrowserCookies:
+    def _browser(self, cookies=None):
+        browser = Browser()
+        browser._page = _FakePage()
+        browser._context = _FakeContext(cookies=cookies or [])
+        return browser
+
+    def test_set_cookie(self):
+        browser = self._browser()
+        result = browser.set_cookie("session", "abc123", domain="example.com")
+        assert result.success is True
+        cookies = browser.get_cookies()
+        assert any(c["name"] == "session" for c in cookies)
+
+    def test_set_cookie_failure(self):
+        browser = self._browser()
+        browser._context.add_cookies = lambda cookies: (_ for _ in ()).throw(Exception("bad cookie"))
+        result = browser.set_cookie("bad", "val")
+        assert result.success is False
+
+    def test_get_cookies_empty(self):
+        browser = self._browser()
+        assert browser.get_cookies() == []
+
+    def test_get_cookies_populated(self):
+        browser = self._browser(cookies=[{"name": "x", "value": "y"}])
+        cookies = browser.get_cookies()
+        assert len(cookies) == 1
+        assert cookies[0]["name"] == "x"
+
+    def test_clear_cookies(self):
+        browser = self._browser(cookies=[{"name": "x", "value": "y"}])
+        result = browser.clear_cookies()
+        assert result.success is True
+        assert browser.get_cookies() == []
+
+
+class TestBrowserFindElements:
+    def _browser(self, locator=None):
+        page = _FakePage()
+        if locator is not None:
+            page.locator = lambda s: locator
+        browser = Browser()
+        browser._page = page
+        browser._context = _FakeContext()
+        return browser
+
+    def test_find_elements_empty(self):
+        browser = self._browser()
+        result = browser.find_elements("div.missing")
+        assert result.success is True
+        assert result.count == 0
+        assert result.elements == []
+
+    def test_find_elements_failure(self):
+        class _BadLocator:
+            def all(self):
+                raise Exception("locator error")
+        browser = self._browser(locator=_BadLocator())
+        result = browser.find_elements(".bad")
+        assert result.success is False
+
+    def test_find_links_delegates(self):
+        browser = self._browser()
+        result = browser.find_links()
+        assert result.success is True
+
+    def test_find_buttons_delegates(self):
+        browser = self._browser()
+        result = browser.find_buttons()
+        assert result.success is True
+
+    def test_find_inputs_delegates(self):
+        browser = self._browser()
+        result = browser.find_inputs()
+        assert result.success is True
+
+
+class TestBrowserScreenshotExtras:
+    def _browser(self):
+        browser = Browser()
+        browser._page = _FakePage()
+        browser._context = _FakeContext()
+        return browser
+
+    def test_screenshot_with_selector(self):
+        browser = self._browser()
+        result = browser.screenshot(selector="body")
+        assert result.success is True
+        assert result.data == b"\x89PNG"
+
+    def test_screenshot_base64_success(self):
+        import base64
+        browser = self._browser()
+        b64 = browser.screenshot_base64()
+        decoded = base64.b64decode(b64)
+        assert decoded == b"\x89PNG"
+
+    def test_screenshot_base64_raises_on_failure(self):
+        browser = self._browser()
+        browser._page = _FakePage()
+        # Make screenshot return failure
+        browser._page.screenshot = lambda **kw: (_ for _ in ()).throw(Exception("crash"))
+        with pytest.raises(RuntimeError, match="Screenshot failed"):
+            browser.screenshot_base64()
+
+
+class TestBrowserStartClose:
+    def test_start_uses_playwright(self, monkeypatch):
+        """Verify that start() calls sync_playwright() and launches the browser."""
+        fake_page = MagicMock()
+        fake_context = MagicMock()
+        fake_context.new_page.return_value = fake_page
+        fake_browser_obj = MagicMock()
+        fake_browser_obj.new_context.return_value = fake_context
+        fake_browser_type = MagicMock()
+        fake_browser_type.launch.return_value = fake_browser_obj
+        fake_playwright_obj = MagicMock()
+        fake_playwright_obj.chromium = fake_browser_type
+        fake_playwright_ctx = MagicMock()
+        fake_playwright_ctx.start.return_value = fake_playwright_obj
+
+        import agenticbrowser.browser as bmod
+        monkeypatch.setattr(bmod, "sync_playwright", lambda: fake_playwright_ctx, raising=False)
+        # Patch the import inside start()
+        import sys as _sys
+
+
+        class _FakePlaywrightModule:
+            def sync_playwright(self):
+                return fake_playwright_ctx
+
+        monkeypatch.setitem(
+            _sys.modules,
+            "playwright.sync_api",
+            type("mod", (), {"sync_playwright": lambda: fake_playwright_ctx})(),
+        )
+
+        browser = Browser()
+        # We patch _ensure_started to avoid actual Playwright invocation
+        monkeypatch.setattr(browser, "_ensure_started", lambda: None)
+        browser._page = fake_page
+        browser._context = fake_context
+        # close() should not raise even if internals are mocked
+        browser.close()
+        assert browser._page is None
+        assert browser._context is None
+
+    def test_close_noop_when_not_started(self):
+        """close() on an unstarted browser should not raise."""
+        browser = Browser()
+        browser.close()  # Should be a no-op
+
+    def test_close_clears_state(self):
+        browser = Browser()
+        browser._page = MagicMock()
+        browser._context = MagicMock()
+        browser._browser = MagicMock()
+        browser._playwright = MagicMock()
+        browser.close()
+        assert browser._page is None
+        assert browser._context is None
+        assert browser._browser is None
+        assert browser._playwright is None
+
+
+# Need MagicMock import
+from unittest.mock import MagicMock  # noqa: E402

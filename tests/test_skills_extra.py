@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+import urllib.error
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -28,6 +29,7 @@ from skills import (
     _validate_url_scheme,
     load_from_directory,
     load_from_file,
+    load_from_github,
     load_from_url,
 )
 
@@ -540,3 +542,150 @@ class TestSkillDefToDict:
         )
         # should not raise when loaded
         assert skill.version == "2.0.0"
+
+
+# ---------------------------------------------------------------------------
+# Additional skills coverage: load_from_github directory mode, edge cases
+# ---------------------------------------------------------------------------
+
+
+
+class TestLoadFromGithubDirectory:
+    """Test skills.load_from_github in directory mode (no file extension)."""
+
+    _VALID_SKILL = {
+        "name": "test-skill",
+        "trigger": "run test",
+        "steps": [{"action": "navigate", "url": "https://example.com"}],
+    }
+
+    def _make_github_response(self, content: bytes):
+        """Build a mock urllib response object."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = content
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return mock_resp
+
+    def test_directory_mode_fetches_index_and_skills(self):
+
+        index_json = json.dumps({"skills": ["skill1.yaml"]}).encode()
+        skill_yaml = (
+            "name: test-skill\n"
+            "trigger: run test\n"
+            "steps:\n"
+            "  - action: navigate\n"
+            "    url: https://example.com\n"
+        ).encode()
+
+        responses = [index_json, skill_yaml]
+        call_count = [0]
+
+        def _fake_urlopen(req, timeout, context):
+            data = responses[call_count[0]]
+            call_count[0] += 1
+            return self._make_github_response(data)
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            result = load_from_github("owner/repo", "skills")
+        assert len(result) == 1
+        assert result[0].name == "test-skill"
+
+    def test_directory_mode_empty_index_raises(self):
+
+        index_json = json.dumps({"skills": []}).encode()
+
+        def _fake_urlopen(req, timeout, context):
+            return self._make_github_response(index_json)
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            with pytest.raises(SkillLoadError, match="no 'skills' entries"):
+                load_from_github("owner/repo", "dir")
+
+    def test_directory_mode_missing_index_raises(self):
+
+        def _fake_urlopen(req, timeout, context):
+            raise urllib.error.URLError("404")
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            with pytest.raises(SkillLoadError, match="Failed to fetch"):
+                load_from_github("owner/repo", "missing-dir")
+
+    def test_directory_mode_skips_bad_skill_file(self, capsys):
+        """A bad skill file is warned and skipped, not a fatal error."""
+
+        index_json = json.dumps({"skills": ["bad.yaml", "good.yaml"]}).encode()
+        bad_yaml = b"not: a: valid: skill"
+        good_yaml = (
+            "name: good-skill\n"
+            "trigger: good\n"
+            "steps:\n"
+            "  - action: navigate\n"
+            "    url: https://good.example\n"
+        ).encode()
+
+        responses = [index_json, bad_yaml, good_yaml]
+        call_count = [0]
+
+        def _fake_urlopen(req, timeout, context):
+            data = responses[call_count[0]]
+            call_count[0] += 1
+            return self._make_github_response(data)
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            result = load_from_github("owner/repo", "mixed-dir")
+        # good.yaml should still be loaded; bad.yaml is skipped with a warning
+        assert any(s.name == "good-skill" for s in result)
+
+    def test_file_mode_with_yaml_extension(self):
+        """load_from_github with a .yaml path is treated as a single file."""
+
+        skill_yaml = (
+            "name: file-skill\n"
+            "trigger: file test\n"
+            "steps:\n"
+            "  - action: navigate\n"
+            "    url: https://example.com\n"
+        ).encode()
+
+        def _fake_urlopen(req, timeout, context):
+            return self._make_github_response(skill_yaml)
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            result = load_from_github("owner/repo", "skills/my-skill.yaml")
+        assert len(result) == 1
+        assert result[0].name == "file-skill"
+
+    def test_file_mode_with_json_extension(self):
+
+        skill_json = json.dumps(self._VALID_SKILL).encode()
+
+        def _fake_urlopen(req, timeout, context):
+            return self._make_github_response(skill_json)
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            result = load_from_github("owner/repo", "skills/skill.json")
+        assert len(result) == 1
+
+    def test_gh_prefix_stripped(self):
+        """'gh:owner/repo' prefix should be stripped before use."""
+
+        skill_yaml = (
+            "name: prefixed-skill\n"
+            "trigger: prefixed\n"
+            "steps:\n"
+            "  - action: navigate\n"
+            "    url: https://example.com\n"
+        ).encode()
+
+        def _fake_urlopen(req, timeout, context):
+            return self._make_github_response(skill_yaml)
+
+        with patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+            result = load_from_github("gh:owner/repo", "skills/skill.yaml")
+        assert len(result) == 1
+
+    def test_invalid_repo_format_raises(self):
+
+        with pytest.raises((SkillLoadError, ValueError)):
+            load_from_github("not-valid-repo-format-nodash", "path/file.yaml")
