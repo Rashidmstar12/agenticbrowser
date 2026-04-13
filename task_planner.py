@@ -47,8 +47,12 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
     },
     "fill": {
         "required": ["selector", "value"],
-        "optional": {},
-        "description": "Fill an input field with a value (fast, no key events).",
+        "optional": {"framework_safe": True},
+        "description": (
+            "Fill an input field. By default fires key events via type_text "
+            "(safe for React/Vue/Angular). Set framework_safe: false to use raw "
+            "Playwright fill for plain server-rendered HTML forms."
+        ),
     },
     "type": {
         "required": ["selector", "text"],
@@ -159,13 +163,13 @@ STEP_SCHEMA: dict[str, dict[str, Any]] = {
     # ---- Smart extraction actions ----
     "extract_links": {
         "required": [],
-        "optional": {"selector": "a", "limit": 100},
-        "description": "Extract all hyperlinks from the page. Returns list of {text, href}. Stored as {{last}} (JSON).",
+        "optional": {"selector": "a", "limit": 100, "wait_for_ready": True, "timeout": 5000},
+        "description": "Extract all hyperlinks from the page. Returns list of {text, href}. Stored as {{last}} (JSON). When selector is not the default 'a', waits for the selector to be present before extracting (wait_for_ready: true by default).",
     },
     "extract_table": {
         "required": [],
-        "optional": {"selector": "table", "table_index": 0},
-        "description": "Extract an HTML table as a list of row dicts keyed by header text.",
+        "optional": {"selector": "table", "table_index": 0, "wait_for_ready": True, "timeout": 5000},
+        "description": "Extract an HTML table as a list of row dicts keyed by header text. When selector is not the default 'table', waits for the selector to be present before extracting (wait_for_ready: true by default).",
     },
     # ---- Assertion actions ----
     "assert_text": {
@@ -325,6 +329,8 @@ def _google_search_steps(query: str) -> list[dict[str, Any]]:
         {"action": "fill",          "selector": sels["search_input"], "value": query},
         {"action": "press",         "key": "Enter"},
         {"action": "wait_state",    "state": "networkidle"},
+        {"action": "wait_selector", "selector": sels["results"]},
+        {"action": "assert_text",   "text": query, "selector": sels["results"]},
     ]
 
 
@@ -337,6 +343,8 @@ def _bing_search_steps(query: str) -> list[dict[str, Any]]:
         {"action": "fill",          "selector": sels["search_input"], "value": query},
         {"action": "press",         "key": "Enter"},
         {"action": "wait_state",    "state": "networkidle"},
+        {"action": "wait_selector", "selector": sels["results"]},
+        {"action": "assert_text",   "text": query, "selector": sels["results"]},
     ]
 
 
@@ -348,6 +356,8 @@ def _ddg_search_steps(query: str) -> list[dict[str, Any]]:
         {"action": "fill",          "selector": sels["search_input"], "value": query},
         {"action": "press",         "key": "Enter"},
         {"action": "wait_state",    "state": "networkidle"},
+        {"action": "wait_selector", "selector": sels["results"]},
+        {"action": "assert_text",   "text": query, "selector": sels["results"]},
     ]
 
 
@@ -360,6 +370,8 @@ def _youtube_search_steps(query: str) -> list[dict[str, Any]]:
         {"action": "fill",          "selector": sels["search_input"], "value": query},
         {"action": "press",         "key": "Enter"},
         {"action": "wait_state",    "state": "networkidle"},
+        {"action": "wait_selector", "selector": sels["results"]},
+        {"action": "assert_text",   "text": query, "selector": sels["results"]},
     ]
 
 
@@ -371,16 +383,21 @@ def _wikipedia_search_steps(query: str) -> list[dict[str, Any]]:
         {"action": "fill",          "selector": sels["search_input"], "value": query},
         {"action": "press",         "key": "Enter"},
         {"action": "wait_state",    "state": "networkidle"},
+        {"action": "wait_selector", "selector": sels["results"]},
+        {"action": "assert_text",   "text": query, "selector": sels["results"]},
     ]
 
 
 def _navigate_steps(url: str) -> list[dict[str, Any]]:
+    import urllib.parse as _urlparse
     if not re.match(r"https?://", url):
         url = "https://" + url
+    domain = _urlparse.urlparse(url).netloc
     return [
-        {"action": "navigate",   "url": url, "wait_until": "domcontentloaded"},
+        {"action": "navigate",    "url": url, "wait_until": "domcontentloaded"},
         {"action": "close_popups"},
-        {"action": "wait_state", "state": "networkidle"},
+        {"action": "wait_state",  "state": "networkidle"},
+        {"action": "assert_url",  "pattern": domain},
     ]
 
 
@@ -545,7 +562,22 @@ PLANNING RULES (MUST follow all):
 5. For well-known sites (Google, Bing, YouTube, Wikipedia, DuckDuckGo) use the
    exact selectors listed below — never invent selectors.
 6. After navigate always add close_popups.
-7. Never add steps to "verify" or "confirm" — just do the task.
+7. MANDATORY VERIFICATION: Any plan that performs a form submission, login,
+   checkout, or navigation to an authenticated page MUST end with an assert_text
+   or assert_url step confirming the expected outcome.
+   - assert_text: check for a confirmation heading, success message, or next-step
+     indicator that would only be present on successful completion.
+   - assert_url: check for a URL path fragment expected after the action
+     (e.g. "/dashboard", "/search?q=").
+   - If you cannot identify a specific success indicator, use assert_url with the
+     most specific URL fragment you can determine from the task description.
+   - Never omit this step when the task has a verifiable outcome.
+8. FORM INPUT: Use "type" instead of "fill" for all form inputs. The "fill" action
+   sets the field value directly without firing JavaScript onChange/onInput events,
+   which leaves React, Vue, and Angular forms in an invalid state (submit button
+   stays disabled, field may clear on blur). Use "fill" only when you are certain
+   the target is a plain server-rendered HTML form and you explicitly set
+   framework_safe to false.
 
 ALLOWED ACTIONS (schema):
 """ + json.dumps(STEP_SCHEMA, indent=2) + """
@@ -561,9 +593,10 @@ Output:
   {"action": "navigate", "url": "https://www.google.com", "wait_until": "domcontentloaded"},
   {"action": "close_popups"},
   {"action": "wait_selector", "selector": "textarea[name='q']"},
-  {"action": "fill", "selector": "textarea[name='q']", "value": "python tutorials"},
+  {"action": "type", "selector": "textarea[name='q']", "text": "python tutorials"},
   {"action": "press", "key": "Enter"},
-  {"action": "wait_state", "state": "networkidle"}
+  {"action": "wait_selector", "selector": "#search"},
+  {"action": "assert_text", "text": "python", "selector": "#search"}
 ]
 
 Task: "open https://news.ycombinator.com"
@@ -580,9 +613,10 @@ Output:
   {"action": "navigate", "url": "https://www.youtube.com", "wait_until": "domcontentloaded"},
   {"action": "close_popups"},
   {"action": "wait_selector", "selector": "input#search"},
-  {"action": "fill", "selector": "input#search", "value": "machine learning"},
+  {"action": "type", "selector": "input#search", "text": "machine learning"},
   {"action": "press", "key": "Enter"},
-  {"action": "wait_state", "state": "networkidle"}
+  {"action": "wait_selector", "selector": "ytd-video-renderer"},
+  {"action": "assert_text", "text": "machine learning", "selector": "body"}
 ]
 
 Now output ONLY the JSON array for the task below. Nothing else.
@@ -607,8 +641,17 @@ PLANNING RULES (MUST follow all):
 3. Use the fewest steps possible. Never add unnecessary steps.
 4. Maximum 20 steps. If you cannot do the task in 20 steps, return an error step.
 5. After navigate always add close_popups.
-6. Never add steps to "verify" or "confirm" — just do the task.
-7. Prefer text=, label=, placeholder=, role= selectors over CSS when possible.
+6. MANDATORY VERIFICATION: Any plan that performs a form submission, login,
+   checkout, or navigation to an authenticated page MUST end with an assert_text
+   or assert_url step confirming the expected outcome.
+   - assert_text: check for a confirmation heading, success message, or next-step
+     indicator present only on successful completion.
+   - assert_url: check for a URL path fragment expected after the action.
+   - Never omit this step when the task has a verifiable outcome.
+7. FORM INPUT: Use "type" instead of "fill" for all form inputs. The "fill" action
+   bypasses JavaScript onChange/onInput events, leaving React/Vue/Angular forms
+   in an invalid state. Use "fill" only for plain server-rendered HTML forms.
+8. Prefer text=, label=, placeholder=, role= selectors over CSS when possible.
 
 ALLOWED ACTIONS (schema):
 """ + json.dumps(STEP_SCHEMA, indent=2) + """
@@ -752,6 +795,169 @@ def _call_ollama(intent: str) -> list[dict[str, Any]]:
 
     steps = json.loads(match.group())
     return validate_steps(steps)
+
+
+# ---------------------------------------------------------------------------
+# Observe-decide LLM helper (Phase 3 — agentic mode)
+# ---------------------------------------------------------------------------
+
+_OBSERVE_DECIDE_PROMPT = """You are a browser automation supervisor.
+
+Your job: given the original task intent, the current page state (URL + visible text),
+and recent step results, decide whether the task goal has been achieved or whether
+corrective browser steps are needed.
+
+RESPOND WITH EXACTLY ONE JSON OBJECT — no prose, no markdown, no explanation.
+
+Response options:
+
+1. Goal achieved:
+{"decision": "done"}
+
+2. Unrecoverable blocker (login wall, CAPTCHA, access denied, permanent redirect):
+{"decision": "abort", "reason": "brief one-line reason"}
+
+3. Correction needed (wrong page, unexpected redirect, goal not yet reached):
+{"decision": "continue", "steps": [... up to 3 corrective steps ...]}
+
+For option 3 steps must use only these actions:
+  navigate, click, type, fill, press, wait_selector, wait_state,
+  close_popups, assert_text, assert_url, scroll
+
+Rules:
+- Maximum 3 corrective steps.
+- Do NOT repeat steps that already completed successfully.
+- If in doubt whether the goal is met, return {"decision": "done"}.
+- Never invent page content; only act on what the URL and page text show.
+"""
+
+
+def _call_observe_decide(
+    intent: str,
+    url: str,
+    page_text: str,
+    recent_results: list[dict[str, Any]],
+    llm: str,
+) -> dict[str, Any]:
+    """Ask the configured LLM whether the task goal is met.
+
+    Parameters
+    ----------
+    intent:
+        The original task description.
+    url:
+        Current browser URL at the time of the checkpoint.
+    page_text:
+        First 2 000 characters of page body text.
+    recent_results:
+        Up to the last 5 executed step result records.
+    llm:
+        ``"openai"`` or ``"ollama"`` — which backend to call.
+
+    Returns
+    -------
+    dict
+        ``{"decision": "done" | "abort" | "continue",
+           "reason": str (abort only),
+           "steps": list[dict] (continue only, already validated)}``
+
+    The function is intentionally fail-safe: any parsing or network error
+    returns ``{"decision": "continue", "steps": []}`` so the outer loop
+    continues executing the original plan rather than crashing.
+    """
+    user_msg = (
+        f"Task: {intent}\n\n"
+        f"Current URL: {url}\n"
+        f"Page text (truncated to 2000 chars):\n{page_text[:2000]}\n\n"
+        f"Recent step results:\n{json.dumps(recent_results[-5:], default=str)}\n\n"
+        "Has the task goal been achieved? Respond with exactly one JSON object."
+    )
+
+    raw = ""
+    try:
+        if llm == "openai":
+            import openai  # type: ignore[import]
+            model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+            client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _OBSERVE_DECIDE_PROMPT},
+                    {"role": "user",   "content": user_msg},
+                ],
+                temperature=0.0,
+                max_tokens=512,
+                response_format={"type": "json_object"},
+            )
+            raw = resp.choices[0].message.content or ""
+
+        elif llm == "ollama":
+            import urllib.request as _ureq
+            host  = os.environ.get("OLLAMA_HOST",  "http://localhost:11434")
+            model = os.environ.get("OLLAMA_MODEL", "llama3")
+            payload = json.dumps({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": _OBSERVE_DECIDE_PROMPT},
+                    {"role": "user",   "content": user_msg},
+                ],
+                "stream": False,
+                "options": {"temperature": 0.0},
+            }).encode()
+            req = _ureq.Request(
+                f"{host}/api/chat",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _ureq.urlopen(req, timeout=30) as r:
+                body = json.loads(r.read())
+            raw = body.get("message", {}).get("content", "")
+
+        else:
+            logger.warning("observe-decide: unknown llm %r, skipping", llm)
+            return {"decision": "continue", "steps": []}
+
+    except Exception as exc:
+        logger.warning("observe-decide LLM call failed (%s); skipping checkpoint", exc)
+        return {"decision": "continue", "steps": []}
+
+    logger.debug("observe-decide raw: %s", raw)
+
+    # Parse JSON object from response
+    try:
+        raw_clean = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+        match = re.search(r"\{.*\}", raw_clean, re.DOTALL)
+        if not match:
+            logger.warning("observe-decide: no JSON object in response: %s", raw[:200])
+            return {"decision": "continue", "steps": []}
+        parsed = json.loads(match.group())
+    except Exception as exc:
+        logger.warning("observe-decide: JSON parse error (%s): %s", exc, raw[:200])
+        return {"decision": "continue", "steps": []}
+
+    decision = parsed.get("decision", "continue")
+    if decision not in ("done", "abort", "continue"):
+        logger.warning("observe-decide: unexpected decision %r, defaulting to continue", decision)
+        decision = "continue"
+
+    result: dict[str, Any] = {"decision": decision}
+
+    if decision == "abort":
+        result["reason"] = str(parsed.get("reason", ""))[:200]
+
+    elif decision == "continue":
+        raw_steps = parsed.get("steps") or []
+        validated_steps: list[dict[str, Any]] = []
+        if raw_steps and isinstance(raw_steps, list):
+            try:
+                # Cap at 3 corrective steps before validation to avoid the 20-step limit
+                validated_steps = validate_steps(raw_steps[:3])
+            except (StepValidationError, Exception) as exc:
+                logger.warning("observe-decide: corrective steps invalid (%s), skipping", exc)
+        result["steps"] = validated_steps
+
+    return result
 
 
 def _call_vision_openai(intent: str, screenshot_b64: str) -> list[dict[str, Any]]:
@@ -1318,7 +1524,22 @@ class TaskPlanner:
         """
         Plan *intent* and execute the resulting steps against *agent*.
 
-        Returns a summary dict with ``steps``, ``results``, and ``success`` flag.
+        Returns a summary dict with the following keys:
+
+        ``success``
+            ``True`` when no step raised an exception (unchanged semantics).
+        ``verified``
+            ``True`` when the last ``assert_text`` or ``assert_url`` step
+            confirmed the expected outcome (``found``/``matched`` == True).
+            ``False`` when an assertion step ran but the check failed.
+            ``None`` when no assertion steps exist in the plan — meaning
+            verification was not attempted; ``success`` is still meaningful.
+        ``steps``
+            The planned step list.
+        ``results``
+            Per-step result records.
+        ``failed_count``
+            Number of steps with status ``"error"``.
 
         Parameters
         ----------
@@ -1335,8 +1556,23 @@ class TaskPlanner:
 
         results = self.execute(steps, agent, stop_on_error=stop_on_error)
         failed  = [r for r in results if r["status"] == "error"]
+
+        # Compute verified: True/False when an assertion step ran, None when none did.
+        assertion_results = [
+            r for r in results
+            if r.get("action") in ("assert_text", "assert_url") and r.get("status") == "ok"
+        ]
+        if not assertion_results:
+            verified: bool | None = None
+        else:
+            last_assert_result = assertion_results[-1].get("result") or {}
+            verified = bool(
+                last_assert_result.get("found") or last_assert_result.get("matched")
+            )
+
         summary = {
             "success":      len(failed) == 0,
+            "verified":     verified,
             "intent":       intent,
             "steps":        steps,
             "results":      results,
@@ -1353,6 +1589,274 @@ class TaskPlanner:
                 logger.info("Execution log saved to %s", log_path)
             except Exception as exc:
                 logger.warning("Could not save execution log to %r: %s", log_path, exc)
+
+        return summary
+
+    def agentic_run(
+        self,
+        intent: str,
+        agent: Any,
+        *,
+        initial_steps: list[dict[str, Any]] | None = None,
+        max_steps: int = 20,
+        checkpoint_every: int = 3,
+        stop_on_error: bool = True,
+        log_path: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Observe-decide-act execution loop (Phase 3 agentic mode).
+
+        Unlike :meth:`run`, which executes a static plan to completion,
+        ``agentic_run`` periodically pauses after every *checkpoint_every*
+        steps, observes the live page state (current URL + body text), and
+        asks the LLM whether the goal has been achieved or whether corrective
+        steps are needed.  Corrective steps are validated and injected into
+        the front of the remaining step queue.
+
+        Parameters
+        ----------
+        intent:
+            Natural-language task description.
+        agent:
+            A ``BrowserAgent`` instance to execute steps against.
+        initial_steps:
+            Optional pre-validated step list.  When provided, ``plan()``
+            is skipped and these steps are used as the starting queue.
+            Callers that already hold a validated plan (e.g. the HTTP
+            route that called ``plan()`` to get an untainted step list)
+            should pass it here to avoid a redundant LLM call.
+        max_steps:
+            Hard ceiling on the total number of steps executed (including
+            any injected corrective steps).  Hitting this limit stops the
+            loop with ``stopped_reason="max_steps"``.  Default 20.
+        checkpoint_every:
+            How many steps to execute between LLM observe-decide calls.
+            Must be ≥ 1.  A checkpoint also fires when the step queue
+            empties after the last step.  Default 3.
+        stop_on_error:
+            If ``True`` (default), the loop stops on the first failed step.
+            If ``False``, errors are recorded and execution continues.
+        log_path:
+            Optional workspace-relative path for saving the full execution
+            log (steps + results + timestamp) as JSON.
+
+        Returns
+        -------
+        dict
+            ``success``
+                ``True`` when no step raised an exception.
+            ``verified``
+                ``True`` / ``False`` / ``None`` (Phase 2 semantics, unchanged).
+            ``stopped_reason``
+                ``"verified"`` — an assert step confirmed the goal.
+                ``"done_by_model"`` — the LLM reported the goal is met,
+                or the step queue completed without any error.
+                ``"max_steps"`` — the step budget was exhausted.
+                ``"abort"`` — the LLM detected an unrecoverable blocker.
+                ``"error"`` — execution stopped due to a step failure.
+            ``recovery_steps_injected``
+                Number of corrective steps injected by the observe-decide loop.
+            ``steps``
+                Full step list (initial plan + injected corrective steps).
+            ``results``
+                Per-step execution records.
+            ``failed_count``
+                Number of error steps.
+
+        Notes
+        -----
+        When no LLM is configured (``self.llm is None``), observe-decide
+        checkpoints are silently skipped.  The method then behaves like
+        :meth:`execute` with a ``max_steps`` ceiling — still strictly more
+        reliable than the unbounded :meth:`execute` call.
+
+        Corrective steps returned by the LLM are always passed through
+        :func:`validate_steps` before use.  If validation fails the
+        corrective steps are silently dropped and execution continues with
+        the original plan (fail-safe behaviour).
+        """
+        import json as _json
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        checkpoint_every = max(1, checkpoint_every)
+
+        # 1. Build initial plan -----------------------------------------------
+        if initial_steps is not None:
+            _plan = initial_steps
+        else:
+            try:
+                _plan = self.plan(intent)
+            except (ValueError, StepValidationError) as exc:
+                # Sanitize the exception message at the source so it cannot carry
+                # stack-trace information into callers (e.g. the HTTP response layer).
+                _safe_err = str(exc).splitlines()[0][:500]
+                logger.warning("agentic_run plan failed: %s", _safe_err)
+                return {
+                    "success":                  False,
+                    "verified":                 None,
+                    "intent":                   intent,
+                    "stopped_reason":           "error",
+                    "recovery_steps_injected":  0,
+                    "steps":                    [],
+                    "results":                  [],
+                    "failed_count":             0,
+                }
+
+        queue:      list[dict[str, Any]] = list(_plan)
+        all_steps:  list[dict[str, Any]] = list(_plan)  # grows when steps are injected
+        executed:   list[dict[str, Any]] = []
+        injected_count = 0
+        total_executed = 0
+        verified: bool | None = None
+        stopped_reason: str | None = None
+
+        # 2. Observe-decide-act loop -------------------------------------------
+        while queue:
+            if total_executed >= max_steps:
+                stopped_reason = "max_steps"
+                break
+
+            step = queue.pop(0)
+            action = step["action"]
+            logger.info(
+                "Agentic step %d (max %d): %s", total_executed + 1, max_steps, action
+            )
+
+            # Execute step
+            try:
+                result = self._execute_step(agent, step)
+            except Exception as exc:
+                # Sanitize exception message at source: take first line only,
+                # cap at 500 chars — same sanitization the HTTP layer applies.
+                _safe_err = str(exc).splitlines()[0][:500]
+                err_record: dict[str, Any] = {
+                    "step":   total_executed,
+                    "action": action,
+                    "status": "error",
+                    "error":  _safe_err,
+                }
+                executed.append(err_record)
+                total_executed += 1
+                if stop_on_error:
+                    stopped_reason = "error"
+                    break
+                continue
+
+            ok_record: dict[str, Any] = {
+                "step":   total_executed,
+                "action": action,
+                "status": "ok",
+                "result": result,
+            }
+            executed.append(ok_record)
+            total_executed += 1
+
+            # Assertion-driven verification → exit immediately on pass
+            if action in ("assert_text", "assert_url"):
+                r = result if isinstance(result, dict) else {}
+                if r.get("found") or r.get("matched"):
+                    verified = True
+                    stopped_reason = "verified"
+                    break
+
+            # Checkpoint: call the LLM after every N steps or when queue empties
+            at_checkpoint = (total_executed % checkpoint_every == 0)
+            queue_empty   = (len(queue) == 0)
+
+            if (at_checkpoint or queue_empty) and self.llm:
+                try:
+                    obs_url   = agent.get_url()
+                    obs_text  = agent.get_text("body")
+                except Exception:
+                    obs_url  = ""
+                    obs_text = ""
+
+                logger.info(
+                    "Agentic checkpoint at step %d: observing page (%s)",
+                    total_executed, obs_url[:80],
+                )
+
+                decision = _call_observe_decide(
+                    intent,
+                    obs_url,
+                    obs_text,
+                    executed[-checkpoint_every:],
+                    self.llm,
+                )
+                dec = decision.get("decision", "continue")
+
+                if dec == "done":
+                    stopped_reason = "done_by_model"
+                    break
+
+                if dec == "abort":
+                    stopped_reason = "abort"
+                    logger.warning(
+                        "Agentic abort: %s", decision.get("reason", "no reason given")
+                    )
+                    break
+
+                # dec == "continue"
+                corrective = decision.get("steps") or []
+                if corrective:
+                    # Validate corrective steps as a safety net even though
+                    # _call_observe_decide already validates them, in case the
+                    # caller has injected raw steps via testing or direct use.
+                    try:
+                        validated_corrective = validate_steps(corrective)
+                    except (StepValidationError, Exception) as exc:
+                        logger.warning(
+                            "Corrective steps failed validation (%s), skipping injection", exc
+                        )
+                        validated_corrective = []
+                    if validated_corrective:
+                        queue[0:0] = validated_corrective
+                        all_steps.extend(validated_corrective)
+                        injected_count += len(validated_corrective)
+                        logger.info(
+                            "Injected %d corrective step(s); queue length now %d",
+                            len(validated_corrective), len(queue),
+                        )
+
+        # 3. Determine final stopped_reason if loop exited without a break ----
+        if stopped_reason is None:
+            stopped_reason = "done_by_model"
+
+        # 4. Compute verified (Phase 2 semantics) if not already set ---------
+        if verified is None:
+            assertion_results = [
+                r for r in executed
+                if r.get("action") in ("assert_text", "assert_url")
+                and r.get("status") == "ok"
+            ]
+            if assertion_results:
+                last_ar = assertion_results[-1].get("result") or {}
+                verified = bool(
+                    last_ar.get("found") or last_ar.get("matched")
+                )
+
+        failed = [r for r in executed if r.get("status") == "error"]
+
+        summary: dict[str, Any] = {
+            "success":                  len(failed) == 0,
+            "verified":                 verified,
+            "intent":                   intent,
+            "stopped_reason":           stopped_reason,
+            "recovery_steps_injected":  injected_count,
+            "steps":                    all_steps,
+            "results":                  executed,
+            "failed_count":             len(failed),
+        }
+
+        if log_path:
+            st = self._get_system_tools()
+            log_entry = {**summary, "timestamp": _dt.now(_tz.utc).isoformat()}
+            try:
+                st.write_file(log_path, _json.dumps(log_entry, indent=2, default=str))
+                logger.info("Agentic execution log saved to %s", log_path)
+            except Exception as exc:
+                logger.warning("Could not save agentic log to %r: %s", log_path, exc)
 
         return summary
 
@@ -1379,12 +1883,41 @@ class TaskPlanner:
         action = step["action"]
 
         if action == "navigate":
-            return agent.navigate(step["url"], wait_until=step.get("wait_until", "domcontentloaded"))
+            result = agent.navigate(step["url"], wait_until=step.get("wait_until", "domcontentloaded"))
+            # Login-wall detection: if we intended to navigate to a non-auth URL
+            # but the browser landed on an auth/login URL, execution must stop.
+            # Continuing would silently run all subsequent steps against the
+            # wrong page (the login form), producing misleading results.
+            _AUTH_TOKENS = (
+                "login", "signin", "sign-in", "auth", "sso",
+                "oauth", "session/new", "account/login",
+            )
+            target = step["url"].lower()
+            actual = agent.page.url.lower()
+            _target_is_auth = any(t in target for t in _AUTH_TOKENS)
+            _actual_is_auth = any(t in actual for t in _AUTH_TOKENS)
+            if not _target_is_auth and _actual_is_auth:
+                raise ValueError(
+                    f"Login wall detected: navigating to {step['url']!r} redirected to "
+                    f"{agent.page.url!r}. Task cannot proceed without authentication."
+                )
+            return result
 
         if action == "click":
             return agent.click(step["selector"], timeout=step.get("timeout"))
 
         if action == "fill":
+            # framework_safe=True (default): route through type_text so that
+            # JavaScript onChange/onInput events fire and React/Vue/Angular
+            # component state stays in sync with the field value.
+            # framework_safe=False: use raw Playwright fill (no key events) —
+            # faster, but only correct for plain server-rendered HTML forms.
+            if step.get("framework_safe", True):
+                return agent.type_text(
+                    step["selector"],
+                    step["value"],
+                    clear_first=True,
+                )
             return agent.fill(step["selector"], step["value"])
 
         if action == "type":
@@ -1446,15 +1979,29 @@ class TaskPlanner:
 
         # ---- Smart extraction ----
 
+        # ---- Smart extraction ----
+
         if action == "extract_links":
+            sel = step.get("selector", "a")
+            if step.get("wait_for_ready", True) and sel != "a":
+                try:
+                    agent.wait_for_selector(sel, timeout=step.get("timeout", 5_000))
+                except Exception:
+                    pass  # proceed — extraction may still succeed
             return agent.extract_links(
-                selector=step.get("selector", "a"),
+                selector=sel,
                 limit=step.get("limit", 100),
             )
 
         if action == "extract_table":
+            sel = step.get("selector", "table")
+            if step.get("wait_for_ready", True) and sel != "table":
+                try:
+                    agent.wait_for_selector(sel, timeout=step.get("timeout", 5_000))
+                except Exception:
+                    pass  # proceed — extraction may still succeed
             return agent.extract_table(
-                selector=step.get("selector", "table"),
+                selector=sel,
                 table_index=step.get("table_index", 0),
             )
 

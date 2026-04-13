@@ -152,10 +152,40 @@ _POPUP_SELECTORS = [
     "[class*='gdpr'] button",
     "[class*='newsletter'] button[class*='close']",
     "[class*='overlay'] button[class*='close']",
+    # Named CMP platforms
+    "#onetrust-accept-btn-handler",
+    "#CybotCookiebotDialogBodyButtonAccept",
+    "#truste-consent-button",
+    ".osano-cm-accept--all",
+    "[data-testid='qc-cmp2-accept-all-button']",
+    "#cookiebanner-accept",
+    ".cc-allow",
+    "#cookieConsentOK",
+    "button[id*='accept'][id*='all']",
 ]
 
 # Allowed URL schemes for navigation (prevents javascript:, file:, data: injection).
 _ALLOWED_URL_SCHEMES: tuple[str, ...] = ("http://", "https://")
+
+
+def _run_popup_scan(page: Any) -> list[str]:
+    """Single pass: try every selector in _POPUP_SELECTORS; return dismissed list.
+
+    Extracted as a module-level function so it can be called multiple times
+    from ``close_popups`` and tested independently without a ``BrowserAgent``
+    instance.
+    """
+    dismissed: list[str] = []
+    for selector in _POPUP_SELECTORS:
+        try:
+            element = page.query_selector(selector)
+            if element and element.is_visible():
+                element.click(timeout=2_000)
+                dismissed.append(selector)
+                logger.debug("Dismissed popup element: %s", selector)
+        except Exception:
+            pass  # Element may have disappeared or be unclickable — skip.
+    return dismissed
 
 
 class BrowserAgent:
@@ -386,19 +416,27 @@ class BrowserAgent:
         """
         Attempt to close common popup / overlay elements.
 
-        Tries each selector in ``_POPUP_SELECTORS`` and clicks it if found
-        and visible.  Returns a summary of what was dismissed.
+        Runs two selector-scan passes with an 800 ms wait between them so that
+        CMPs (OneTrust, CookieBot, etc.) that render after initial page load are
+        caught by the second pass even when the first pass finds nothing.
+        Returns a deduplicated summary of what was dismissed.
         """
-        dismissed: list[str] = []
-        for selector in _POPUP_SELECTORS:
-            try:
-                element = self.page.query_selector(selector)
-                if element and element.is_visible():
-                    element.click(timeout=2_000)
-                    dismissed.append(selector)
-                    logger.debug("Dismissed popup element: %s", selector)
-            except Exception:
-                pass  # Element may have disappeared or be unclickable — skip.
+        # First pass
+        dismissed: list[str] = _run_popup_scan(self.page)
+
+        # Second pass: most CMP banners appear 300–800 ms after page load.
+        try:
+            self.page.wait_for_timeout(800)
+        except Exception:
+            pass
+        second = _run_popup_scan(self.page)
+
+        # Merge passes, deduplicating while preserving first-seen order.
+        seen: set[str] = set(dismissed)
+        for s in second:
+            if s not in seen:
+                seen.add(s)
+                dismissed.append(s)
 
         # Also dismiss any visible <dialog> or [role=dialog] overlays by
         # pressing Escape (catches many SPA modals).
