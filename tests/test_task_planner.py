@@ -283,3 +283,55 @@ class TestTaskPlannerLLMMock:
                 planner = TaskPlanner()
                 planner.plan("go to google and search python")
         mock_llm.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# set_network_intercept key collision regression test
+# ---------------------------------------------------------------------------
+
+class TestSetNetworkInterceptSchema:
+    def test_intercept_action_key_not_overwritten_by_action(self) -> None:
+        """
+        The optional key for set_network_intercept must be 'intercept_action',
+        NOT 'action' — to avoid the step's mandatory 'action' field being
+        overwritten during validation.
+        """
+        schema = STEP_SCHEMA["set_network_intercept"]
+        # The optional dict must NOT contain an 'action' key
+        assert "action" not in schema["optional"], (
+            "set_network_intercept optional key named 'action' collides with "
+            "the mandatory step 'action' key. Rename it to 'intercept_action'."
+        )
+        # The intercept_action key must be present
+        assert "intercept_action" in schema["optional"]
+
+    def test_validate_set_network_intercept_preserves_action(self) -> None:
+        """After validation the step action must still be 'set_network_intercept'."""
+        steps = [{"action": "set_network_intercept", "url_pattern": "**/*.png"}]
+        out = validate_steps(steps)
+        assert out[0]["action"] == "set_network_intercept"
+
+    def test_validate_set_network_intercept_default_intercept_action(self) -> None:
+        """Default intercept_action should be 'abort'."""
+        steps = [{"action": "set_network_intercept", "url_pattern": "**/*.png"}]
+        out = validate_steps(steps)
+        assert out[0]["intercept_action"] == "abort"
+
+    def test_validate_set_network_intercept_custom_intercept_action(self) -> None:
+        """Custom intercept_action 'continue' should be preserved."""
+        steps = [{"action": "set_network_intercept", "url_pattern": "**/*.png", "intercept_action": "continue"}]
+        out = validate_steps(steps)
+        assert out[0]["intercept_action"] == "continue"
+
+
+# ---------------------------------------------------------------------------
+# _SYSTEM_PROMPT step count consistency
+# ---------------------------------------------------------------------------
+
+class TestSystemPromptStepCount:
+    def test_system_prompt_max_steps_matches_validate_steps(self) -> None:
+        """_SYSTEM_PROMPT must say 20 steps (matching validate_steps max of 20)."""
+        from task_planner import _SYSTEM_PROMPT
+        assert "20 steps" in _SYSTEM_PROMPT, (
+            "_SYSTEM_PROMPT should say 'Maximum 20 steps' to match validate_steps limit"
+        )

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from pathlib import Path
 from typing import Any
 
 from playwright.sync_api import (
@@ -93,6 +94,9 @@ _POPUP_SELECTORS = [
     "[class*='overlay'] button[class*='close']",
 ]
 
+# Allowed URL schemes for navigation (prevents javascript:, file:, data: injection).
+_ALLOWED_URL_SCHEMES: tuple[str, ...] = ("http://", "https://")
+
 
 class BrowserAgent:
     """
@@ -130,6 +134,9 @@ class BrowserAgent:
         self._context: BrowserContext | None = None
         self._page: Page | None = None
         self._pages: list[Page] = []  # all open tabs; self._page is the active one
+        self._intercept_patterns: list[str] = []  # patterns registered via set_network_intercept
+        self._recording: bool = False          # True while video recording is active
+        self._recording_path: str | None = None  # desired output path for active recording
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -143,26 +150,17 @@ class BrowserAgent:
             slow_mo=self.slow_mo,
             args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
-        self._context = self._browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
-        self._context.set_default_timeout(self.default_timeout)
-
-        # Auto-handle native JS dialogs (alert / confirm / prompt).
-        self._page = self._context.new_page()
-        self._page.on("dialog", self._handle_dialog)
-        self._pages = [self._page]  # track all open tabs
-
+        self._make_context()
         logger.info("BrowserAgent started (headless=%s)", self.headless)
         return self
 
     def stop(self) -> None:
         """Close the browser and release all resources."""
+        if self._recording:
+            logger.warning(
+                "Video recording was active when stop() was called; "
+                "the saved video may be incomplete."
+            )
         if self._browser:
             self._browser.close()
         if self._playwright:
@@ -172,7 +170,54 @@ class BrowserAgent:
         self._browser = None
         self._playwright = None
         self._pages = []
+        self._recording = False
+        self._recording_path = None
         logger.info("BrowserAgent stopped")
+
+    # ------------------------------------------------------------------
+    # Private context helpers
+    # ------------------------------------------------------------------
+
+    def _make_context(self, record_video_dir: str | None = None) -> None:
+        """Create (or recreate) the BrowserContext and a fresh first page.
+
+        When *record_video_dir* is given, Playwright will save a WebM video of
+        everything that happens inside this context to that directory.
+        """
+        if self._browser is None:
+            raise RuntimeError("Browser is not launched. Call start() first.")
+        ctx_kwargs: dict[str, Any] = {
+            "viewport": {"width": 1280, "height": 800},
+            "user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        }
+        if record_video_dir is not None:
+            ctx_kwargs["record_video_dir"] = record_video_dir
+            ctx_kwargs["record_video_size"] = {"width": 1280, "height": 800}
+        self._context = self._browser.new_context(**ctx_kwargs)
+        self._context.set_default_timeout(self.default_timeout)
+        self._page = self._context.new_page()
+        self._page.on("dialog", self._handle_dialog)
+        self._pages = [self._page]
+
+    def _close_context(self) -> None:
+        """Close all pages and the current context without touching the browser."""
+        for page in list(self._pages):
+            try:
+                page.close()
+            except Exception:
+                pass
+        if self._context is not None:
+            try:
+                self._context.close()
+            except Exception:
+                pass
+        self._page = None
+        self._context = None
+        self._pages = []
 
     # Context manager support
     def __enter__(self) -> "BrowserAgent":
@@ -242,7 +287,9 @@ class BrowserAgent:
         Parameters
         ----------
         url:
-            Target URL (e.g. ``"https://example.com"``).
+            Target URL (e.g. ``"https://example.com"``).  Only ``http://`` and
+            ``https://`` schemes are accepted; ``javascript:``, ``file://``, and
+            ``data:`` URIs are rejected with a ``ValueError``.
         wait_until:
             Playwright load-state strategy: ``"load"``, ``"domcontentloaded"``,
             or ``"networkidle"``.  When ``"networkidle"`` is requested the page
@@ -255,6 +302,11 @@ class BrowserAgent:
         dict
             ``{"url": ..., "title": ...}``
         """
+        if not url.startswith(_ALLOWED_URL_SCHEMES):
+            raise ValueError(
+                f"Unsafe URL scheme in {url!r}. "
+                "Only http:// and https:// are allowed."
+            )
         logger.info("Navigating to %s", url)
         # Navigate with a reliable load event; networkidle is attempted separately
         # to avoid infinite hangs on SPAs that never stop making network requests.
@@ -525,6 +577,173 @@ class BrowserAgent:
         return result
 
     # ------------------------------------------------------------------
+    # Video recording
+    # ------------------------------------------------------------------
+
+    def start_video_recording(self, save_path: str) -> dict[str, Any]:
+        """Start recording the browser session as a WebM video.
+
+        Playwright records the browser context as ``.webm`` video.  The file is
+        only finalised when :meth:`stop_video_recording` is called.
+
+        Parameters
+        ----------
+        save_path:
+            Absolute path for the output ``.webm`` file (e.g.
+            ``/workspace/recordings/session.webm``).  The parent directory is
+            created if it does not exist.  Must use only ``http://`` / ``https://``
+            URLs when navigating during recording.
+
+        Returns
+        -------
+        dict
+            ``{"recording": True, "save_path": ...}``
+        """
+        if self._recording:
+            raise RuntimeError(
+                "Video recording is already active. "
+                "Call stop_video_recording() before starting a new one."
+            )
+        save_dir = str(Path(save_path).parent)
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+
+        current_url = self._page.url if self._page else None
+        self._close_context()
+        self._make_context(record_video_dir=save_dir)
+
+        self._recording = True
+        self._recording_path = save_path
+
+        if current_url and current_url.startswith(_ALLOWED_URL_SCHEMES):
+            self.navigate(current_url)
+
+        logger.info("Video recording started")
+        return {"recording": True, "save_path": save_path}
+
+    def stop_video_recording(self) -> dict[str, Any]:
+        """Stop recording and save the finalised WebM video.
+
+        Closes the current browser context (which tells Playwright to finalise
+        the video), renames the auto-generated file to the path that was
+        supplied to :meth:`start_video_recording`, then reopens a clean
+        context.
+
+        Returns
+        -------
+        dict
+            ``{"saved_to": ..., "ok": True}``
+        """
+        if not self._recording:
+            raise RuntimeError(
+                "No video recording is in progress. "
+                "Call start_video_recording() first."
+            )
+
+        # Capture the raw video path BEFORE closing (Playwright sets it on
+        # record; the file is finalised only after context.close()).
+        raw_video_path: str | None = None
+        if self._page is not None and self._page.video is not None:
+            try:
+                raw_video_path = self._page.video.path()
+            except Exception:
+                pass
+
+        current_url = self._page.url if self._page else None
+        desired_path = self._recording_path
+
+        self._recording = False
+        self._recording_path = None
+
+        # Closing the context finalises the video file.
+        self._close_context()
+
+        # Move the auto-named file to the caller's desired path.
+        saved_to: str | None = None
+        if raw_video_path and desired_path and raw_video_path != desired_path:
+            import shutil as _shutil
+            try:
+                _shutil.move(raw_video_path, desired_path)
+                saved_to = desired_path
+            except Exception as exc:
+                logger.warning("Could not rename recorded video file: %s", exc)
+                saved_to = raw_video_path
+        else:
+            saved_to = raw_video_path or desired_path
+
+        # Reinitialise without recording so the agent remains usable.
+        self._make_context()
+        if current_url and current_url.startswith(_ALLOWED_URL_SCHEMES):
+            self.navigate(current_url)
+
+        logger.info("Video recording stopped")
+        return {"saved_to": saved_to, "ok": True}
+
+    # ------------------------------------------------------------------
+    # GIF recording
+    # ------------------------------------------------------------------
+
+    def record_gif(
+        self,
+        path: str,
+        duration: float = 3.0,
+        fps: int = 2,
+    ) -> dict[str, Any]:
+        """Capture an animated GIF of the current page over *duration* seconds.
+
+        Takes ``ceil(duration * fps)`` screenshots at equal intervals and
+        stitches them into an animated GIF using Pillow (``pillow>=10.3.0``
+        is already listed in ``requirements.txt``).
+
+        Parameters
+        ----------
+        path:
+            Absolute path for the output ``.gif`` file.
+        duration:
+            Total recording time in seconds (default ``3.0``).
+        fps:
+            Frames per second (default ``2``; max recommended ``10``).
+
+        Returns
+        -------
+        dict
+            ``{"saved_to": ..., "frames": N, "fps": N, "duration": N, "ok": True}``
+        """
+        import io
+        import time
+
+        from PIL import Image  # type: ignore[import-untyped]
+
+        n_frames = max(1, int(duration * fps))
+        interval = duration / n_frames
+
+        frames: list[Any] = []
+        for i in range(n_frames):
+            raw = self.page.screenshot()
+            frames.append(Image.open(io.BytesIO(raw)))
+            if i < n_frames - 1:
+                time.sleep(interval)
+
+        dest = Path(path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        frames[0].save(
+            dest,
+            format="GIF",
+            save_all=True,
+            append_images=frames[1:],
+            optimize=False,
+            loop=0,
+            duration=int(interval * 1000),
+        )
+        logger.info("GIF saved (%d frames @ %d fps)", n_frames, fps)
+        return {
+            "saved_to": str(dest),
+            "frames": n_frames,
+            "fps": fps,
+            "duration": duration,
+            "ok": True,
+        }
+
+    # ------------------------------------------------------------------
     # Wait helpers
     # ------------------------------------------------------------------
 
@@ -534,9 +753,35 @@ class BrowserAgent:
         return {"visible": selector}
 
     def wait_for_navigation(self, url: str | None = None) -> dict[str, Any]:
-        """Wait for any navigation to complete (optionally matching *url*)."""
-        with self.page.expect_navigation(url=url):
-            pass
+        """
+        Wait for the current page to reach a settled load state.
+
+        This method waits for ``domcontentloaded`` (falling back gracefully if
+        the page is already loaded) so it is safe to call after an action that
+        triggers navigation has already been started.
+
+        .. note::
+            To wait for navigation that is *about to be triggered* by a click or
+            form submission, use ``wait_for_load_state()`` immediately after the
+            triggering action instead — Playwright's ``expect_navigation``
+            context manager requires the triggering action to occur *inside* the
+            ``with`` block, which is not possible from this convenience wrapper.
+
+        Parameters
+        ----------
+        url:
+            Ignored (kept for backwards-compatibility).  Use ``assert_url()``
+            after this call if you need to verify the destination URL.
+
+        Returns
+        -------
+        dict
+            ``{"url": <current_url>}``
+        """
+        try:
+            self.page.wait_for_load_state("domcontentloaded")
+        except Exception:
+            pass  # already loaded — not an error
         return {"url": self.page.url}
 
     def wait_for_load_state(self, state: str = "networkidle") -> dict[str, Any]:
@@ -900,6 +1145,11 @@ class BrowserAgent:
         dict
             ``{"saved_to": ..., "filename": ..., "ok": True}``
         """
+        if not url.startswith(_ALLOWED_URL_SCHEMES):
+            raise ValueError(
+                f"Unsafe URL scheme in {url!r}. "
+                f"Only {_ALLOWED_URL_SCHEMES} are allowed."
+            )
         with self.page.expect_download() as download_info:
             self.page.goto(url, wait_until="domcontentloaded")
         download = download_info.value
@@ -1028,8 +1278,6 @@ class BrowserAgent:
                 route.continue_()
             self.page.route(url_pattern, _continue_handler)
 
-        if not hasattr(self, "_intercept_patterns"):
-            self._intercept_patterns: list[str] = []
         self._intercept_patterns.append(url_pattern)
         return {"url_pattern": url_pattern, "action": action, "ok": True}
 
@@ -1043,19 +1291,18 @@ class BrowserAgent:
         dict
             ``{"cleared": N, "ok": True}``
         """
-        count = len(getattr(self, "_intercept_patterns", []))
+        count = len(self._intercept_patterns)
         try:
             self.page.unroute_all()
         except AttributeError:
             # Playwright < 1.32 does not have unroute_all(); fall back to
             # unrouting each pattern individually.
-            for pattern in getattr(self, "_intercept_patterns", []):
+            for pattern in self._intercept_patterns:
                 try:
                     self.page.unroute(pattern)
                 except Exception:
                     pass
-        if hasattr(self, "_intercept_patterns"):
-            self._intercept_patterns.clear()
+        self._intercept_patterns.clear()
         return {"cleared": count, "ok": True}
 
     def set_viewport(self, width: int, height: int) -> dict[str, Any]:

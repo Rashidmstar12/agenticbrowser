@@ -542,11 +542,15 @@ class TestWaitHelpers:
 
     def test_wait_for_navigation(self):
         agent, page, _ = _make_agent()
-        # page.expect_navigation is a context manager
-        cm = MagicMock()
-        cm.__enter__ = MagicMock(return_value=None)
-        cm.__exit__ = MagicMock(return_value=False)
-        page.expect_navigation.return_value = cm
+        result = agent.wait_for_navigation()
+        # Should use wait_for_load_state, not expect_navigation
+        page.wait_for_load_state.assert_called_once_with("domcontentloaded")
+        assert "url" in result
+
+    def test_wait_for_navigation_handles_exception(self):
+        """wait_for_navigation should not raise if the page is already loaded."""
+        agent, page, _ = _make_agent()
+        page.wait_for_load_state.side_effect = Exception("already loaded")
         result = agent.wait_for_navigation()
         assert "url" in result
 
@@ -838,3 +842,281 @@ class TestMultiTab:
 
         assert result["count"] == 2
         assert result["tabs"][1]["url"] == "unknown"
+
+
+# ---------------------------------------------------------------------------
+# URL scheme validation
+# ---------------------------------------------------------------------------
+
+class TestNavigateURLValidation:
+    def test_navigate_http_allowed(self):
+        agent, page, _ = _make_agent()
+        page.url = "http://example.com"
+        result = agent.navigate("http://example.com")
+        assert "url" in result
+
+    def test_navigate_https_allowed(self):
+        agent, page, _ = _make_agent()
+        result = agent.navigate("https://example.com")
+        assert "url" in result
+
+    def test_navigate_javascript_blocked(self):
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.navigate("javascript:alert(1)")
+
+    def test_navigate_file_blocked(self):
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.navigate("file:///etc/passwd")
+
+    def test_navigate_data_blocked(self):
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.navigate("data:text/html,<h1>xss</h1>")
+
+    def test_navigate_no_scheme_blocked(self):
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.navigate("example.com")
+
+
+# ---------------------------------------------------------------------------
+# _intercept_patterns initialized in __init__
+# ---------------------------------------------------------------------------
+
+class TestInterceptPatternsInit:
+    def test_intercept_patterns_initialized(self):
+        """_intercept_patterns should be a list from the start, not require hasattr."""
+        agent = BrowserAgent()
+        assert hasattr(agent, "_intercept_patterns")
+        assert isinstance(agent._intercept_patterns, list)
+        assert len(agent._intercept_patterns) == 0
+
+    def test_clear_network_intercepts_on_fresh_agent(self):
+        """clear_network_intercepts should work even without prior set_network_intercept."""
+        agent, page, _ = _make_agent()
+        result = agent.clear_network_intercepts()
+        assert result["cleared"] == 0
+        assert result["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# set_network_intercept intercept_action key (Bug fix regression)
+# ---------------------------------------------------------------------------
+
+class TestSetNetworkIntercept:
+    def test_set_intercept_appends_pattern(self):
+        agent, page, _ = _make_agent()
+        agent.set_network_intercept("**/*.png", action="abort")
+        assert "**/*.png" in agent._intercept_patterns
+
+    def test_set_intercept_invalid_action_raises(self):
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="action must be 'abort' or 'continue'"):
+            agent.set_network_intercept("**/*.png", action="block")
+
+    def test_clear_intercepts_resets_patterns(self):
+        agent, page, _ = _make_agent()
+        agent.set_network_intercept("**/*.png", action="abort")
+        result = agent.clear_network_intercepts()
+        assert result["cleared"] == 1
+        assert len(agent._intercept_patterns) == 0
+
+
+# ---------------------------------------------------------------------------
+# download_file URL scheme validation (Bug fix regression)
+# ---------------------------------------------------------------------------
+
+class TestDownloadFileURLValidation:
+    def test_download_http_allowed(self):
+        """http:// URLs should be accepted and page.goto called."""
+        agent, page, _ = _make_agent()
+        dl = MagicMock()
+        dl.suggested_filename = "file.zip"
+        page.expect_download.return_value.__enter__ = MagicMock(return_value=MagicMock(value=dl))
+        page.expect_download.return_value.__exit__ = MagicMock(return_value=False)
+        # Just asserting no ValueError is raised
+        try:
+            agent.download_file("http://example.com/file.zip", "/tmp/file.zip")
+        except Exception as exc:
+            # Any exception other than ValueError for scheme is acceptable
+            # (the mock may raise on save_as, etc.)
+            assert "Unsafe URL scheme" not in str(exc)
+
+    def test_download_https_allowed(self):
+        """https:// URLs should be accepted."""
+        agent, page, _ = _make_agent()
+        try:
+            agent.download_file("https://example.com/file.zip", "/tmp/file.zip")
+        except Exception as exc:
+            assert "Unsafe URL scheme" not in str(exc)
+
+    def test_download_javascript_blocked(self):
+        """javascript: URLs must be rejected before page.goto is called."""
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.download_file("javascript:alert(1)", "/tmp/evil.js")
+        page.goto.assert_not_called()
+
+    def test_download_file_blocked(self):
+        """file:// URLs must be rejected."""
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.download_file("file:///etc/passwd", "/tmp/passwd")
+        page.goto.assert_not_called()
+
+    def test_download_data_blocked(self):
+        """data: URIs must be rejected."""
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.download_file("data:text/html,<h1>xss</h1>", "/tmp/xss.html")
+        page.goto.assert_not_called()
+
+    def test_download_no_scheme_blocked(self):
+        """A plain hostname with no scheme must be rejected."""
+        agent, page, _ = _make_agent()
+        with pytest.raises(ValueError, match="Unsafe URL scheme"):
+            agent.download_file("example.com/file.zip", "/tmp/file.zip")
+        page.goto.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Video recording
+# ---------------------------------------------------------------------------
+
+class TestVideoRecording:
+    """BrowserAgent.start_video_recording / stop_video_recording."""
+
+    def _make_recording_agent(self):
+        """Agent with a fully mocked browser so _make_context() works."""
+        agent, page, context = _make_agent()
+
+        browser = MagicMock()
+        new_ctx = MagicMock()
+        new_page = MagicMock()
+        new_page.url = "about:blank"
+        new_page.video = MagicMock()
+        new_page.video.path.return_value = "/tmp/playwright-video-xyz.webm"
+        new_ctx.new_page.return_value = new_page
+        browser.new_context.return_value = new_ctx
+        agent._browser = browser
+
+        # pre-existing page URL so navigate-back can be tested
+        page.url = "about:blank"
+        return agent, page, context, browser, new_ctx, new_page
+
+    def test_start_sets_recording_flag(self, tmp_path):
+        agent, *_ = self._make_recording_agent()
+        save = str(tmp_path / "out.webm")
+        agent.start_video_recording(save)
+        assert agent._recording is True
+        assert agent._recording_path == save
+
+    def test_start_creates_context_with_record_video_dir(self, tmp_path):
+        agent, _, _, browser, *_ = self._make_recording_agent()
+        save = str(tmp_path / "video.webm")
+        agent.start_video_recording(save)
+        call_kwargs = browser.new_context.call_args[1]
+        assert "record_video_dir" in call_kwargs
+        assert call_kwargs["record_video_dir"] == str(tmp_path)
+
+    def test_start_raises_if_already_recording(self, tmp_path):
+        agent, *_ = self._make_recording_agent()
+        agent.start_video_recording(str(tmp_path / "a.webm"))
+        with pytest.raises(RuntimeError, match="already active"):
+            agent.start_video_recording(str(tmp_path / "b.webm"))
+
+    def test_stop_clears_recording_flag(self, tmp_path):
+        agent, *_, new_ctx, new_page = self._make_recording_agent()
+        save = str(tmp_path / "out.webm")
+        agent.start_video_recording(save)
+        # point _page at new_page so stop_video_recording can read .video.path()
+        agent._page = new_page
+        agent._pages = [new_page]
+        with patch("shutil.move"):
+            result = agent.stop_video_recording()
+        assert agent._recording is False
+        assert agent._recording_path is None
+        assert result["ok"] is True
+
+    def test_stop_raises_if_not_recording(self):
+        agent, *_ = _make_agent()
+        agent._browser = MagicMock()
+        with pytest.raises(RuntimeError, match="No video recording"):
+            agent.stop_video_recording()
+
+    def test_stop_renames_video_file(self, tmp_path):
+        agent, _, _, browser, new_ctx, new_page = self._make_recording_agent()
+        desired = str(tmp_path / "session.webm")
+        raw_path = "/tmp/playwright-video-xyz.webm"
+        new_page.video.path.return_value = raw_path
+
+        agent.start_video_recording(desired)
+        agent._page = new_page
+        agent._pages = [new_page]
+
+        with patch("shutil.move") as mv:
+            result = agent.stop_video_recording()
+        mv.assert_called_once_with(raw_path, desired)
+        assert result["saved_to"] == desired
+
+    def test_stop_warning_on_shutdown_while_recording(self):
+        agent, *_ = _make_agent()
+        agent._recording = True
+        agent._browser = MagicMock()
+        agent._playwright = MagicMock()
+        import logging
+        with patch.object(logging.getLogger("browser_agent"), "warning") as warn:
+            agent.stop()
+        warn.assert_called()
+
+
+# ---------------------------------------------------------------------------
+# GIF recording
+# ---------------------------------------------------------------------------
+
+class TestRecordGif:
+    """BrowserAgent.record_gif."""
+
+    def test_record_gif_saves_file(self, tmp_path):
+        agent, page, _ = _make_agent()
+        dest = tmp_path / "out.gif"
+
+        # Stub PIL.Image so we don't need a real PNG decoder.
+        fake_img = MagicMock()
+        fake_img.save = MagicMock()
+        with patch("PIL.Image.open", return_value=fake_img), \
+             patch("time.sleep"):
+            result = agent.record_gif(str(dest), duration=1.0, fps=2)
+
+        assert result["ok"] is True
+        assert result["frames"] == 2
+        assert result["fps"] == 2
+        fake_img.save.assert_called_once()
+
+    def test_record_gif_respects_fps_duration(self, tmp_path):
+        agent, page, _ = _make_agent()
+        fake_img = MagicMock()
+        with patch("PIL.Image.open", return_value=fake_img), \
+             patch("time.sleep"):
+            result = agent.record_gif(str(tmp_path / "g.gif"), duration=2.0, fps=3)
+        assert result["frames"] == 6  # ceil(2.0 * 3)
+
+    def test_record_gif_creates_parent_dirs(self, tmp_path):
+        agent, page, _ = _make_agent()
+        dest = tmp_path / "subdir" / "deep" / "out.gif"
+        fake_img = MagicMock()
+        with patch("PIL.Image.open", return_value=fake_img), \
+             patch("time.sleep"):
+            agent.record_gif(str(dest), duration=0.5, fps=1)
+        assert dest.parent.exists()
+
+    def test_record_gif_min_one_frame(self, tmp_path):
+        """duration * fps < 1 should still produce at least one frame."""
+        agent, page, _ = _make_agent()
+        fake_img = MagicMock()
+        with patch("PIL.Image.open", return_value=fake_img), \
+             patch("time.sleep"):
+            result = agent.record_gif(str(tmp_path / "g.gif"), duration=0.1, fps=1)
+        assert result["frames"] >= 1

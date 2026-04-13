@@ -637,3 +637,563 @@ class TestGetPlannerError:
             json={"steps": [{"action": "navigate", "url": "https://example.com"}]},
         )
         assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Upload/Download file — path traversal protection
+# ---------------------------------------------------------------------------
+
+class TestUploadDownloadPathTraversal:
+    def test_upload_file_traversal_rejected(self):
+        """Paths outside the workspace should be rejected with 422."""
+        agent = _make_agent()
+        tools = SystemTools()
+
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post(
+                "/upload_file",
+                json={"selector": "input[type=file]", "path": "../../../etc/passwd"},
+            )
+        assert r.status_code == 422
+
+    def test_download_file_traversal_rejected(self):
+        """Paths outside the workspace should be rejected with 422."""
+        agent = _make_agent()
+        tools = SystemTools()
+
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post(
+                "/download_file",
+                json={"url": "https://example.com/file.zip", "path": "../../etc/passwd"},
+            )
+        assert r.status_code == 422
+
+    def test_upload_file_valid_path_accepted(self):
+        """A normal workspace-relative path should succeed."""
+        agent = _make_agent()
+        agent.upload_file.return_value = {"selector": "input", "uploaded": "file.txt", "ok": True}
+        tools = SystemTools()
+
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post(
+                "/upload_file",
+                json={"selector": "input[type=file]", "path": "file.txt"},
+            )
+        assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# SetViewportRequest — dimension validation
+# ---------------------------------------------------------------------------
+
+class TestSetViewportValidation:
+    def test_negative_width_rejected(self):
+        agent = _make_agent()
+        with patch.object(api_server, "_agent", agent):
+            c = TestClient(app)
+            r = c.post("/session/viewport", json={"width": -1, "height": 600})
+        assert r.status_code == 422
+
+    def test_zero_width_rejected(self):
+        agent = _make_agent()
+        with patch.object(api_server, "_agent", agent):
+            c = TestClient(app)
+            r = c.post("/session/viewport", json={"width": 0, "height": 600})
+        assert r.status_code == 422
+
+    def test_negative_height_rejected(self):
+        agent = _make_agent()
+        with patch.object(api_server, "_agent", agent):
+            c = TestClient(app)
+            r = c.post("/session/viewport", json={"width": 1280, "height": -1})
+        assert r.status_code == 422
+
+    def test_valid_dimensions_accepted(self):
+        agent = _make_agent()
+        agent.set_viewport.return_value = {"width": 1280, "height": 720, "ok": True}
+        with patch.object(api_server, "_agent", agent):
+            c = TestClient(app)
+            r = c.post("/session/viewport", json={"width": 1280, "height": 720})
+        assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# /screenshot path traversal protection (Bug fix regression)
+# ---------------------------------------------------------------------------
+
+class TestScreenshotPathTraversal:
+    def test_screenshot_traversal_path_rejected(self):
+        """A path escaping the workspace must return 422."""
+        agent = _make_agent()
+        tools = SystemTools()  # default workspace = ./workspace
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post("/screenshot", json={"path": "../../../etc/evil.png"})
+        assert r.status_code == 422
+
+    def test_screenshot_absolute_path_outside_workspace_rejected(self):
+        """An absolute path outside the workspace must return 422."""
+        agent = _make_agent()
+        tools = SystemTools()
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post("/screenshot", json={"path": "/tmp/evil.png"})
+        assert r.status_code == 422
+
+    def test_screenshot_safe_path_accepted(self):
+        """A normal workspace-relative path must pass through to the agent."""
+        agent = _make_agent()
+        agent.screenshot.return_value = {"path": "shot.png", "base64": None}
+        tools = SystemTools()
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post("/screenshot", json={"path": "shot.png"})
+        assert r.status_code == 200
+        # The path passed to the agent must be absolute (resolved by safe_path)
+        _args, kwargs = agent.screenshot.call_args
+        called_path = kwargs.get("path")
+        assert called_path is not None
+        # Confirm it ends with the requested filename
+        assert str(called_path).endswith("shot.png")
+
+    def test_screenshot_no_path_no_validation(self):
+        """Omitting path entirely (base64 mode) should still succeed."""
+        agent = _make_agent()
+        agent.screenshot.return_value = {"path": None, "base64": "abc=="}
+        tools = SystemTools()
+        with patch.object(api_server, "_agent", agent), \
+             patch.object(api_server, "_tools", tools):
+            c = TestClient(app)
+            r = c.post("/screenshot", json={})
+        assert r.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# /recording/* — video and GIF endpoints
+# ---------------------------------------------------------------------------
+
+class TestRecordingEndpoints:
+    """Tests for /recording/start, /recording/stop, /recording/gif."""
+
+    def test_start_recording_valid_path(self, client_active, tmp_path):
+        client, agent, _, _ = client_active
+        agent.start_video_recording.return_value = {"recording": True, "save_path": str(tmp_path / "vid.webm")}
+        resp = client.post("/recording/start", json={"path": "vid.webm"})
+        assert resp.status_code == 200
+        agent.start_video_recording.assert_called_once()
+
+    def test_start_recording_path_traversal_rejected(self, client_active):
+        client, agent, _, _ = client_active
+        resp = client.post("/recording/start", json={"path": "../../../etc/evil.webm"})
+        assert resp.status_code == 422
+        agent.start_video_recording.assert_not_called()
+
+    def test_start_recording_already_active_returns_409(self, client_active):
+        client, agent, _, _ = client_active
+        agent.start_video_recording.side_effect = RuntimeError("already active")
+        resp = client.post("/recording/start", json={"path": "vid.webm"})
+        assert resp.status_code == 409
+
+    def test_stop_recording_ok(self, client_active):
+        client, agent, _, _ = client_active
+        agent.stop_video_recording.return_value = {"saved_to": "/ws/vid.webm", "ok": True}
+        resp = client.post("/recording/stop")
+        assert resp.status_code == 200
+        assert resp.json()["ok"] is True
+
+    def test_stop_recording_not_started_returns_409(self, client_active):
+        client, agent, _, _ = client_active
+        agent.stop_video_recording.side_effect = RuntimeError("No recording in progress")
+        resp = client.post("/recording/stop")
+        assert resp.status_code == 409
+
+    def test_gif_valid_path(self, client_active, tmp_path):
+        client, agent, _, _ = client_active
+        agent.record_gif.return_value = {
+            "saved_to": str(tmp_path / "out.gif"), "frames": 4, "fps": 2, "duration": 2.0, "ok": True
+        }
+        resp = client.post("/recording/gif", json={"path": "out.gif", "duration": 2.0, "fps": 2})
+        assert resp.status_code == 200
+        agent.record_gif.assert_called_once()
+
+    def test_gif_path_traversal_rejected(self, client_active):
+        client, agent, _, _ = client_active
+        resp = client.post("/recording/gif", json={"path": "../../etc/evil.gif"})
+        assert resp.status_code == 422
+        agent.record_gif.assert_not_called()
+
+    def test_gif_fps_bounds(self, client_active):
+        """fps outside [1,30] should be rejected by Pydantic."""
+        client, _, _, _ = client_active
+        resp = client.post("/recording/gif", json={"path": "g.gif", "fps": 0})
+        assert resp.status_code == 422
+        resp2 = client.post("/recording/gif", json={"path": "g.gif", "fps": 31})
+        assert resp2.status_code == 422
+
+    def test_gif_duration_minimum(self, client_active):
+        """duration < 0.1 should be rejected."""
+        client, _, _, _ = client_active
+        resp = client.post("/recording/gif", json={"path": "g.gif", "duration": 0.0})
+        assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# /tabs/execute_parallel
+# ---------------------------------------------------------------------------
+
+class TestTabsExecuteParallel:
+    """Tests for /tabs/execute_parallel."""
+
+    def _make_planner_with_results(self, ok: bool = True):
+        p = MagicMock()
+        if ok:
+            p.execute.return_value = [{"step": 0, "action": "navigate", "status": "ok", "result": {}}]
+        else:
+            p.execute.return_value = [{"step": 0, "action": "navigate", "status": "error", "error": "boom"}]
+        return p
+
+    def test_two_tab_tasks_ok(self, client_active):
+        client, agent, planner, _ = client_active
+        agent.new_tab.return_value = {"tab_index": 1, "url": "about:blank", "title": "New"}
+        planner.execute.return_value = [{"step": 0, "action": "navigate", "status": "ok", "result": {}}]
+        body = {
+            "tasks": [
+                {"steps": [{"action": "navigate", "url": "https://a.com"}]},
+                {"steps": [{"action": "navigate", "url": "https://b.com"}]},
+            ]
+        }
+        resp = client.post("/tabs/execute_parallel", json=body)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total_tabs"] == 2
+        assert data["all_succeeded"] is True
+
+    def test_single_task_rejected(self, client_active):
+        client, *_ = client_active
+        body = {"tasks": [{"steps": [{"action": "navigate", "url": "https://a.com"}]}]}
+        resp = client.post("/tabs/execute_parallel", json=body)
+        assert resp.status_code == 422
+
+    def test_too_many_tasks_rejected(self, client_active):
+        client, *_ = client_active
+        tasks = [{"steps": [{"action": "navigate", "url": "https://a.com"}]} for _ in range(21)]
+        resp = client.post("/tabs/execute_parallel", json={"tasks": tasks})
+        assert resp.status_code == 422
+
+    def test_invalid_step_schema_rejected(self, client_active):
+        client, *_ = client_active
+        body = {
+            "tasks": [
+                {"steps": [{"action": "not_a_real_action"}]},
+                {"steps": [{"action": "navigate", "url": "https://b.com"}]},
+            ]
+        }
+        resp = client.post("/tabs/execute_parallel", json=body)
+        assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# /agents/pool/* management
+# ---------------------------------------------------------------------------
+
+class TestAgentPool:
+    """Tests for pool CRUD endpoints."""
+
+    @pytest.fixture()
+    def clean_pool(self):
+        """Ensure the global pool is empty before and after each test."""
+        import api_server as _srv
+        with _srv._pool_lock:
+            _srv._agent_pool.clear()
+            _srv._planner_pool.clear()
+        yield
+        with _srv._pool_lock:
+            _srv._agent_pool.clear()
+            _srv._planner_pool.clear()
+
+    def test_start_agent_auto_id(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        with patch.object(_srv, "_tools", tools), \
+             patch("api_server.BrowserAgent") as MockAgent:
+            mock_inst = MagicMock()
+            MockAgent.return_value = mock_inst
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.post("/agents/pool/start", json={})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "agent_id" in data
+        assert data["status"] == "started"
+        mock_inst.start.assert_called_once()
+
+    def test_start_agent_custom_id(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        with patch.object(_srv, "_tools", tools), \
+             patch("api_server.BrowserAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.post("/agents/pool/start", json={"agent_id": "my-worker"})
+        assert resp.json()["agent_id"] == "my-worker"
+
+    def test_start_duplicate_id_returns_409(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        with patch.object(_srv, "_tools", tools), \
+             patch("api_server.BrowserAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            with TestClient(app, raise_server_exceptions=False) as c:
+                c.post("/agents/pool/start", json={"agent_id": "dup"})
+                resp = c.post("/agents/pool/start", json={"agent_id": "dup"})
+        assert resp.status_code == 409
+
+    def test_list_agents_empty(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        with patch.object(_srv, "_tools", tools), \
+             patch.object(_srv, "_agent", None):
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.get("/agents/pool")
+        assert resp.status_code == 200
+        assert resp.json()["count"] == 0
+
+    def test_list_agents_populated(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        mock_agent = MagicMock()
+        mock_agent._page = MagicMock()
+        mock_agent._page.url = "https://example.com"
+        mock_agent._pages = [mock_agent._page]
+        mock_agent._recording = False
+        with _srv._pool_lock:
+            _srv._agent_pool["worker-1"] = mock_agent
+        with patch.object(_srv, "_tools", tools):
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.get("/agents/pool")
+        data = resp.json()
+        assert data["count"] == 1
+        assert data["agents"][0]["agent_id"] == "worker-1"
+
+    def test_get_agent_status_found(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        mock_agent = MagicMock()
+        mock_agent._page = MagicMock()
+        mock_agent._page.url = "https://example.com"
+        mock_agent._pages = [mock_agent._page]
+        mock_agent._recording = False
+        mock_agent.list_tabs.return_value = {"tabs": [], "count": 0}
+        with _srv._pool_lock:
+            _srv._agent_pool["w1"] = mock_agent
+        with patch.object(_srv, "_tools", tools):
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.get("/agents/pool/w1")
+        assert resp.status_code == 200
+        assert resp.json()["active"] is True
+
+    def test_get_agent_status_not_found(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        with patch.object(_srv, "_tools", tools):
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.get("/agents/pool/does-not-exist")
+        assert resp.status_code == 404
+
+    def test_delete_agent_ok(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        mock_agent = MagicMock()
+        mock_agent._page = MagicMock()
+        mock_agent._pages = [mock_agent._page]
+        mock_agent._recording = False
+        with _srv._pool_lock:
+            _srv._agent_pool["del-me"] = mock_agent
+        with patch.object(_srv, "_tools", tools):
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.delete("/agents/pool/del-me")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "stopped"
+        mock_agent.stop.assert_called_once()
+        with _srv._pool_lock:
+            assert "del-me" not in _srv._agent_pool
+
+    def test_delete_agent_not_found(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        with patch.object(_srv, "_tools", tools):
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.delete("/agents/pool/ghost")
+        assert resp.status_code == 404
+
+    def test_execute_on_pooled_agent(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        mock_agent = MagicMock()
+        mock_agent._page = MagicMock()
+        mock_agent._pages = [mock_agent._page]
+        mock_planner = MagicMock()
+        mock_planner.execute.return_value = [
+            {"step": 0, "action": "navigate", "status": "ok", "result": {}}
+        ]
+        with _srv._pool_lock:
+            _srv._agent_pool["exec-agent"] = mock_agent
+            _srv._planner_pool["exec-agent"] = mock_planner
+        with patch.object(_srv, "_tools", tools):
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.post(
+                    "/agents/pool/exec-agent/task/execute",
+                    json={"steps": [{"action": "navigate", "url": "https://example.com"}]},
+                )
+        assert resp.status_code == 200
+        assert resp.json()["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# /agents/execute_parallel
+# ---------------------------------------------------------------------------
+
+class TestAgentsExecuteParallel:
+    """Tests for /agents/execute_parallel."""
+
+    @pytest.fixture()
+    def clean_pool(self):
+        import api_server as _srv
+        with _srv._pool_lock:
+            _srv._agent_pool.clear()
+            _srv._planner_pool.clear()
+        yield
+        with _srv._pool_lock:
+            _srv._agent_pool.clear()
+            _srv._planner_pool.clear()
+
+    def _mock_browser_agent(self):
+        inst = MagicMock()
+        inst._page = MagicMock()
+        inst._pages = [inst._page]
+        return inst
+
+    def test_broadcast_mode_spawns_n_agents(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        with patch.object(_srv, "_tools", tools), \
+             patch("api_server.BrowserAgent") as MockBA, \
+             patch("api_server.TaskPlanner") as MockTP:
+            mock_inst = self._mock_browser_agent()
+            MockBA.return_value = mock_inst
+            mock_planner = MagicMock()
+            mock_planner.execute.return_value = [
+                {"step": 0, "action": "navigate", "status": "ok", "result": {}}
+            ]
+            MockTP.return_value = mock_planner
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.post("/agents/execute_parallel", json={
+                    "agent_count": 2,
+                    "steps": [{"action": "navigate", "url": "https://example.com"}],
+                    "auto_stop": False,
+                })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total_agents"] == 2
+
+    def test_explicit_tasks_mode(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        with patch.object(_srv, "_tools", tools), \
+             patch("api_server.BrowserAgent") as MockBA, \
+             patch("api_server.TaskPlanner") as MockTP:
+            mock_inst = self._mock_browser_agent()
+            MockBA.return_value = mock_inst
+            mock_planner = MagicMock()
+            mock_planner.execute.return_value = [
+                {"step": 0, "action": "navigate", "status": "ok", "result": {}}
+            ]
+            MockTP.return_value = mock_planner
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.post("/agents/execute_parallel", json={
+                    "tasks": [
+                        {"steps": [{"action": "navigate", "url": "https://a.com"}]},
+                        {"steps": [{"action": "navigate", "url": "https://b.com"}]},
+                    ],
+                    "auto_stop": False,
+                })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total_agents"] == 2
+        assert data["all_succeeded"] is True
+
+    def test_no_tasks_and_no_agent_count_returns_422(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        with patch.object(_srv, "_tools", tools):
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.post("/agents/execute_parallel", json={})
+        assert resp.status_code == 422
+
+    def test_broadcast_without_steps_returns_422(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        with patch.object(_srv, "_tools", tools):
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.post("/agents/execute_parallel", json={"agent_count": 2})
+        assert resp.status_code == 422
+
+    def test_auto_stop_removes_spawned_agents(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        with patch.object(_srv, "_tools", tools), \
+             patch("api_server.BrowserAgent") as MockBA, \
+             patch("api_server.TaskPlanner") as MockTP:
+            mock_inst = self._mock_browser_agent()
+            MockBA.return_value = mock_inst
+            mock_planner = MagicMock()
+            mock_planner.execute.return_value = [
+                {"step": 0, "action": "navigate", "status": "ok", "result": {}}
+            ]
+            MockTP.return_value = mock_planner
+            with TestClient(app, raise_server_exceptions=False) as c:
+                c.post("/agents/execute_parallel", json={
+                    "agent_count": 1,
+                    "steps": [{"action": "navigate", "url": "https://example.com"}],
+                    "auto_stop": True,
+                })
+        with _srv._pool_lock:
+            assert len(_srv._agent_pool) == 0
+
+    def test_existing_pooled_agent_used(self, tmp_path, clean_pool):
+        import api_server as _srv
+        tools = SystemTools(workspace=tmp_path)
+        mock_inst = self._mock_browser_agent()
+        mock_planner = MagicMock()
+        mock_planner.execute.return_value = [
+            {"step": 0, "action": "navigate", "status": "ok", "result": {}}
+        ]
+        with _srv._pool_lock:
+            _srv._agent_pool["existing"] = mock_inst
+            _srv._planner_pool["existing"] = mock_planner
+        with patch.object(_srv, "_tools", tools), \
+             patch("api_server.TaskPlanner") as MockTP:
+            MockTP.return_value = mock_planner
+            with TestClient(app, raise_server_exceptions=False) as c:
+                resp = c.post("/agents/execute_parallel", json={
+                    "tasks": [
+                        {"agent_id": "existing",
+                         "steps": [{"action": "navigate", "url": "https://example.com"}]},
+                    ],
+                    "auto_stop": True,
+                })
+                assert resp.status_code == 200
+                # auto_stop must NOT touch the pre-existing pooled agent —
+                # verify this BEFORE the TestClient context exits (which triggers
+                # lifespan shutdown that would legitimately call stop()).
+                mock_inst.stop.assert_not_called()
+                with _srv._pool_lock:
+                    assert "existing" in _srv._agent_pool
