@@ -258,7 +258,7 @@ class TestLinksCommand:
         with patch("agenticbrowser.cli.Browser", return_value=browser):
             result = runner.invoke(main, ["links", "https://example.com"])
         assert result.exit_code == 0
-        assert "https://example.com/" in result.output
+        assert result.output.count("https://example.com/") >= 1
 
     def test_links_json_output(self):
         runner = CliRunner()
