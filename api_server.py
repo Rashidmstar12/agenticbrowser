@@ -1582,19 +1582,23 @@ def task_agentic_run(req: AgenticRunRequest) -> dict[str, Any]:
         log_path=req.log_path,
     )
 
-    # Build a safe response: cross-reference the *untainted* all_steps list for
-    # action names; pull only sanitized error strings from execution results.
-    all_steps    = summary.get("steps") or []
+    # Build a safe response: take action names from result records filtered
+    # through the known-safe STEP_SCHEMA key set (breaks CodeQL taint chain);
+    # pull only sanitized error strings from execution results.
+    _KNOWN_ACTIONS = frozenset(STEP_SCHEMA.keys())
     all_results  = summary.get("results") or []
     safe_results = []
     failed_count = 0
-    for step, r in zip(all_steps, all_results):
+    for r in all_results:
         is_error = r.get("status") == "error"
         if is_error:
             failed_count += 1
+        # Filter action name through known-safe schema keys to break taint chain.
+        _action_raw = r.get("action", "")
+        _action_safe = _action_raw if _action_raw in _KNOWN_ACTIONS else "unknown"
         safe_results.append({
             "step":   len(safe_results),
-            "action": step["action"],          # from validated (untainted) step
+            "action": _action_safe,
             "status": "error" if is_error else "ok",
             "error":  _sanitize_error(str(r.get("error", ""))) if is_error else None,
         })
