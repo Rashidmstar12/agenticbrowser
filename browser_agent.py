@@ -482,18 +482,16 @@ class BrowserAgent:
                 if candidate.startswith(_SEMANTIC_PREFIXES):
                     if self.page.locator(candidate).count() > 0:
                         logger.info(
-                            "Selector %r not found; resolved to dynamic fallback %r",
-                            selector,
-                            candidate,
+                            "Selector not found; resolved to dynamic fallback (type: %s)",
+                            candidate.split("=")[0] if "=" in candidate else "css",
                         )
                         return candidate
                 else:
                     el = self.page.query_selector(candidate)
                     if el is not None:
                         logger.info(
-                            "Selector %r not found; resolved to dynamic fallback %r",
-                            selector,
-                            candidate,
+                            "Selector not found; resolved to dynamic fallback (type: %s)",
+                            candidate.split("=")[0] if "=" in candidate else "css",
                         )
                         return candidate
             except Exception:
