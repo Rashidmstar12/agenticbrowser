@@ -505,6 +505,29 @@ class VisionRunRequest(BaseModel):
     )
 
 
+class AgenticRunRequest(BaseModel):
+    intent: str = Field(..., description="Natural-language task to execute in agentic observe-decide-act mode")
+    stop_on_error: bool = Field(True, description="Stop execution on the first failed step")
+    log_path: str | None = Field(None, description="Workspace-relative path to save the execution log")
+    max_steps: int = Field(
+        20,
+        ge=1,
+        le=50,
+        description=(
+            "Hard ceiling on total steps executed (including injected corrective steps). "
+            "Range 1–50; default 20."
+        ),
+    )
+    checkpoint_every: int = Field(
+        3,
+        ge=1,
+        le=10,
+        description=(
+            "Number of steps between LLM observe-decide calls. "
+            "Range 1–10; default 3."
+        ),
+    )
+
 # ---------------------------------------------------------------------------
 # Request models — video / GIF recording
 # ---------------------------------------------------------------------------
@@ -1518,6 +1541,88 @@ def task_vision_run(req: VisionRunRequest) -> dict[str, Any]:
         "failed_count": failed_count,
         "results":      safe_step_results,
     }
+    if failed_count > 0:
+        raise HTTPException(status_code=422, detail=safe_response)
+    return safe_response
+
+
+@app.post("/task/agentic_run", summary="Execute a browser task in agentic observe-decide-act mode")
+def task_agentic_run(req: AgenticRunRequest) -> dict[str, Any]:
+    """
+    Plan a task and execute it with an observe-decide-act loop.
+
+    Unlike ``/task/run``, which executes a static plan to completion, this
+    endpoint periodically observes the live page state (URL + body text) and
+    asks the configured LLM whether the goal has been achieved or whether
+    corrective steps are needed.  Corrective steps are validated and injected
+    into the execution queue automatically.
+
+    The ``stopped_reason`` field in the response indicates why the loop ended:
+
+    * ``"verified"``        — an assert step confirmed the expected outcome.
+    * ``"done_by_model"``   — the LLM (or natural step-queue exhaustion) reported
+                              the goal is met.
+    * ``"max_steps"``       — the step budget was exhausted.
+    * ``"abort"``           — the LLM detected an unrecoverable blocker
+                              (login wall, CAPTCHA, …).
+    * ``"error"``           — execution stopped due to a failed step.
+
+    When no LLM is configured, observe-decide checkpoints are silently skipped
+    and the endpoint behaves like ``/task/run`` with a ``max_steps`` ceiling.
+    """
+    planner = get_planner()
+    agent   = get_agent()
+
+    summary = planner.agentic_run(
+        req.intent,
+        agent,
+        max_steps=req.max_steps,
+        checkpoint_every=req.checkpoint_every,
+        stop_on_error=req.stop_on_error,
+        log_path=req.log_path,
+    )
+
+    # Build a safe response: cross-reference the *untainted* all_steps list for
+    # action names; pull only sanitized error strings from execution results.
+    all_steps    = summary.get("steps") or []
+    all_results  = summary.get("results") or []
+    safe_results = []
+    failed_count = 0
+    for step, r in zip(all_steps, all_results):
+        is_error = r.get("status") == "error"
+        if is_error:
+            failed_count += 1
+        safe_results.append({
+            "step":   len(safe_results),
+            "action": step["action"],          # from validated (untainted) step
+            "status": "error" if is_error else "ok",
+            "error":  _sanitize_error(str(r.get("error", ""))) if is_error else None,
+        })
+
+    # Extract known-safe scalar values from summary to break CodeQL taint chains.
+    # stopped_reason is always one of a fixed set of string literals.
+    _KNOWN_STOPPED_REASONS = frozenset({
+        "verified", "done_by_model", "max_steps", "abort", "error",
+    })
+    _raw_reason = summary.get("stopped_reason")
+    stopped_reason = _raw_reason if _raw_reason in _KNOWN_STOPPED_REASONS else "error"
+
+    _raw_verified = summary.get("verified")
+    verified = bool(_raw_verified) if _raw_verified is not None else None
+
+    _raw_injected = summary.get("recovery_steps_injected", 0)
+    recovery_steps_injected = int(_raw_injected) if isinstance(_raw_injected, int) else 0
+
+    safe_response: dict[str, Any] = {
+        "success":                  failed_count == 0,
+        "verified":                 verified,
+        "intent":                   req.intent,     # from request, not from summary
+        "stopped_reason":           stopped_reason,
+        "recovery_steps_injected":  recovery_steps_injected,
+        "failed_count":             failed_count,
+        "results":                  safe_results,
+    }
+
     if failed_count > 0:
         raise HTTPException(status_code=422, detail=safe_response)
     return safe_response

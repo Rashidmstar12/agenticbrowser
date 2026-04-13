@@ -797,6 +797,169 @@ def _call_ollama(intent: str) -> list[dict[str, Any]]:
     return validate_steps(steps)
 
 
+# ---------------------------------------------------------------------------
+# Observe-decide LLM helper (Phase 3 — agentic mode)
+# ---------------------------------------------------------------------------
+
+_OBSERVE_DECIDE_PROMPT = """You are a browser automation supervisor.
+
+Your job: given the original task intent, the current page state (URL + visible text),
+and recent step results, decide whether the task goal has been achieved or whether
+corrective browser steps are needed.
+
+RESPOND WITH EXACTLY ONE JSON OBJECT — no prose, no markdown, no explanation.
+
+Response options:
+
+1. Goal achieved:
+{"decision": "done"}
+
+2. Unrecoverable blocker (login wall, CAPTCHA, access denied, permanent redirect):
+{"decision": "abort", "reason": "brief one-line reason"}
+
+3. Correction needed (wrong page, unexpected redirect, goal not yet reached):
+{"decision": "continue", "steps": [... up to 3 corrective steps ...]}
+
+For option 3 steps must use only these actions:
+  navigate, click, type, fill, press, wait_selector, wait_state,
+  close_popups, assert_text, assert_url, scroll
+
+Rules:
+- Maximum 3 corrective steps.
+- Do NOT repeat steps that already completed successfully.
+- If in doubt whether the goal is met, return {"decision": "done"}.
+- Never invent page content; only act on what the URL and page text show.
+"""
+
+
+def _call_observe_decide(
+    intent: str,
+    url: str,
+    page_text: str,
+    recent_results: list[dict[str, Any]],
+    llm: str,
+) -> dict[str, Any]:
+    """Ask the configured LLM whether the task goal is met.
+
+    Parameters
+    ----------
+    intent:
+        The original task description.
+    url:
+        Current browser URL at the time of the checkpoint.
+    page_text:
+        First 2 000 characters of page body text.
+    recent_results:
+        Up to the last 5 executed step result records.
+    llm:
+        ``"openai"`` or ``"ollama"`` — which backend to call.
+
+    Returns
+    -------
+    dict
+        ``{"decision": "done" | "abort" | "continue",
+           "reason": str (abort only),
+           "steps": list[dict] (continue only, already validated)}``
+
+    The function is intentionally fail-safe: any parsing or network error
+    returns ``{"decision": "continue", "steps": []}`` so the outer loop
+    continues executing the original plan rather than crashing.
+    """
+    user_msg = (
+        f"Task: {intent}\n\n"
+        f"Current URL: {url}\n"
+        f"Page text (truncated to 2000 chars):\n{page_text[:2000]}\n\n"
+        f"Recent step results:\n{json.dumps(recent_results[-5:], default=str)}\n\n"
+        "Has the task goal been achieved? Respond with exactly one JSON object."
+    )
+
+    raw = ""
+    try:
+        if llm == "openai":
+            import openai  # type: ignore[import]
+            model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+            client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _OBSERVE_DECIDE_PROMPT},
+                    {"role": "user",   "content": user_msg},
+                ],
+                temperature=0.0,
+                max_tokens=512,
+                response_format={"type": "json_object"},
+            )
+            raw = resp.choices[0].message.content or ""
+
+        elif llm == "ollama":
+            import urllib.request as _ureq
+            host  = os.environ.get("OLLAMA_HOST",  "http://localhost:11434")
+            model = os.environ.get("OLLAMA_MODEL", "llama3")
+            payload = json.dumps({
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": _OBSERVE_DECIDE_PROMPT},
+                    {"role": "user",   "content": user_msg},
+                ],
+                "stream": False,
+                "options": {"temperature": 0.0},
+            }).encode()
+            req = _ureq.Request(
+                f"{host}/api/chat",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with _ureq.urlopen(req, timeout=30) as r:
+                body = json.loads(r.read())
+            raw = body.get("message", {}).get("content", "")
+
+        else:
+            logger.warning("observe-decide: unknown llm %r, skipping", llm)
+            return {"decision": "continue", "steps": []}
+
+    except Exception as exc:
+        logger.warning("observe-decide LLM call failed (%s); skipping checkpoint", exc)
+        return {"decision": "continue", "steps": []}
+
+    logger.debug("observe-decide raw: %s", raw)
+
+    # Parse JSON object from response
+    try:
+        raw_clean = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+        match = re.search(r"\{.*\}", raw_clean, re.DOTALL)
+        if not match:
+            logger.warning("observe-decide: no JSON object in response: %s", raw[:200])
+            return {"decision": "continue", "steps": []}
+        parsed = json.loads(match.group())
+    except Exception as exc:
+        logger.warning("observe-decide: JSON parse error (%s): %s", exc, raw[:200])
+        return {"decision": "continue", "steps": []}
+
+    decision = parsed.get("decision", "continue")
+    if decision not in ("done", "abort", "continue"):
+        logger.warning("observe-decide: unexpected decision %r, defaulting to continue", decision)
+        decision = "continue"
+
+    result: dict[str, Any] = {"decision": decision}
+
+    if decision == "abort":
+        result["reason"] = str(parsed.get("reason", ""))[:200]
+
+    elif decision == "continue":
+        raw_steps = parsed.get("steps") or []
+        validated_steps: list[dict[str, Any]] = []
+        if raw_steps and isinstance(raw_steps, list):
+            try:
+                # Cap at 3 corrective steps before validation to avoid the 20-step limit
+                validated_steps = validate_steps(raw_steps[:3])
+            except (StepValidationError, Exception) as exc:
+                logger.warning("observe-decide: corrective steps invalid (%s), skipping", exc)
+        result["steps"] = validated_steps
+
+    return result
+
+
 def _call_vision_openai(intent: str, screenshot_b64: str) -> list[dict[str, Any]]:
     """Call GPT-4V (OpenAI vision) with a screenshot + intent and return validated steps.
 
@@ -1426,6 +1589,258 @@ class TaskPlanner:
                 logger.info("Execution log saved to %s", log_path)
             except Exception as exc:
                 logger.warning("Could not save execution log to %r: %s", log_path, exc)
+
+        return summary
+
+    def agentic_run(
+        self,
+        intent: str,
+        agent: Any,
+        *,
+        max_steps: int = 20,
+        checkpoint_every: int = 3,
+        stop_on_error: bool = True,
+        log_path: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Observe-decide-act execution loop (Phase 3 agentic mode).
+
+        Unlike :meth:`run`, which executes a static plan to completion,
+        ``agentic_run`` periodically pauses after every *checkpoint_every*
+        steps, observes the live page state (current URL + body text), and
+        asks the LLM whether the goal has been achieved or whether corrective
+        steps are needed.  Corrective steps are validated and injected into
+        the front of the remaining step queue.
+
+        Parameters
+        ----------
+        intent:
+            Natural-language task description.
+        agent:
+            A ``BrowserAgent`` instance to execute steps against.
+        max_steps:
+            Hard ceiling on the total number of steps executed (including
+            any injected corrective steps).  Hitting this limit stops the
+            loop with ``stopped_reason="max_steps"``.  Default 20.
+        checkpoint_every:
+            How many steps to execute between LLM observe-decide calls.
+            Must be ≥ 1.  A checkpoint also fires when the step queue
+            empties after the last step.  Default 3.
+        stop_on_error:
+            If ``True`` (default), the loop stops on the first failed step.
+            If ``False``, errors are recorded and execution continues.
+        log_path:
+            Optional workspace-relative path for saving the full execution
+            log (steps + results + timestamp) as JSON.
+
+        Returns
+        -------
+        dict
+            ``success``
+                ``True`` when no step raised an exception.
+            ``verified``
+                ``True`` / ``False`` / ``None`` (Phase 2 semantics, unchanged).
+            ``stopped_reason``
+                ``"verified"`` — an assert step confirmed the goal.
+                ``"done_by_model"`` — the LLM reported the goal is met,
+                or the step queue completed without any error.
+                ``"max_steps"`` — the step budget was exhausted.
+                ``"abort"`` — the LLM detected an unrecoverable blocker.
+                ``"error"`` — execution stopped due to a step failure.
+            ``recovery_steps_injected``
+                Number of corrective steps injected by the observe-decide loop.
+            ``steps``
+                Full step list (initial plan + injected corrective steps).
+            ``results``
+                Per-step execution records.
+            ``failed_count``
+                Number of error steps.
+
+        Notes
+        -----
+        When no LLM is configured (``self.llm is None``), observe-decide
+        checkpoints are silently skipped.  The method then behaves like
+        :meth:`execute` with a ``max_steps`` ceiling — still strictly more
+        reliable than the unbounded :meth:`execute` call.
+
+        Corrective steps returned by the LLM are always passed through
+        :func:`validate_steps` before use.  If validation fails the
+        corrective steps are silently dropped and execution continues with
+        the original plan (fail-safe behaviour).
+        """
+        import json as _json
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        checkpoint_every = max(1, checkpoint_every)
+
+        # 1. Build initial plan -----------------------------------------------
+        try:
+            initial_steps = self.plan(intent)
+        except (ValueError, StepValidationError) as exc:
+            return {
+                "success":                  False,
+                "verified":                 None,
+                "intent":                   intent,
+                "stopped_reason":           "error",
+                "recovery_steps_injected":  0,
+                "steps":                    [],
+                "results":                  [],
+                "failed_count":             0,
+                "error":                    str(exc),
+            }
+
+        queue:      list[dict[str, Any]] = list(initial_steps)
+        all_steps:  list[dict[str, Any]] = list(initial_steps)  # grows when steps are injected
+        executed:   list[dict[str, Any]] = []
+        injected_count = 0
+        total_executed = 0
+        verified: bool | None = None
+        stopped_reason: str | None = None
+
+        # 2. Observe-decide-act loop -------------------------------------------
+        while queue:
+            if total_executed >= max_steps:
+                stopped_reason = "max_steps"
+                break
+
+            step = queue.pop(0)
+            action = step["action"]
+            logger.info(
+                "Agentic step %d (max %d): %s", total_executed + 1, max_steps, action
+            )
+
+            # Execute step
+            try:
+                result = self._execute_step(agent, step)
+            except Exception as exc:
+                err_record: dict[str, Any] = {
+                    "step":   total_executed,
+                    "action": action,
+                    "status": "error",
+                    "error":  str(exc),
+                }
+                executed.append(err_record)
+                total_executed += 1
+                if stop_on_error:
+                    stopped_reason = "error"
+                    break
+                continue
+
+            ok_record: dict[str, Any] = {
+                "step":   total_executed,
+                "action": action,
+                "status": "ok",
+                "result": result,
+            }
+            executed.append(ok_record)
+            total_executed += 1
+
+            # Assertion-driven verification → exit immediately on pass
+            if action in ("assert_text", "assert_url"):
+                r = result if isinstance(result, dict) else {}
+                if r.get("found") or r.get("matched"):
+                    verified = True
+                    stopped_reason = "verified"
+                    break
+
+            # Checkpoint: call the LLM after every N steps or when queue empties
+            at_checkpoint = (total_executed % checkpoint_every == 0)
+            queue_empty   = (len(queue) == 0)
+
+            if (at_checkpoint or queue_empty) and self.llm:
+                try:
+                    obs_url   = agent.get_url()
+                    obs_text  = agent.get_text("body")
+                except Exception:
+                    obs_url  = ""
+                    obs_text = ""
+
+                logger.info(
+                    "Agentic checkpoint at step %d: observing page (%s)",
+                    total_executed, obs_url[:80],
+                )
+
+                decision = _call_observe_decide(
+                    intent,
+                    obs_url,
+                    obs_text,
+                    executed[-checkpoint_every:],
+                    self.llm,
+                )
+                dec = decision.get("decision", "continue")
+
+                if dec == "done":
+                    stopped_reason = "done_by_model"
+                    break
+
+                if dec == "abort":
+                    stopped_reason = "abort"
+                    logger.warning(
+                        "Agentic abort: %s", decision.get("reason", "no reason given")
+                    )
+                    break
+
+                # dec == "continue"
+                corrective = decision.get("steps") or []
+                if corrective:
+                    # Validate corrective steps as a safety net even though
+                    # _call_observe_decide already validates them, in case the
+                    # caller has injected raw steps via testing or direct use.
+                    try:
+                        validated_corrective = validate_steps(corrective)
+                    except (StepValidationError, Exception) as exc:
+                        logger.warning(
+                            "Corrective steps failed validation (%s), skipping injection", exc
+                        )
+                        validated_corrective = []
+                    if validated_corrective:
+                        queue[0:0] = validated_corrective
+                        all_steps.extend(validated_corrective)
+                        injected_count += len(validated_corrective)
+                        logger.info(
+                            "Injected %d corrective step(s); queue length now %d",
+                            len(validated_corrective), len(queue),
+                        )
+
+        # 3. Determine final stopped_reason if loop exited without a break ----
+        if stopped_reason is None:
+            stopped_reason = "done_by_model"
+
+        # 4. Compute verified (Phase 2 semantics) if not already set ---------
+        if verified is None:
+            assertion_results = [
+                r for r in executed
+                if r.get("action") in ("assert_text", "assert_url")
+                and r.get("status") == "ok"
+            ]
+            if assertion_results:
+                last_ar = assertion_results[-1].get("result") or {}
+                verified = bool(
+                    last_ar.get("found") or last_ar.get("matched")
+                )
+
+        failed = [r for r in executed if r.get("status") == "error"]
+
+        summary: dict[str, Any] = {
+            "success":                  len(failed) == 0,
+            "verified":                 verified,
+            "intent":                   intent,
+            "stopped_reason":           stopped_reason,
+            "recovery_steps_injected":  injected_count,
+            "steps":                    all_steps,
+            "results":                  executed,
+            "failed_count":             len(failed),
+        }
+
+        if log_path:
+            st = self._get_system_tools()
+            log_entry = {**summary, "timestamp": _dt.now(_tz.utc).isoformat()}
+            try:
+                st.write_file(log_path, _json.dumps(log_entry, indent=2, default=str))
+                logger.info("Agentic execution log saved to %s", log_path)
+            except Exception as exc:
+                logger.warning("Could not save agentic log to %r: %s", log_path, exc)
 
         return summary
 
