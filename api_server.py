@@ -15,12 +15,13 @@ import contextvars
 import json as _json
 import logging
 import os
+import queue as _queue
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from pathlib import Path as _Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -63,6 +64,75 @@ def _safe_response(data: Any) -> Any:
     findings in HTTP responses.
     """
     return _json.loads(_json.dumps(data, default=str))
+
+
+# ---------------------------------------------------------------------------
+# Browser worker thread — thread-affinity fix for Playwright sync API
+# ---------------------------------------------------------------------------
+
+class _BrowserThread:
+    """Single dedicated thread that owns all Playwright sync objects.
+
+    Playwright's ``sync_api`` objects (``Page``, ``BrowserContext``, etc.) are
+    *thread-affine*: they must be created **and** used on the same OS thread.
+    FastAPI's sync route handlers can run on any thread in uvicorn's thread
+    pool, so if the browser session is started in one request and later used in
+    another the Playwright internals raise "Cannot switch to a different thread".
+
+    This class solves the problem by funnelling every Playwright call through a
+    single long-lived daemon thread.  All browser-touching routes submit a
+    callable to this thread via :meth:`submit`, block until it completes, and
+    return the result (or re-raise any exception) on the calling thread.
+
+    Pooled agents (``/agents/pool/*``) manage their own independent browser
+    processes and are not routed through this thread.
+    """
+
+    def __init__(self) -> None:
+        self._q: _queue.SimpleQueue = _queue.SimpleQueue()
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="browser-worker"
+        )
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while True:
+            item = self._q.get()
+            if item is None:  # poison pill — shut down
+                break
+            fut, fn, args, kwargs = item
+            try:
+                result = fn(*args, **kwargs)
+                fut.set_result(result)
+            except BaseException as exc:  # noqa: BLE001
+                try:
+                    fut.set_exception(exc)
+                except Exception:
+                    pass
+
+    def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Run *fn* on the browser thread and return its result.
+
+        Blocks the calling thread until the work completes (or raises).
+        """
+        fut: Future[Any] = Future()
+        self._q.put((fut, fn, args, kwargs))
+        return fut.result()
+
+    def stop(self) -> None:
+        """Send a poison pill and wait for the worker thread to exit."""
+        self._q.put(None)
+        self._thread.join(timeout=10)
+
+
+# Module-level singleton — one browser worker thread per process.
+_browser_thread = _BrowserThread()
+
+
+def _on_browser_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Convenience wrapper: execute *fn* on the dedicated browser worker thread."""
+    return _browser_thread.submit(fn, *args, **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # Global singletons (one per server process)
@@ -137,9 +207,24 @@ def get_pooled_agent(agent_id: str) -> BrowserAgent:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Agentic Browser API server starting up")
     yield
-    if _agent is not None:
-        _agent.stop()
-    # Stop all pooled agents on shutdown.
+    # Stop the shared agent on its owner thread so Playwright teardown is
+    # thread-safe (same thread that called start()).
+    def _stop_shared() -> None:
+        if _agent is not None:
+            try:
+                _agent.stop()
+            except Exception:
+                pass
+    try:
+        _browser_thread.submit(_stop_shared)
+    except Exception:
+        pass
+    # Note: _browser_thread is a daemon thread; it is cleaned up automatically
+    # when the process exits.  We must NOT stop() it here because the singleton
+    # persists for the lifetime of the module (across multiple TestClient
+    # invocations in tests), and stopping it would leave subsequent requests
+    # blocked waiting on a dead thread.
+    # Stop all pooled agents (each has its own lifecycle thread).
     with _pool_lock:
         for _pooled in list(_agent_pool.values()):
             try:
@@ -598,38 +683,46 @@ class ExecuteParallelRequest(BaseModel):
 
 @app.post("/session/start", summary="Start a browser session")
 def session_start(req: SessionStartRequest) -> dict[str, Any]:
-    global _agent, _planner, _tools
-    if _agent is not None and _agent._page is not None:
-        return {"status": "already_running", "headless": _agent.headless}
-    _tools = SystemTools(workspace=_workspace())
-    _agent = BrowserAgent(
-        headless=req.headless,
-        slow_mo=req.slow_mo,
-        auto_close_popups=req.auto_close_popups,
-        default_timeout=req.default_timeout,
-    )
-    _agent.start()
-    _planner = TaskPlanner()
-    _planner._system_tools = _tools  # share workspace
-    return {"status": "started", "headless": req.headless, "workspace": str(_tools.workspace)}
+    # Create and start the agent entirely on the browser thread so all
+    # Playwright sync objects are owned by that thread from the start.
+    def _do() -> dict[str, Any]:
+        global _agent, _planner, _tools
+        if _agent is not None and _agent._page is not None:
+            return {"status": "already_running", "headless": _agent.headless}
+        _tools = SystemTools(workspace=_workspace())
+        _agent = BrowserAgent(
+            headless=req.headless,
+            slow_mo=req.slow_mo,
+            auto_close_popups=req.auto_close_popups,
+            default_timeout=req.default_timeout,
+        )
+        _agent.start()
+        _planner = TaskPlanner()
+        _planner._system_tools = _tools  # share workspace
+        return {"status": "started", "headless": req.headless, "workspace": str(_tools.workspace)}
+    return _browser_thread.submit(_do)
 
 
 @app.post("/session/stop", summary="Stop the browser session")
 def session_stop() -> dict[str, Any]:
-    global _agent, _planner
-    if _agent is None:
-        return {"status": "not_running"}
-    _agent.stop()
-    _agent = None
-    _planner = None
-    return {"status": "stopped"}
+    def _do() -> dict[str, Any]:
+        global _agent, _planner
+        if _agent is None:
+            return {"status": "not_running"}
+        _agent.stop()
+        _agent = None
+        _planner = None
+        return {"status": "stopped"}
+    return _browser_thread.submit(_do)
 
 
 @app.get("/session/status", summary="Get session and page info")
 def session_status() -> dict[str, Any]:
-    if _agent is None or _agent._page is None:
-        return {"active": False}
-    return {"active": True, **_agent.get_page_info()}
+    def _check() -> dict[str, Any]:
+        if _agent is None or _agent._page is None:
+            return {"active": False}
+        return {"active": True, **_agent.get_page_info()}
+    return _browser_thread.submit(_check)
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +731,7 @@ def session_status() -> dict[str, Any]:
 
 @app.post("/navigate", summary="Navigate to a URL")
 def navigate(req: NavigateRequest) -> dict[str, Any]:
-    return get_agent().navigate(req.url, wait_until=req.wait_until)
+    return _on_browser_thread(get_agent().navigate, req.url, wait_until=req.wait_until)
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +740,7 @@ def navigate(req: NavigateRequest) -> dict[str, Any]:
 
 @app.post("/popups/close", summary="Close common popup/overlay elements")
 def close_popups() -> dict[str, Any]:
-    return get_agent().close_popups()
+    return _on_browser_thread(get_agent().close_popups)
 
 
 # ---------------------------------------------------------------------------
@@ -656,32 +749,32 @@ def close_popups() -> dict[str, Any]:
 
 @app.post("/click", summary="Click an element")
 def click(req: ClickRequest) -> dict[str, Any]:
-    return get_agent().click(req.selector, timeout=req.timeout)
+    return _on_browser_thread(get_agent().click, req.selector, timeout=req.timeout)
 
 
 @app.post("/type", summary="Type text into an element")
 def type_text(req: TypeRequest) -> dict[str, Any]:
-    return get_agent().type_text(req.selector, req.text, clear_first=req.clear_first)
+    return _on_browser_thread(get_agent().type_text, req.selector, req.text, clear_first=req.clear_first)
 
 
 @app.post("/fill", summary="Fill an input element with a value")
 def fill(req: FillRequest) -> dict[str, Any]:
-    return get_agent().fill(req.selector, req.value)
+    return _on_browser_thread(get_agent().fill, req.selector, req.value)
 
 
 @app.post("/press_key", summary="Press a keyboard key")
 def press_key(req: PressKeyRequest) -> dict[str, Any]:
-    return get_agent().press_key(req.key)
+    return _on_browser_thread(get_agent().press_key, req.key)
 
 
 @app.post("/hover", summary="Hover over an element")
 def hover(req: HoverRequest) -> dict[str, Any]:
-    return get_agent().hover(req.selector)
+    return _on_browser_thread(get_agent().hover, req.selector)
 
 
 @app.post("/select_option", summary="Select an option in a <select> element")
 def select_option(req: SelectOptionRequest) -> dict[str, Any]:
-    return get_agent().select_option(req.selector, req.value)
+    return _on_browser_thread(get_agent().select_option, req.selector, req.value)
 
 
 # ---------------------------------------------------------------------------
@@ -690,12 +783,12 @@ def select_option(req: SelectOptionRequest) -> dict[str, Any]:
 
 @app.post("/scroll", summary="Scroll the page")
 def scroll(req: ScrollRequest) -> dict[str, Any]:
-    return get_agent().scroll(req.x, req.y)
+    return _on_browser_thread(get_agent().scroll, req.x, req.y)
 
 
 @app.post("/scroll_to_element", summary="Scroll an element into view")
 def scroll_to_element(req: ScrollToElementRequest) -> dict[str, Any]:
-    return get_agent().scroll_to_element(req.selector)
+    return _on_browser_thread(get_agent().scroll_to_element, req.selector)
 
 
 # ---------------------------------------------------------------------------
@@ -704,27 +797,27 @@ def scroll_to_element(req: ScrollToElementRequest) -> dict[str, Any]:
 
 @app.get("/page/info", summary="Get current page URL and title")
 def page_info() -> dict[str, Any]:
-    return get_agent().get_page_info()
+    return _on_browser_thread(get_agent().get_page_info)
 
 
 @app.post("/page/text", summary="Get inner text of an element")
 def get_text(req: GetTextRequest) -> dict[str, Any]:
-    return {"text": get_agent().get_text(req.selector)}
+    return {"text": _on_browser_thread(get_agent().get_text, req.selector)}
 
 
 @app.post("/page/html", summary="Get inner HTML of an element")
 def get_html(req: GetHtmlRequest) -> dict[str, Any]:
-    return {"html": get_agent().get_html(req.selector)}
+    return {"html": _on_browser_thread(get_agent().get_html, req.selector)}
 
 
 @app.post("/page/attribute", summary="Get an attribute value of an element")
 def get_attribute(req: GetAttributeRequest) -> dict[str, Any]:
-    return {"value": get_agent().get_attribute(req.selector, req.attribute)}
+    return {"value": _on_browser_thread(get_agent().get_attribute, req.selector, req.attribute)}
 
 
 @app.post("/page/query_all", summary="Query all elements matching a selector")
 def query_all(req: QueryAllRequest) -> dict[str, Any]:
-    return {"elements": get_agent().query_all(req.selector)}
+    return {"elements": _on_browser_thread(get_agent().query_all, req.selector)}
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +826,7 @@ def query_all(req: QueryAllRequest) -> dict[str, Any]:
 
 @app.post("/evaluate", summary="Evaluate JavaScript in the page context")
 def evaluate(req: EvaluateRequest) -> dict[str, Any]:
-    result = get_agent().evaluate(req.script)
+    result = _on_browser_thread(get_agent().evaluate, req.script)
     return {"result": result}
 
 
@@ -750,7 +843,10 @@ def screenshot(req: ScreenshotRequest) -> dict[str, Any]:
             safe_screenshot_path = str(safe_path(tools.workspace, req.path))
         except PathTraversalError as exc:
             raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
-    return get_agent().screenshot(path=safe_screenshot_path, full_page=req.full_page, as_base64=req.as_base64)
+    return _on_browser_thread(
+        get_agent().screenshot,
+        path=safe_screenshot_path, full_page=req.full_page, as_base64=req.as_base64,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -766,7 +862,7 @@ def recording_start(req: StartRecordingRequest) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
     agent = get_agent()
     try:
-        return agent.start_video_recording(save_path)
+        return _on_browser_thread(agent.start_video_recording, save_path)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=_sanitize_error(str(exc)))
 
@@ -774,7 +870,7 @@ def recording_start(req: StartRecordingRequest) -> dict[str, Any]:
 @app.post("/recording/stop", summary="Stop video recording and save the WebM file")
 def recording_stop() -> dict[str, Any]:
     try:
-        return get_agent().stop_video_recording()
+        return _on_browser_thread(get_agent().stop_video_recording)
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=_sanitize_error(str(exc)))
 
@@ -786,7 +882,7 @@ def recording_gif(req: RecordGifRequest) -> dict[str, Any]:
         save_path = str(safe_path(tools.workspace, req.path))
     except PathTraversalError as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
-    return get_agent().record_gif(save_path, duration=req.duration, fps=req.fps)
+    return _on_browser_thread(get_agent().record_gif, save_path, duration=req.duration, fps=req.fps)
 
 
 # ---------------------------------------------------------------------------
@@ -795,12 +891,12 @@ def recording_gif(req: RecordGifRequest) -> dict[str, Any]:
 
 @app.post("/wait/selector", summary="Wait for an element to appear")
 def wait_for_selector(req: WaitForSelectorRequest) -> dict[str, Any]:
-    return get_agent().wait_for_selector(req.selector, timeout=req.timeout)
+    return _on_browser_thread(get_agent().wait_for_selector, req.selector, timeout=req.timeout)
 
 
 @app.post("/wait/load_state", summary="Wait for a specific load state")
 def wait_for_load_state(req: WaitForLoadStateRequest) -> dict[str, Any]:
-    return get_agent().wait_for_load_state(req.state)
+    return _on_browser_thread(get_agent().wait_for_load_state, req.state)
 
 
 # ---------------------------------------------------------------------------
@@ -809,12 +905,12 @@ def wait_for_load_state(req: WaitForLoadStateRequest) -> dict[str, Any]:
 
 @app.post("/page/extract_links", summary="Extract all hyperlinks from the page")
 def extract_links(req: ExtractLinksRequest) -> dict[str, Any]:
-    return get_agent().extract_links(selector=req.selector, limit=req.limit)
+    return _on_browser_thread(get_agent().extract_links, selector=req.selector, limit=req.limit)
 
 
 @app.post("/page/extract_table", summary="Extract an HTML table as JSON rows")
 def extract_table(req: ExtractTableRequest) -> dict[str, Any]:
-    return get_agent().extract_table(selector=req.selector, table_index=req.table_index)
+    return _on_browser_thread(get_agent().extract_table, selector=req.selector, table_index=req.table_index)
 
 
 # ---------------------------------------------------------------------------
@@ -824,7 +920,9 @@ def extract_table(req: ExtractTableRequest) -> dict[str, Any]:
 @app.post("/assert/text", summary="Assert text is present on the page (fails with 422 if not)")
 def assert_text(req: AssertTextRequest) -> dict[str, Any]:
     try:
-        return get_agent().assert_text(req.text, selector=req.selector, case_sensitive=req.case_sensitive)
+        return _on_browser_thread(
+            get_agent().assert_text, req.text, selector=req.selector, case_sensitive=req.case_sensitive
+        )
     except AssertionError as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
 
@@ -832,7 +930,7 @@ def assert_text(req: AssertTextRequest) -> dict[str, Any]:
 @app.post("/assert/url", summary="Assert the current URL matches a regex pattern")
 def assert_url(req: AssertUrlRequest) -> dict[str, Any]:
     try:
-        return get_agent().assert_url(req.pattern)
+        return _on_browser_thread(get_agent().assert_url, req.pattern)
     except AssertionError as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
 
@@ -843,7 +941,7 @@ def assert_url(req: AssertUrlRequest) -> dict[str, Any]:
 
 @app.post("/wait/text", summary="Wait until text appears on the page")
 def wait_text(req: WaitTextRequest) -> dict[str, Any]:
-    return get_agent().wait_text(req.text, selector=req.selector, timeout=req.timeout)
+    return _on_browser_thread(get_agent().wait_text, req.text, selector=req.selector, timeout=req.timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -853,7 +951,7 @@ def wait_text(req: WaitTextRequest) -> dict[str, Any]:
 @app.post("/cookies/save", summary="Save browser cookies to a workspace file")
 def save_cookies(req: SaveCookiesRequest) -> dict[str, Any]:
     import json as _json
-    cookies = get_agent().get_cookies()
+    cookies = _on_browser_thread(get_agent().get_cookies)
     get_tools().write_file(req.path, _json.dumps(cookies, indent=2))
     return {"cookies_saved": len(cookies), "path": req.path}
 
@@ -863,7 +961,7 @@ def load_cookies(req: LoadCookiesRequest) -> dict[str, Any]:
     import json as _json
     result = get_tools().read_file(req.path)
     cookies = _json.loads(result["content"])
-    get_agent().add_cookies(cookies)
+    _on_browser_thread(get_agent().add_cookies, cookies)
     return {"cookies_loaded": len(cookies), "path": req.path}
 
 
@@ -873,22 +971,22 @@ def load_cookies(req: LoadCookiesRequest) -> dict[str, Any]:
 
 @app.post("/tabs/new", summary="Open a new browser tab")
 def new_tab(req: NewTabRequest) -> dict[str, Any]:
-    return get_agent().new_tab(url=req.url)
+    return _on_browser_thread(get_agent().new_tab, url=req.url)
 
 
 @app.post("/tabs/switch", summary="Switch to a tab by index")
 def switch_tab(req: SwitchTabRequest) -> dict[str, Any]:
-    return get_agent().switch_tab(req.index)
+    return _on_browser_thread(get_agent().switch_tab, req.index)
 
 
 @app.post("/tabs/close", summary="Close a browser tab")
 def close_tab(req: CloseTabRequest) -> dict[str, Any]:
-    return get_agent().close_tab(index=req.index)
+    return _on_browser_thread(get_agent().close_tab, index=req.index)
 
 
 @app.get("/tabs/list", summary="List all open browser tabs")
 def list_tabs() -> dict[str, Any]:
-    return get_agent().list_tabs()
+    return _on_browser_thread(get_agent().list_tabs)
 
 
 @app.post("/tabs/execute_parallel", summary="Open N tabs in the current session and run a step sequence on each (sequential per-tab)")
@@ -908,7 +1006,7 @@ def tabs_execute_parallel(req: TabParallelExecuteRequest) -> dict[str, Any]:
     agent = get_agent()
     planner_inst = get_planner()
 
-    # Validate all step lists up-front so we fail early.
+    # Validate all step lists up-front so we fail early (no browser needed).
     validated: list[tuple[list[dict], str | None]] = []
     for task in req.tasks:
         try:
@@ -917,65 +1015,67 @@ def tabs_execute_parallel(req: TabParallelExecuteRequest) -> dict[str, Any]:
             raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
         validated.append((vsteps, task.url))
 
-    # Open a new tab for every task beyond the first (reuse tab 0 for task 0).
-    tab_indices: list[int] = [0]
-    for _ in range(1, len(validated)):
-        result = agent.new_tab()
-        tab_indices.append(result["tab_index"])
+    # Run all browser work on the dedicated browser thread.
+    def _do_tabs() -> dict[str, Any]:
+        # Open a new tab for every task beyond the first (reuse tab 0 for task 0).
+        tab_indices: list[int] = [0]
+        for _ in range(1, len(validated)):
+            result = agent.new_tab()
+            tab_indices.append(result["tab_index"])
 
-    all_results: list[dict[str, Any]] = []
-    for i, (vsteps, url) in enumerate(validated):
-        agent.switch_tab(tab_indices[i])
-        if url:
-            try:
-                agent.navigate(url)
-            except Exception:
-                # Do not echo the exception message (may contain the caller-supplied
-                # URL); use a static string to avoid stack-trace-exposure.
-                all_results.append(_safe_response({
-                    "tab_index": tab_indices[i],
-                    "success": False,
-                    "failed_count": 1,
-                    "step_results": [{"step": 0, "action": "navigate",
-                                      "status": "error",
-                                      "error": "Navigation failed before steps could execute."}],
-                }))
-                if req.stop_on_error:
-                    break
-                continue
-        task_results = planner_inst.execute(vsteps, agent, stop_on_error=req.stop_on_error)
-        failed_count_tab = sum(1 for r in task_results if r.get("status") == "error")
-        # Build safe_results using the untainted validated step list for step index
-        # and action name — only the error string comes from execution results.
-        safe_results = []
-        for j, (vstep, r) in enumerate(zip(vsteps, task_results)):
-            is_err = r.get("status") == "error"
-            if is_err:
-                failed_count_tab += 0   # already counted above
-            safe_results.append({
-                "step":   j,                                      # untainted counter
-                "action": vstep["action"],                        # from untainted validated list
-                "status": "error" if is_err else "ok",            # literal string
-                "error":  _sanitize_error(str(r.get("error", ""))) if is_err else None,
+        all_results: list[dict[str, Any]] = []
+        for i, (vsteps, url) in enumerate(validated):
+            agent.switch_tab(tab_indices[i])
+            if url:
+                try:
+                    agent.navigate(url)
+                except Exception:
+                    # Do not echo the exception message (may contain the caller-supplied
+                    # URL); use a static string to avoid stack-trace-exposure.
+                    all_results.append(_safe_response({
+                        "tab_index": tab_indices[i],
+                        "success": False,
+                        "failed_count": 1,
+                        "step_results": [{"step": 0, "action": "navigate",
+                                          "status": "error",
+                                          "error": "Navigation failed before steps could execute."}],
+                    }))
+                    if req.stop_on_error:
+                        break
+                    continue
+            task_results = planner_inst.execute(vsteps, agent, stop_on_error=req.stop_on_error)
+            failed_count_tab = sum(1 for r in task_results if r.get("status") == "error")
+            # Build safe_results using the untainted validated step list for step index
+            # and action name — only the error string comes from execution results.
+            safe_results = []
+            for j, (vstep, r) in enumerate(zip(vsteps, task_results)):
+                is_err = r.get("status") == "error"
+                safe_results.append({
+                    "step":   j,                                      # untainted counter
+                    "action": vstep["action"],                        # from untainted validated list
+                    "status": "error" if is_err else "ok",            # literal string
+                    "error":  _sanitize_error(str(r.get("error", ""))) if is_err else None,
+                })
+            all_results.append({
+                "tab_index":    tab_indices[i],
+                "success":      failed_count_tab == 0,
+                "failed_count": failed_count_tab,
+                "step_results": safe_results,
             })
-        all_results.append({
-            "tab_index":    tab_indices[i],
-            "success":      failed_count_tab == 0,
-            "failed_count": failed_count_tab,
-            "step_results": safe_results,
-        })
 
-    # Return focus to tab 0.
-    try:
-        agent.switch_tab(0)
-    except Exception:
-        pass
+        # Return focus to tab 0.
+        try:
+            agent.switch_tab(0)
+        except Exception:
+            pass
 
-    return _safe_response({
-        "results":      all_results,
-        "total_tabs":   len(all_results),
-        "all_succeeded": all(r["success"] for r in all_results),
-    })
+        return {
+            "results":      all_results,
+            "total_tabs":   len(all_results),
+            "all_succeeded": all(r["success"] for r in all_results),
+        }
+
+    return _safe_response(_browser_thread.submit(_do_tabs))
 
 
 # ---------------------------------------------------------------------------
@@ -1229,7 +1329,7 @@ def upload_file(req: UploadFileRequest) -> dict[str, Any]:
         file_path = str(safe_path(tools.workspace, req.path))
     except PathTraversalError as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
-    return get_agent().upload_file(req.selector, file_path)
+    return _on_browser_thread(get_agent().upload_file, req.selector, file_path)
 
 
 @app.post("/download_file", summary="Navigate to a URL and save the triggered download")
@@ -1239,47 +1339,47 @@ def download_file(req: DownloadFileRequest) -> dict[str, Any]:
         save_path = str(safe_path(tools.workspace, req.path))
     except PathTraversalError as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
-    return get_agent().download_file(req.url, save_path)
+    return _on_browser_thread(get_agent().download_file, req.url, save_path)
 
 
 @app.post("/drag_drop", summary="Drag an element and drop it on another element")
 def drag_drop(req: DragDropRequest) -> dict[str, Any]:
-    return get_agent().drag_and_drop(req.source, req.target)
+    return _on_browser_thread(get_agent().drag_and_drop, req.source, req.target)
 
 
 @app.post("/right_click", summary="Right-click (context-menu) an element")
 def right_click(req: RightClickRequest) -> dict[str, Any]:
-    return get_agent().right_click(req.selector)
+    return _on_browser_thread(get_agent().right_click, req.selector)
 
 
 @app.post("/double_click", summary="Double-click an element")
 def double_click(req: DoubleClickRequest) -> dict[str, Any]:
-    return get_agent().double_click(req.selector)
+    return _on_browser_thread(get_agent().double_click, req.selector)
 
 
 @app.post("/page/rect", summary="Get the bounding box of an element")
 def get_element_rect(req: GetElementRectRequest) -> dict[str, Any]:
-    return get_agent().get_element_rect(req.selector)
+    return _on_browser_thread(get_agent().get_element_rect, req.selector)
 
 
 @app.post("/network/intercept", summary="Intercept (block or pass through) requests matching a URL pattern")
 def set_network_intercept(req: SetNetworkInterceptRequest) -> dict[str, Any]:
-    return get_agent().set_network_intercept(req.url_pattern, action=req.action)
+    return _on_browser_thread(get_agent().set_network_intercept, req.url_pattern, action=req.action)
 
 
 @app.post("/network/clear_intercepts", summary="Remove all network intercept routes")
 def clear_network_intercepts() -> dict[str, Any]:
-    return get_agent().clear_network_intercepts()
+    return _on_browser_thread(get_agent().clear_network_intercepts)
 
 
 @app.post("/session/viewport", summary="Resize the browser viewport")
 def set_viewport(req: SetViewportRequest) -> dict[str, Any]:
-    return get_agent().set_viewport(req.width, req.height)
+    return _on_browser_thread(get_agent().set_viewport, req.width, req.height)
 
 
 @app.post("/session/geolocation", summary="Override the browser geolocation")
 def set_geolocation(req: SetGeolocationRequest) -> dict[str, Any]:
-    return get_agent().set_geolocation(req.latitude, req.longitude, accuracy=req.accuracy)
+    return _on_browser_thread(get_agent().set_geolocation, req.latitude, req.longitude, accuracy=req.accuracy)
 
 
 # ---------------------------------------------------------------------------
@@ -1361,14 +1461,14 @@ def task_run(req: TaskRunRequest) -> dict[str, Any]:
     planner = get_planner()
     agent   = get_agent()
 
-    # Plan first (untainted source of step metadata).
+    # Plan first (untainted source of step metadata) — no browser call needed.
     try:
         steps = planner.plan(req.intent)
     except (ValueError, StepValidationError) as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
 
-    # Execute — results list may contain exception strings internally.
-    exec_results = planner.execute(steps, agent, stop_on_error=req.stop_on_error)
+    # Execute on the browser thread — results list may contain exception strings.
+    exec_results = _on_browser_thread(planner.execute, steps, agent, stop_on_error=req.stop_on_error)
 
     # Build response by cross-referencing the *untainted* steps list for action
     # names and using only sanitized error messages from the execution results.
@@ -1435,7 +1535,9 @@ def task_execute(req: TaskExecuteRequest) -> dict[str, Any]:
         validated = validate_steps(req.steps)
     except StepValidationError as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
-    results = get_planner().execute(validated, get_agent(), stop_on_error=req.stop_on_error)
+    planner = get_planner()
+    agent   = get_agent()
+    results = _on_browser_thread(planner.execute, validated, agent, stop_on_error=req.stop_on_error)
     # Cross-reference the *untainted* validated steps for action names;
     # only pull sanitized error messages from the potentially-tainted results.
     safe_results = []
@@ -1474,7 +1576,8 @@ def task_vision_plan(req: VisionPlanRequest) -> dict[str, Any]:
     planner = get_planner()
     agent = get_agent()
     try:
-        steps = planner.vision_plan(req.intent, agent, provider=req.provider)
+        # vision_plan takes a screenshot (browser call) so it must run on the browser thread.
+        steps = _on_browser_thread(planner.vision_plan, req.intent, agent, provider=req.provider)
         return {"intent": req.intent, "steps": steps, "count": len(steps), "vision": True}
     except (ValueError, StepValidationError) as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
@@ -1493,11 +1596,11 @@ def task_vision_run(req: VisionRunRequest) -> dict[str, Any]:
     planner = get_planner()
     agent = get_agent()
     try:
-        steps = planner.vision_plan(req.intent, agent, provider=req.provider)
+        steps = _on_browser_thread(planner.vision_plan, req.intent, agent, provider=req.provider)
     except (ValueError, StepValidationError) as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
 
-    exec_results = planner.execute(steps, agent, stop_on_error=req.stop_on_error)
+    exec_results = _on_browser_thread(planner.execute, steps, agent, stop_on_error=req.stop_on_error)
 
     safe_step_results = []
     failed_count = 0
@@ -1580,7 +1683,8 @@ def task_agentic_run(req: AgenticRunRequest) -> dict[str, Any]:
     except (ValueError, StepValidationError) as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
 
-    summary = planner.agentic_run(
+    summary = _on_browser_thread(
+        planner.agentic_run,
         req.intent,
         agent,
         initial_steps=initial_steps,
@@ -1808,14 +1912,17 @@ async def ws_task(websocket: WebSocket) -> None:
         })
 
         # ------------------------------------------------------------------
-        # Real-time streaming: use a queue to bridge the synchronous thread
-        # pool (where execute() runs) and this async coroutine.
-        # The callbacks below are called from the worker thread and push
+        # Real-time streaming: use a queue to bridge the synchronous browser
+        # thread (where execute() runs) and this async coroutine.
+        # The callbacks below are called from the browser thread and push
         # events onto the queue; the consumer loop below drains it and sends
         # each event to the WebSocket immediately.
+        #
+        # Thread-affinity note: planner.execute() is submitted to the
+        # dedicated _browser_thread via run_in_executor so that all
+        # Playwright calls happen on the same thread that called agent.start().
         # ------------------------------------------------------------------
         queue: asyncio.Queue = asyncio.Queue()
-        _SENTINEL = object()  # signals that execution has finished
 
         def _start_cb(step_idx: int, action: str) -> None:
             loop.call_soon_threadsafe(
@@ -1836,9 +1943,12 @@ async def ws_task(websocket: WebSocket) -> None:
                 },
             )
 
+        # Submit execute() to the browser thread via run_in_executor so the
+        # event loop stays unblocked while Playwright work runs on the owner thread.
         exec_future = loop.run_in_executor(
             None,
-            lambda: planner.execute(
+            lambda: _browser_thread.submit(
+                planner.execute,
                 steps,
                 agent,
                 stop_on_error=True,
