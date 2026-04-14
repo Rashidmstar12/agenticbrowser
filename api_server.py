@@ -146,6 +146,7 @@ _tools:   SystemTools  | None = None
 # ---------------------------------------------------------------------------
 _agent_pool:   dict[str, BrowserAgent]   = {}
 _planner_pool: dict[str, TaskPlanner]    = {}
+_pool_thread:  dict[str, _BrowserThread] = {}   # owner thread for each pooled agent
 _pool_lock:    threading.Lock            = threading.Lock()
 
 # Per-request context variable — set by _agent_routing_middleware so that
@@ -199,6 +200,26 @@ def get_pooled_agent(agent_id: str) -> BrowserAgent:
     return agent
 
 
+def get_pool_thread(agent_id: str) -> _BrowserThread:
+    """Return the owner thread for the given pooled agent.
+
+    Falls back to the shared ``_browser_thread`` when no dedicated thread was
+    registered (e.g. during testing where agents are injected directly into
+    ``_agent_pool`` without going through ``/agents/pool/start``).
+    """
+    with _pool_lock:
+        bt = _pool_thread.get(agent_id)
+    if bt is None:
+        # Agent exists in the pool (checked by the caller) but was not started
+        # via the API route.  Fall back to the shared browser thread so
+        # Playwright calls still land on a consistent owner thread.
+        with _pool_lock:
+            if agent_id not in _agent_pool:
+                raise HTTPException(status_code=404, detail=f"Agent {agent_id!r} not found in pool.")
+        return _browser_thread
+    return bt
+
+
 # ---------------------------------------------------------------------------
 # App lifecycle
 # ---------------------------------------------------------------------------
@@ -224,15 +245,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # persists for the lifetime of the module (across multiple TestClient
     # invocations in tests), and stopping it would leave subsequent requests
     # blocked waiting on a dead thread.
-    # Stop all pooled agents (each has its own lifecycle thread).
+    # Stop all pooled agents on their owner threads, then stop the owner threads.
     with _pool_lock:
-        for _pooled in list(_agent_pool.values()):
-            try:
-                _pooled.stop()
-            except Exception:
-                pass
+        pool_snapshot = list(_pool_thread.items())
+        agent_snapshot = dict(_agent_pool)
         _agent_pool.clear()
         _planner_pool.clear()
+        _pool_thread.clear()
+    for aid, bt in pool_snapshot:
+        pooled = agent_snapshot.get(aid)
+        def _stop_pooled(a=pooled) -> None:
+            if a is not None:
+                try:
+                    a.stop()
+                except Exception:
+                    pass
+        try:
+            bt.submit(_stop_pooled)
+        except Exception:
+            pass
+        # Pool threads are daemon threads too — do not call bt.stop() here for
+        # the same reason as _browser_thread above.
     logger.info("Agentic Browser API server shut down")
 
 app = FastAPI(
@@ -1088,24 +1121,35 @@ def pool_agent_start(req: PoolAgentStartRequest) -> dict[str, Any]:
     Spawn a new ``BrowserAgent`` with its own browser process and add it to
     the named pool.  Use the returned ``agent_id`` to target subsequent
     requests at this specific agent (e.g. ``/agents/pool/{agent_id}/task/execute``).
+
+    Each pooled agent gets its own dedicated browser-worker thread so all
+    Playwright calls for that agent are thread-affine.
     """
     global _agent_pool, _planner_pool
     aid = req.agent_id or f"agent-{uuid.uuid4().hex[:8]}"
     with _pool_lock:
         if aid in _agent_pool:
             raise HTTPException(status_code=409, detail=f"Agent {aid!r} already exists in pool.")
+
+    # Create the dedicated thread first, then start the agent on it.
+    bt = _BrowserThread()
+
+    def _do_start() -> None:
+        agent.start()
+
     agent = BrowserAgent(
         headless=req.headless,
         slow_mo=req.slow_mo,
         auto_close_popups=req.auto_close_popups,
         default_timeout=req.default_timeout,
     )
-    agent.start()
+    bt.submit(_do_start)
     planner = TaskPlanner()
     planner._system_tools = get_tools()
     with _pool_lock:
         _agent_pool[aid]   = agent
         _planner_pool[aid] = planner
+        _pool_thread[aid]  = bt
     logger.info("Pooled agent %r started", aid)
     return {"agent_id": aid, "status": "started", "headless": req.headless}
 
@@ -1113,15 +1157,22 @@ def pool_agent_start(req: PoolAgentStartRequest) -> dict[str, Any]:
 @app.get("/agents/pool", summary="List all pooled agents and their status")
 def pool_agents_list() -> dict[str, Any]:
     with _pool_lock:
-        snapshot = list(_agent_pool.items())
+        snapshot = [(aid, _agent_pool[aid], _pool_thread.get(aid)) for aid in list(_agent_pool)]
     agents: list[dict[str, Any]] = []
-    for aid, agent in snapshot:
+    for aid, agent, bt in snapshot:
         try:
-            info: dict[str, Any] = {"agent_id": aid, "active": agent._page is not None}
-            if agent._page is not None:
-                info["url"]       = agent._page.url
-                info["tab_count"] = len(agent._pages)
-                info["recording"] = agent._recording
+            if bt is not None:
+                def _info(a=agent) -> dict[str, Any]:
+                    active = a._page is not None
+                    result: dict[str, Any] = {"active": active}
+                    if active:
+                        result["url"]       = a._page.url
+                        result["tab_count"] = len(a._pages)
+                        result["recording"] = a._recording
+                    return result
+                info = {"agent_id": aid, **bt.submit(_info)}
+            else:
+                info = {"agent_id": aid, "active": agent._page is not None}
         except Exception:
             info = {"agent_id": aid, "active": False}
         agents.append(info)
@@ -1131,31 +1182,43 @@ def pool_agents_list() -> dict[str, Any]:
 @app.get("/agents/pool/{agent_id}", summary="Get status of a specific pooled agent")
 def pool_agent_status(agent_id: str) -> dict[str, Any]:
     agent = get_pooled_agent(agent_id)
-    try:
-        tabs = agent.list_tabs()
-    except Exception:
-        tabs = {"tabs": [], "count": 0}
-    return {
-        "agent_id":  agent_id,
-        "active":    True,
-        "url":       agent._page.url if agent._page else None,
-        "tab_count": len(agent._pages),
-        "recording": agent._recording,
-        "tabs":      tabs.get("tabs", []),
-    }
+    bt    = get_pool_thread(agent_id)
+
+    def _do_status() -> dict[str, Any]:
+        try:
+            tabs = agent.list_tabs()
+        except Exception:
+            tabs = {"tabs": [], "count": 0}
+        return {
+            "agent_id":  agent_id,
+            "active":    True,
+            "url":       agent._page.url if agent._page else None,
+            "tab_count": len(agent._pages),
+            "recording": agent._recording,
+            "tabs":      tabs.get("tabs", []),
+        }
+
+    return bt.submit(_do_status)
 
 
 @app.delete("/agents/pool/{agent_id}", summary="Stop and remove a pooled agent")
 def pool_agent_stop(agent_id: str) -> dict[str, Any]:
     with _pool_lock:
-        agent   = _agent_pool.pop(agent_id, None)
+        agent  = _agent_pool.pop(agent_id, None)
         _planner_pool.pop(agent_id, None)
+        bt     = _pool_thread.pop(agent_id, None)
     if agent is None:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id!r} not found in pool.")
-    try:
-        agent.stop()
-    except Exception as exc:
-        logger.warning("Error stopping pooled agent %r: %s", agent_id, exc)
+    if bt is not None:
+        try:
+            bt.submit(agent.stop)
+        except Exception as exc:
+            logger.warning("Error stopping pooled agent %r: %s", agent_id, exc)
+    else:
+        try:
+            agent.stop()
+        except Exception as exc:
+            logger.warning("Error stopping pooled agent %r: %s", agent_id, exc)
     logger.info("Pooled agent %r stopped and removed", agent_id)
     return {"agent_id": agent_id, "status": "stopped"}
 
@@ -1163,6 +1226,7 @@ def pool_agent_stop(agent_id: str) -> dict[str, Any]:
 @app.post("/agents/pool/{agent_id}/task/execute", summary="Execute a step list on a specific pooled agent")
 def pool_agent_execute(agent_id: str, req: PoolAgentExecuteRequest) -> dict[str, Any]:
     agent = get_pooled_agent(agent_id)
+    bt    = get_pool_thread(agent_id)
     with _pool_lock:
         planner = _planner_pool.get(agent_id)
     if planner is None:
@@ -1174,7 +1238,8 @@ def pool_agent_execute(agent_id: str, req: PoolAgentExecuteRequest) -> dict[str,
         validated = validate_steps(req.steps)
     except StepValidationError as exc:
         raise HTTPException(status_code=422, detail=_sanitize_error(str(exc)))
-    results = planner.execute(validated, agent, stop_on_error=req.stop_on_error)
+    # Execute entirely on the agent's owner thread.
+    results = bt.submit(planner.execute, validated, agent, stop_on_error=req.stop_on_error)
     failed_count = 0
     # Build safe_results using the untainted validated step list for step index
     # and action name — only the error string comes from execution results.
@@ -1214,6 +1279,9 @@ def agents_execute_parallel(req: ExecuteParallelRequest) -> dict[str, Any]:
 
     Auto-spawned agents are removed from the pool and stopped automatically
     when ``auto_stop=true`` (default).
+
+    Each agent runs on its own dedicated browser-worker thread so Playwright
+    thread-affinity is preserved even under true parallel execution.
     """
     # -- Build the task list -------------------------------------------------
     if req.tasks is not None:
@@ -1230,7 +1298,8 @@ def agents_execute_parallel(req: ExecuteParallelRequest) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail="No tasks provided.")
 
     # -- Validate all step lists up-front ------------------------------------
-    validated_tasks: list[tuple[str, BrowserAgent, list[dict], bool]] = []
+    # Each tuple: (agent_id, agent, browser_thread, validated_steps, spawned?)
+    validated_tasks: list[tuple[str, BrowserAgent, _BrowserThread, list[dict], bool]] = []
     spawned_ids: list[str] = []
     tools = get_tools()
 
@@ -1242,26 +1311,37 @@ def agents_execute_parallel(req: ExecuteParallelRequest) -> dict[str, Any]:
 
         if task.agent_id is not None:
             agent = get_pooled_agent(task.agent_id)
-            validated_tasks.append((task.agent_id, agent, vsteps, False))
+            bt    = get_pool_thread(task.agent_id)
+            validated_tasks.append((task.agent_id, agent, bt, vsteps, False))
         else:
-            aid = f"agent-{uuid.uuid4().hex[:8]}"
+            aid   = f"agent-{uuid.uuid4().hex[:8]}"
+            bt    = _BrowserThread()
             agent = BrowserAgent(headless=req.headless)
-            agent.start()
+            bt.submit(agent.start)
             with _pool_lock:
                 _agent_pool[aid]   = agent
                 p = TaskPlanner()
                 p._system_tools    = tools
                 _planner_pool[aid] = p
+                _pool_thread[aid]  = bt
             spawned_ids.append(aid)
-            validated_tasks.append((aid, agent, vsteps, True))
+            validated_tasks.append((aid, agent, bt, vsteps, True))
 
-    # -- Execute in parallel -------------------------------------------------
+    # -- Execute in parallel — each agent on its own owner thread ------------
     results: list[dict[str, Any]] = [{}] * len(validated_tasks)
 
-    def _run(idx: int, aid: str, agent: BrowserAgent, vsteps: list[dict], spawned: bool) -> dict[str, Any]:
+    def _run(
+        idx: int,
+        aid: str,
+        agent: BrowserAgent,
+        bt: _BrowserThread,
+        vsteps: list[dict],
+        spawned: bool,
+    ) -> dict[str, Any]:
         planner = TaskPlanner()
         planner._system_tools = tools
-        task_results = planner.execute(vsteps, agent, stop_on_error=req.stop_on_error)
+        # Submit all Playwright work to the agent's dedicated owner thread.
+        task_results = bt.submit(planner.execute, vsteps, agent, stop_on_error=req.stop_on_error)
         failed = [r for r in task_results if r.get("status") == "error"]
         return {
             "agent_id":     aid,
@@ -1281,8 +1361,8 @@ def agents_execute_parallel(req: ExecuteParallelRequest) -> dict[str, Any]:
 
     with ThreadPoolExecutor(max_workers=len(validated_tasks)) as pool:
         futures = {
-            pool.submit(_run, i, aid, agent, vsteps, spawned): i
-            for i, (aid, agent, vsteps, spawned) in enumerate(validated_tasks)
+            pool.submit(_run, i, aid, agent, bt, vsteps, spawned): i
+            for i, (aid, agent, bt, vsteps, spawned) in enumerate(validated_tasks)
         }
         for future in as_completed(futures):
             idx = futures[future]
@@ -1303,9 +1383,15 @@ def agents_execute_parallel(req: ExecuteParallelRequest) -> dict[str, Any]:
     if req.auto_stop:
         for aid in spawned_ids:
             with _pool_lock:
-                a = _agent_pool.pop(aid, None)
+                a  = _agent_pool.pop(aid, None)
                 _planner_pool.pop(aid, None)
-            if a:
+                bt = _pool_thread.pop(aid, None)
+            if a and bt:
+                try:
+                    bt.submit(a.stop)
+                except Exception:
+                    pass
+            elif a:
                 try:
                     a.stop()
                 except Exception:
@@ -1881,7 +1967,26 @@ async def ws_task(websocket: WebSocket) -> None:
     Steps are emitted in real-time: ``step_start`` fires the moment a step
     begins executing, and ``step_done`` fires as soon as it completes — not
     after all steps finish.
+
+    Authentication
+    --------------
+    When ``BROWSER_API_KEY`` is set, the WebSocket connection must be
+    authenticated.  HTTP middleware does not cover WebSocket upgrades, so the
+    key is checked explicitly here.  Pass the key via:
+    - ``X-API-Key`` header (preferred, supported by most WebSocket clients), or
+    - ``?api_key=<key>`` query parameter (fallback for browser-native clients
+      that cannot set custom headers on WebSocket connections).
     """
+    # --- Auth check (WebSocket connections bypass HTTP middleware) -----------
+    if _API_KEY:
+        provided = (
+            websocket.headers.get("X-API-Key", "")
+            or websocket.query_params.get("api_key", "")
+        )
+        if provided != _API_KEY:
+            await websocket.close(code=4401, reason="Invalid or missing API key.")
+            return
+    # -------------------------------------------------------------------------
     await websocket.accept()
     loop = asyncio.get_running_loop()
     try:
