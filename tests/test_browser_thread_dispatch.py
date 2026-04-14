@@ -148,10 +148,13 @@ class TestBrowserThreadUnit:
             bt.stop()
 
     def test_submit_propagates_exception(self):
+        def _raise():
+            raise ValueError("boom")
+
         bt = _BrowserThread()
         try:
             with pytest.raises(ValueError, match="boom"):
-                bt.submit(lambda: (_ for _ in ()).throw(ValueError("boom")))
+                bt.submit(_raise)
         finally:
             bt.stop()
 
@@ -406,14 +409,14 @@ class TestSessionRoutesOnBrowserThread:
     def test_session_start_already_running_uses_browser_thread(self, tmp_path):
         """session_start's 'already_running' check runs on the browser thread."""
         agent = _make_agent()
-        access_tids = []
+        access_tids: list[int] = []
+        original_headless = True
 
-        # Track calls to agent.headless (accessed inside _do on the browser thread
-        # when the "already_running" branch is taken).
-        original_headless = agent.headless
-        type(agent).headless = property(lambda self: (
-            access_tids.append(threading.get_ident()) or original_headless
-        ))
+        def _tracked_headless(self_inner) -> bool:
+            access_tids.append(threading.get_ident())
+            return original_headless
+
+        type(agent).headless = property(_tracked_headless)
 
         tools = SystemTools(workspace=tmp_path)
         with patch.object(api_server, "_agent", agent), \

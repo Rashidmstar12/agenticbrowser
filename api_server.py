@@ -104,7 +104,7 @@ class _BrowserThread:
             try:
                 result = fn(*args, **kwargs)
                 fut.set_result(result)
-            except BaseException as exc:  # noqa: BLE001
+            except Exception as exc:
                 try:
                     fut.set_exception(exc)
                 except Exception:
