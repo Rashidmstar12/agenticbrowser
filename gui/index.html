@@ -49,6 +49,13 @@
 
   <!-- Session controls -->
   <div class="p-3 border-t border-gray-700 space-y-1.5">
+    <div id="api-key-row" class="space-y-1">
+      <label class="text-xs text-gray-500 block">API Key</label>
+      <input id="api-key-input" type="password" placeholder="(none required)"
+        value=""
+        oninput="saveApiKey(this.value)"
+        class="w-full text-xs bg-gray-800 text-gray-200 placeholder-gray-600 border border-gray-700 rounded px-2 py-1 focus:outline-none focus:border-indigo-500" />
+    </div>
     <button onclick="startSession()" class="w-full text-xs font-medium bg-green-600 hover:bg-green-500 text-white px-3 py-1.5 rounded">▶ Start Session</button>
     <button onclick="stopSession()"  class="w-full text-xs font-medium bg-red-700  hover:bg-red-600  text-white px-3 py-1.5 rounded">■ Stop Session</button>
   </div>
@@ -269,6 +276,7 @@ const state = {
   currentTitle: '',
   wsTask: null,
   taskRunning: false,
+  apiKey: localStorage.getItem('browser_api_key') || '',
 };
 
 // ──────────────────────────────────────────────────────────────────
@@ -280,6 +288,7 @@ async function api(method, path, body = null) {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(body);
   }
+  if (state.apiKey) opts.headers['X-API-Key'] = state.apiKey;
   const res = await fetch(path, opts);
   const ct = res.headers.get('content-type') || '';
   let data;
@@ -304,6 +313,46 @@ function toast(msg, type = 'info') {
   t.textContent = msg;
   document.getElementById('toasts').appendChild(t);
   setTimeout(() => t.remove(), 3500);
+}
+
+// ──────────────────────────────────────────────────────────────────
+// API KEY
+// ──────────────────────────────────────────────────────────────────
+function saveApiKey(value) {
+  state.apiKey = value.trim();
+  if (state.apiKey) {
+    localStorage.setItem('browser_api_key', state.apiKey);
+  } else {
+    localStorage.removeItem('browser_api_key');
+  }
+}
+
+async function initApiKey() {
+  // Pre-fill the input from localStorage
+  const input = document.getElementById('api-key-input');
+  if (input && state.apiKey) input.value = state.apiKey;
+
+  // Ask the server if auth is required; highlight the field when it is but
+  // no key has been entered so the user knows they need to supply one.
+  try {
+    const cfg = await fetch('/config').then(r => r.json());
+    if (cfg.auth_required && !state.apiKey) {
+      const row = document.getElementById('api-key-row');
+      if (row) {
+        row.title = 'Server requires an API key — enter it here';
+        const lbl = row.querySelector('label');
+        if (lbl) lbl.classList.add('text-yellow-400');
+        const inp = row.querySelector('input');
+        if (inp) {
+          inp.classList.add('border-yellow-500');
+          inp.placeholder = 'Required — enter key';
+        }
+      }
+      toast('Server has BROWSER_API_KEY set — enter the key in the sidebar', 'warn');
+    }
+  } catch (_) {
+    // /config unreachable — silently ignore (server may be starting up)
+  }
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -389,7 +438,10 @@ function runTask() {
   document.getElementById('task-stop-btn').classList.remove('hidden');
 
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(`${protocol}//${location.host}/ws/task`);
+  const wsUrl = state.apiKey
+    ? `${protocol}//${location.host}/ws/task?api_key=${encodeURIComponent(state.apiKey)}`
+    : `${protocol}//${location.host}/ws/task`;
+  const ws = new WebSocket(wsUrl);
   state.wsTask = ws;
 
   ws.onopen = () => ws.send(JSON.stringify({ intent }));
@@ -764,6 +816,7 @@ function _renderDoctorResults(data) {
 // INIT
 // ──────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
+  initApiKey();
   showTab('tasks');
   refreshStatus();
   setInterval(refreshStatus, 15000);

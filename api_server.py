@@ -16,6 +16,7 @@ import json as _json
 import logging
 import os
 import queue as _queue
+import secrets
 import threading
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -293,7 +294,7 @@ _CODE_EXEC_ALLOWED: bool = os.environ.get("BROWSER_ALLOW_CODE_EXEC", "false").lo
 
 _API_KEY: str | None = os.environ.get("BROWSER_API_KEY")
 
-_AUTH_EXEMPT_PATHS = frozenset({"/", "/docs", "/redoc", "/openapi.json", "/ui", "/doctor"})
+_AUTH_EXEMPT_PATHS = frozenset({"/", "/docs", "/redoc", "/openapi.json", "/ui", "/doctor", "/config"})
 
 
 @app.middleware("http")
@@ -304,7 +305,7 @@ async def _api_key_middleware(request: Request, call_next):  # type: ignore[type
         path = request.url.path.rstrip("/") or "/"
         if path not in _AUTH_EXEMPT_PATHS:
             provided = request.headers.get("X-API-Key", "")
-            if provided != _API_KEY:
+            if not secrets.compare_digest(provided, _API_KEY):
                 from fastapi.responses import JSONResponse
                 return JSONResponse(
                     status_code=401,
@@ -1932,6 +1933,15 @@ def root_redirect() -> RedirectResponse:
     return RedirectResponse(url="/ui")
 
 
+@app.get("/config", summary="Return public server configuration (no auth required)")
+def get_config() -> dict[str, Any]:
+    """Return non-secret configuration that the GUI and API clients need before
+    they have authenticated.  Currently exposes only whether the server has
+    ``BROWSER_API_KEY`` set so that the GUI can prompt the user for the key.
+    """
+    return {"auth_required": bool(_API_KEY)}
+
+
 @app.get("/ui", include_in_schema=False)
 def serve_gui() -> HTMLResponse:
     """Serve the built-in web GUI (single-page application)."""
@@ -1983,7 +1993,7 @@ async def ws_task(websocket: WebSocket) -> None:
             websocket.headers.get("X-API-Key", "")
             or websocket.query_params.get("api_key", "")
         )
-        if provided != _API_KEY:
+        if not secrets.compare_digest(provided, _API_KEY):
             await websocket.close(code=4401, reason="Invalid or missing API key.")
             return
     # -------------------------------------------------------------------------
